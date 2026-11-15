@@ -54,7 +54,7 @@ def run_backfill(
         float(site_row["capacity_mw"]),
     )
     with dbm.session(settings.db_path) as conn:
-        run_id, created = store_run(
+        run_id, created, stored_points = store_run(
             conn,
             site_row,
             spec,
@@ -67,18 +67,38 @@ def run_backfill(
             points=points,
             raw_json=dbm.j(raw),
         )
-    return {
+        coverage = None
+        if not created:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MIN(valid_at_utc) AS first_valid, MAX(valid_at_utc) AS last_valid "
+                "FROM forecast_points WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            coverage = {
+                "stored_points": int(row["n"]),
+                "first_valid_utc": row["first_valid"],
+                "last_valid_utc": row["last_valid"],
+            }
+    result = {
         "status": "ok",
         "run_id": run_id,
         "created": created,
         "model_id": spec.id,
         "run_issued_utc": run_issued,
-        "points": len(points),
+        "points": stored_points,
         "note": (
             "Archived forecast issue stored unchanged. This is the model's own past "
             "prediction — never a reanalysis or a current-forecast substitute."
         ),
     }
+    if not created:
+        result["already_archived"] = True
+        result["stored_coverage"] = coverage
+        result["note"] = (
+            "already-archived: this issue was stored earlier and its snapshot is immutable — "
+            "the stored coverage is reported; nothing was extended or rewritten."
+        )
+    return result
 
 
 __all__ = ["run_backfill", "ModelRunUnavailable"]

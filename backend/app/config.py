@@ -38,5 +38,9 @@ class Settings:
         self.om_max_retries = int(os.environ.get("WINDY_OM_MAX_RETRIES", "3"))
         cors = os.environ.get("WINDY_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
         self.cors_origins = [o.strip() for o in cors.split(",") if o.strip()]
+        # Built frontend directory served by the backend (Docker image). In dev
+        # (`vite dev`) this does not exist and the API-only backend is correct.
+        dist_default = REPO_DIR / "frontend" / "dist"
+        self.frontend_dist = _env_path("WINDY_FRONTEND_DIST", dist_default)
         # Default forecast collection depth (days); clamped per-model in registry.
         self.collect_days = int(os.environ.get("WINDY_COLLECT_DAYS", "10"))

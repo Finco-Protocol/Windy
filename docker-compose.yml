@@ -3,7 +3,10 @@ services:
     build: .
     container_name: windy
     ports:
-      - "8000:8000"
+      # Single-user app without authentication: bind to loopback by default.
+      # For remote access use an authenticating reverse proxy / VPN and only
+      # then widen this binding.
+      - "127.0.0.1:8000:8000"
     volumes:
       # Persistent SQLite database — forecast archive + actuals survive rebuilds.
       - ./data:/data

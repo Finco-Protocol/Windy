@@ -40,6 +40,55 @@ def test_same_cycle_twice_does_not_duplicate(client):
         assert r["run_issued_utc"] == "2026-11-14T00:00:00Z"
 
 
+def test_same_issue_is_immutable_noop(client):
+    """P0 regression: re-collecting the SAME issue must never rewrite archived
+    points, raw payload or metadata — even when the (fake) provider now returns
+    different values or a longer horizon."""
+    import sqlite3
+
+    api, fake, settings = client
+    fake.push_run("gfs_seamless", "2026-11-14T00:00", make_raw_run(TIMES, WS_GFS))
+    api.post("/api/collect", json={})
+    run_id = api.get("/api/runs", params={"model_id": "gfs_seamless"}).json()["runs"][0]["id"]
+
+    def snapshot():
+        conn = sqlite3.connect(settings.db_path)
+        try:
+            points = conn.execute(
+                "SELECT valid_at_utc, wind_speed_mps, wind_direction_deg, modeled_power_mw, "
+                "interval_energy_mwh, interval_hours, status FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc",
+                (run_id,),
+            ).fetchall()
+            run = conn.execute(
+                "SELECT raw_json, fetched_at_utc, run_issued_utc, issue_source, height_method, height_sources_json "
+                "FROM forecast_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return points, run
+
+    points_a, run_a = snapshot()
+
+    # same issue re-served with DIFFERENT values and an extra hour
+    fake.runs["gfs_seamless"] = [
+        ("2026-11-14T00:00", make_raw_run(TIMES + ["2026-11-14T06:00"], {"80": [20.0] * 7, "100": [21.0] * 7}))
+    ]
+    api.post("/api/collect", json={})
+
+    points_b, run_b = snapshot()
+    assert points_a == points_b, "archived forecast points must be byte-for-byte immutable"
+    assert run_a == run_b, "raw payload, issue/fetch times and provenance must be immutable"
+    assert len(api.get("/api/runs", params={"model_id": "gfs_seamless"}).json()["runs"]) == 1
+
+    # a genuinely NEW issue cycle still creates its own record
+    fake.runs["gfs_seamless"].append(("2026-11-14T06:00", make_raw_run(TIMES, WS_GFS)))
+    api.post("/api/collect", json={})
+    runs = api.get("/api/runs", params={"model_id": "gfs_seamless"}).json()["runs"]
+    assert len(runs) == 2
+    assert sorted(r["run_issued_utc"] for r in runs) == ["2026-11-14T00:00:00Z", "2026-11-14T06:00:00Z"]
+
+
 def test_new_cycle_retained_alongside_old(client):
     api, fake, _settings = client
     _push_cycle(fake, "2026-11-14T00:00")
@@ -132,9 +181,16 @@ def test_backfill_stores_archived_run(client):
     assert body["created"] is True
     assert body["run_issued_utc"] == "2026-11-13T00:00:00Z"
 
-    # idempotent second backfill of the same run
+    # idempotent second backfill of the same run: explicit already-archived,
+    # stored coverage reported, nothing rewritten
     resp2 = api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-13", "run_hour": 0})
-    assert resp2.json()["created"] is False
+    body2 = resp2.json()
+    assert body2["created"] is False
+    assert body2["already_archived"] is True
+    assert body2["stored_coverage"]["stored_points"] == 6
+    assert "already-archived" in body2["note"]
+    detail = api.get(f"/api/runs/{body2['run_id']}").json()
+    assert len(detail["points"]) == 6  # still exactly the original snapshot
 
     # missing run → explicit UNAVAILABLE
     resp3 = api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2020-01-01", "run_hour": 0})
@@ -158,3 +214,18 @@ def test_compare_uses_issue_not_fetch_time(client):
     assert len(cmp["points"]) == 6, "issue of the 13th predicts the 14th — same valid times"
     cmp2 = api.get("/api/compare", params={"run_id": run_id, "target_date": "2026-11-13"}).json()
     assert cmp2["points"] == []  # the run has no valid hours on its issue date
+
+
+def test_compare_target_date_is_utc_day(client):
+    """target_date filters on the UTC day; the UI labels it '(UTC)' — pinned here
+    so a local-timezone shift can never creep in silently."""
+    api, fake, _settings = client
+    times = ["2026-11-13T22:00", "2026-11-13T23:00", "2026-11-14T00:00", "2026-11-14T01:00"]
+    fake.push_run("gfs_seamless", "2026-11-12T00:00", make_raw_run(times, {"80": [8.0] * 4, "100": [8.0] * 4}))
+    api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-12", "run_hour": 0})
+    run_id = api.get("/api/runs", params={"model_id": "gfs_seamless"}).json()["runs"][0]["id"]
+
+    day13 = api.get("/api/compare", params={"run_id": run_id, "target_date": "2026-11-13"}).json()
+    assert [p["valid_at_utc"] for p in day13["points"]] == ["2026-11-13T22:00:00Z", "2026-11-13T23:00:00Z"]
+    day14 = api.get("/api/compare", params={"run_id": run_id, "target_date": "2026-11-14"}).json()
+    assert [p["valid_at_utc"] for p in day14["points"]] == ["2026-11-14T00:00:00Z", "2026-11-14T01:00:00Z"]

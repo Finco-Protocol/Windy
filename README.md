@@ -62,8 +62,13 @@ corepack pnpm dev                              # http://localhost:5173 (proxies 
 **One-command production-ish start** (builds the frontend and serves it from the backend):
 
 ```bash
-docker compose up --build      # app on http://localhost:8000, DB persisted in ./data/
+docker compose up --build      # app on http://127.0.0.1:8000, DB persisted in ./data/
 ```
+
+The backend serves the built SPA including history-mode deep links (`/history`, `/actuals` on
+hard refresh); missing asset chunks stay real 404s. The compose file binds to `127.0.0.1` only —
+the app is single-user and unauthenticated, so put an authenticating reverse proxy or VPN in
+front before ever widening that binding.
 
 ## Scheduling (twice daily)
 
@@ -91,7 +96,8 @@ On *Actuals & accuracy* → *Import actual generation*:
   the first occurrence. Everything is persisted in UTC.
 - `Preview` shows parsed rows, row-level errors, decimal-comma handling, duplicates inside the
   file, and conflicts with already-stored rows. Overwriting existing actuals requires the explicit
-  **replace** choice (default is reject).
+  **replace** choice (default is reject). A file with invalid rows is **blocked** from import
+  (never partially imported) until the listed rows are fixed.
 - Accuracy appears once archived forecast issues overlap imported actuals; until then the screen
   says *Actuals not imported / accuracy not available* — no invented numbers.
 
@@ -135,14 +141,17 @@ independent provider APIs. Public endpoints only; no API key needed (upstream's 
 ## Tests
 
 ```bash
-# backend (47 fast, deterministic tests; fixtures are synthetic)
+# backend (56 fast, deterministic tests; fixtures are synthetic)
 cd backend && python -m pytest -q
 
-# frontend (upstream 456 + 5 new windy tests)
+# frontend (upstream 456 + 4 new windy tests)
 cd frontend && corepack pnpm vitest run
 corepack pnpm type-check      # vue-tsc, strict
 corepack pnpm build           # production build + PWA
 ```
+
+A small root CI (`.github/workflows/ci.yml`) runs the same two suites on every PR to `main` and
+push to `main` — backend pytest + frontend install/vitest/type-check/build, two jobs, no deploys.
 
 ## Limitations
 

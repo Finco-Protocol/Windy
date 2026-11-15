@@ -33,12 +33,20 @@ def curve_row_to_power_curve(row: sqlite3.Row) -> PowerCurve:
 
 
 def load_curve(db_path, curve_id: str | None = None) -> PowerCurve:
-    """Load the curve persisted for the site; fall back to the library default."""
+    """Load the curve persisted for the site.
+
+    An asset that references a curve id which is missing from `power_curves`
+    is a data-integrity problem: it fails explicitly instead of silently
+    falling back to an unrelated (alphabetically first) curve. The default
+    library curve is used only when the asset carries no reference at all
+    (first-startup path before seeding).
+    """
     with dbm.session(db_path) as conn:
         if curve_id:
             row = conn.execute("SELECT * FROM power_curves WHERE id=?", (curve_id,)).fetchone()
             if row:
                 return curve_row_to_power_curve(row)
+            raise KeyError(f"power curve '{curve_id}' referenced by the site is missing from power_curves")
         row = conn.execute("SELECT * FROM power_curves ORDER BY id LIMIT 1").fetchone()
         if row:
             return curve_row_to_power_curve(row)
@@ -62,8 +70,19 @@ def load_site_and_curve(db_path, site_id: str) -> tuple[dict, PowerCurve]:
 
 
 def seed_defaults(db_path) -> None:
-    """Create schema and seed the Krnovo asset + power curve (idempotent)."""
+    """Create schema and seed defaults ONLY if absent (idempotent, non-destructive).
+
+    The Krnovo asset and the default power curve are first-startup seeds:
+    user-edited asset values (hub height, losses, curve reference) and edited
+    curve data are preserved across restarts, CLI init and scheduler startup.
+    Configuration evolution must go through versioned migrations, never an
+    implicit reset-to-default.
+    """
     dbm.init_db(db_path)
+    with dbm.session(db_path) as conn:
+        already_seeded = conn.execute("SELECT 1 FROM assets WHERE id=?", (KRNOVO_ASSET["id"],)).fetchone()
+    if already_seeded:
+        return
     curve = load_default_curve()
     with dbm.session(db_path) as conn:
         conn.execute(
@@ -71,11 +90,7 @@ def seed_defaults(db_path) -> None:
             INSERT INTO power_curves (id, label, status, source, provenance, rated_power_mw,
                                       cut_in_mps, rated_mps, cut_out_mps, points_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                label=excluded.label, status=excluded.status, source=excluded.source,
-                provenance=excluded.provenance, rated_power_mw=excluded.rated_power_mw,
-                cut_in_mps=excluded.cut_in_mps, rated_mps=excluded.rated_mps,
-                cut_out_mps=excluded.cut_out_mps, points_json=excluded.points_json
+            ON CONFLICT(id) DO NOTHING
             """,
             (
                 curve.id,
@@ -96,8 +111,7 @@ def seed_defaults(db_path) -> None:
                                 turbine_count, turbine_model, turbine_rated_mw, hub_height_m,
                                 loss_factor, timezone, power_curve_id, assumptions_json, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                power_curve_id=excluded.power_curve_id
+            ON CONFLICT(id) DO NOTHING
             """,
             (
                 KRNOVO_ASSET["id"],

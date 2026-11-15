@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import accuracy as accuracy_mod
 from . import db as dbm
@@ -59,22 +59,25 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     )
 
     # ---- error mapping ----------------------------------------------------
+    # Handlers RETURN proper JSON responses (raising HTTPException from inside
+    # an exception handler would escape the handler middleware and surface as
+    # an opaque 500). Expected invalid input never becomes a 500.
 
     @app.exception_handler(ActualsError)
     async def _actuals_error(_req: Request, exc: ActualsError):
-        raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.exception_handler(KeyError)
     async def _key_error(_req: Request, exc: KeyError):
-        raise HTTPException(status_code=404, detail=str(exc.args[0] if exc.args else exc))
+        return JSONResponse(status_code=404, content={"detail": str(exc.args[0] if exc.args else exc)})
 
     @app.exception_handler(OMError)
     async def _om_error(_req: Request, exc: OMError):
-        raise HTTPException(status_code=502, detail=str(exc))
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
 
     @app.exception_handler(ValueError)
     async def _value_error(_req: Request, exc: ValueError):
-        raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     # ---- basics ------------------------------------------------------------
 
@@ -370,6 +373,21 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         filename, data = _read_upload(file)
         mapping_dict = json.loads(mapping)
         parsed = parse_actuals(filename, data, mapping_dict)
+        if parsed.errors:
+            # A file with invalid rows is blocked, never partially imported:
+            # quiet partial imports would make the archive silently inconsistent.
+            # An explicit partial-import opt-in may come in a future PR.
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        f"{len(parsed.errors)} row(s) failed validation — import blocked. "
+                        "Fix the rows listed below (see /api/actuals/preview) and re-import."
+                    ),
+                    "n_errors": len(parsed.errors),
+                    "errors": parsed.errors[:50],
+                },
+            )
         result = persist_actuals(settings.db_path, "krnovo", filename, mapping_dict, parsed, on_conflict=on_conflict)
         return result
 
@@ -478,12 +496,41 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         )
 
     # ---- built frontend (Docker image) ----------------------------------------------
+    #
+    # The Vue app uses history-mode routes (/history, /actuals), so hard
+    # refreshes and direct navigation must serve index.html. Starlette's
+    # StaticFiles(html=True) does NOT do that for unknown deep links, so:
+    #   - /assets/* is served statically (missing chunks stay real 404s),
+    #   - a catch-all GET route serves existing root files (favicon, sw.js, ...)
+    #     and falls back to index.html for application routes only.
+    # API routes are registered before the catch-all, and unmatched /api/*
+    # paths return JSON 404 — never index.html disguised as an API response.
 
-    dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-    if dist.exists():  # pragma: no cover - only in packaged image
-        from fastapi.staticfiles import StaticFiles
+    dist = settings.frontend_dist
+    if dist and dist.exists():
+        if (dist / "assets").is_dir():
+            from fastapi.staticfiles import StaticFiles
 
-        app.mount("/", StaticFiles(directory=str(dist), html=True), name="frontend")
+            app.mount("/assets", StaticFiles(directory=str(dist / "assets")), name="assets")
+
+        index_html = dist / "index.html"
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def spa_fallback(full_path: str):
+            if full_path.startswith("api/"):
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            candidate = (dist / full_path).resolve()
+            try:
+                candidate.relative_to(dist.resolve())  # traversal guard
+            except ValueError:
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            if candidate.is_file():
+                return FileResponse(candidate)
+            if Path(full_path).suffix:  # a missing file with an extension stays a 404
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            if index_html.is_file():
+                return FileResponse(index_html)
+            return JSONResponse(status_code=404, content={"detail": "frontend build missing index.html"})
 
     return app
 

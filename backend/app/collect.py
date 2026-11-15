@@ -146,12 +146,28 @@ def store_run(
     forecast_days: int,
     points: list[PointRow],
     raw_json: str | None,
-) -> tuple[int, bool]:
-    """Insert a run (or find the existing identical one) and upsert its points.
+) -> tuple[int, bool, int]:
+    """Archive one forecast issue, immutably.
 
-    Returns (run_id, created). On re-collection the existing run row and its
-    original raw payload are preserved; points are upserted idempotently.
+    A previously recorded (site, model, issue, height) run is an idempotent
+    **no-op**: its stored points, raw payload, issue time and provenance are
+    never rewritten, so re-collection cannot silently rewrite history. A
+    genuinely new issue cycle is a new row. Returns (run_id, created,
+    stored_points) where stored_points is the archived point count (the
+    existing coverage when the run was already archived).
     """
+    existing = conn.execute(
+        "SELECT id FROM forecast_runs WHERE site_id=? AND model_id=? AND dedupe_key=? AND requested_height_m=?",
+        (site["id"], spec.id, dedupe_key, float(hub_from(site))),
+    ).fetchone()
+    if existing is not None:
+        run_id = int(existing["id"])
+        stored = conn.execute(
+            "SELECT COUNT(*) AS n FROM forecast_points WHERE run_id=?",
+            (run_id,),
+        ).fetchone()["n"]
+        return run_id, False, int(stored)
+
     cur = conn.execute(
         """
         INSERT INTO forecast_runs (
@@ -159,7 +175,6 @@ def store_run(
             issue_source, requested_height_m, height_method, height_sources_json,
             fetched_at_utc, source_url, forecast_days, status, error, raw_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?)
-        ON CONFLICT(site_id, model_id, dedupe_key, requested_height_m) DO NOTHING
         """,
         (
             site["id"],
@@ -177,31 +192,13 @@ def store_run(
             raw_json,
         ),
     )
-    if cur.rowcount == 0:
-        row = conn.execute(
-            "SELECT id FROM forecast_runs WHERE site_id=? AND model_id=? AND dedupe_key=? AND requested_height_m=?",
-            (site["id"], spec.id, dedupe_key, float(hub_from(site))),
-        ).fetchone()
-        run_id = int(row["id"])
-        created = False
-    else:
-        run_id = int(cur.lastrowid)
-        created = True
-
+    run_id = int(cur.lastrowid)
     conn.executemany(
         """
         INSERT INTO forecast_points (
             run_id, valid_at_utc, wind_speed_mps, wind_direction_deg,
             height_method, modeled_power_mw, interval_energy_mwh, interval_hours, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(run_id, valid_at_utc) DO UPDATE SET
-            wind_speed_mps=excluded.wind_speed_mps,
-            wind_direction_deg=excluded.wind_direction_deg,
-            height_method=excluded.height_method,
-            modeled_power_mw=excluded.modeled_power_mw,
-            interval_energy_mwh=excluded.interval_energy_mwh,
-            interval_hours=excluded.interval_hours,
-            status=excluded.status
         """,
         [
             (
@@ -218,7 +215,7 @@ def store_run(
             for p in points
         ],
     )
-    return run_id, created
+    return run_id, True, len(points)
 
 
 def hub_from(site: dict) -> float:
@@ -268,7 +265,7 @@ def collect_model(
     points = build_points(raw, spec, hub_from(site), curve, int(site["turbine_count"]), float(site["loss_factor"]), float(site["capacity_mw"]))
     key = _dedupe_key(run_iso, now)
     with dbm.session(db_path) as conn:
-        run_id, _created = store_run(
+        run_id, _created, stored_points = store_run(
             conn,
             site,
             spec,
@@ -284,7 +281,7 @@ def collect_model(
     result.status = "ok" if run_iso else "ok-issue-unknown"
     result.run_id = run_id
     result.run_issued_utc = run_iso
-    result.points = len(points)
+    result.points = stored_points
     return result
 
 
