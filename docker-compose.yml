@@ -1,0 +1,17 @@
+services:
+  windy:
+    build: .
+    container_name: windy
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persistent SQLite database — forecast archive + actuals survive rebuilds.
+      - ./data:/data
+    environment:
+      # Enable the built-in twice-daily collector (00:00 / 12:00 UTC).
+      WINDY_SCHEDULER_ENABLED: "${WINDY_SCHEDULER_ENABLED:-1}"
+      WINDY_SCHEDULE_CRON: "${WINDY_SCHEDULE_CRON:-0 0,12 * * *}"
+      WINDY_DB_PATH: /data/windy.db
+    restart: unless-stopped
+    # For private use: keep this port off the public internet (firewall/VPN)
+    # or put an authenticating reverse proxy in front before exposing it.
