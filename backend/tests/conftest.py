@@ -7,6 +7,8 @@ forecasts — these tests only exercise code paths.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -29,12 +31,22 @@ def make_raw_run(times: list[str], ws_by_height: dict[int, list], dir_by_height:
 
 
 class FakeOMClient:
-    """Stand-in for OpenMeteoClient with a scripted archive."""
+    """Stand-in for OpenMeteoClient with a scripted archive.
+
+    Test hooks beyond the happy path:
+    - a run not pushed raises ModelRunUnavailable (as the real API does);
+    - `om_error_runs` raises a generic OMError (network-ish failure);
+    - `gates[(model_id, run_iso)]` blocks fetch_single_run on an Event until
+      set, making worker-thread scheduling deterministic in tests.
+    """
 
     def __init__(self) -> None:
         # model_id -> list of (run_iso, raw); the LAST element is "newest".
         self.runs: dict[str, list[tuple[str, dict]]] = {}
         self.live: dict[str, dict] = {}
+        self.om_error_runs: set[tuple[str, str]] = set()
+        self.gates: dict[tuple[str, str], "threading.Event"] = {}
+        self.requests: list[tuple[str, str]] = []
 
     def push_run(self, model_id: str, run_iso: str, raw: dict) -> None:
         self.runs.setdefault(model_id, []).append((run_iso, raw))
@@ -51,6 +63,12 @@ class FakeOMClient:
         raise OMError("open-meteo network error: fake client has no live fixture")
 
     def fetch_single_run(self, lat, lon, spec, run_iso, days):
+        self.requests.append((spec.id, run_iso))
+        gate = self.gates.get((spec.id, run_iso))
+        if gate is not None:
+            gate.wait()
+        if (spec.id, run_iso) in self.om_error_runs:
+            raise OMError(f"fake network failure for {spec.id} {run_iso}")
         for iso, raw in reversed(self.runs.get(spec.id, [])):
             if iso == run_iso:
                 return raw
@@ -71,3 +89,15 @@ def client(tmp_path, fake_client):
     application = create_app(settings=settings, om_client=fake_client)
     with TestClient(application) as test_client:
         yield test_client, fake_client, settings
+
+
+def wait_for_job_status(api, job_id: int, target: set[str], timeout_s: float = 5.0) -> dict:
+    """Poll a batch job until it reaches one of `target` (or time out)."""
+    deadline = time.monotonic() + timeout_s
+    job = None
+    while time.monotonic() < deadline:
+        job = api.get(f"/api/backfill/batch/{job_id}").json()
+        if job["status"] in target:
+            return job
+        time.sleep(0.02)
+    return job  # last observed state; the caller's assertion will fail loudly

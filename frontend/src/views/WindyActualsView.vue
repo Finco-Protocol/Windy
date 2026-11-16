@@ -13,6 +13,7 @@ import {
   type ActualsImportResult,
   type ActualsMapping,
   type ActualsPreview,
+  type CalibrationEntry,
   type OverlayResponse,
   type SiteResponse,
 } from "@/api/windy";
@@ -113,16 +114,51 @@ const LEAD_BIN_OPTIONS = [
 ];
 const leadBin = ref<string>("");
 
+const useCalibration = ref(false);
 const accuracyResource = useAbortableResource<AccuracyResponse>(
-  (signal) => windyApi.accuracy(fromUtc.value, toUtc.value, signal),
-  () => [fromUtc.value, toUtc.value],
+  (signal) => windyApi.accuracy(fromUtc.value, toUtc.value, useCalibration.value, signal),
+  () => [fromUtc.value, toUtc.value, useCalibration.value],
 );
 const { data: accuracyData } = accuracyResource;
 const overlayResource = useAbortableResource<OverlayResponse>(
-  (signal) => windyApi.overlay(fromUtc.value, toUtc.value, leadBin.value || null, signal),
-  () => [fromUtc.value, toUtc.value, leadBin.value],
+  (signal) => windyApi.overlay(fromUtc.value, toUtc.value, leadBin.value || null, useCalibration.value, signal),
+  () => [fromUtc.value, toUtc.value, leadBin.value, useCalibration.value],
 );
 const { data: overlayData } = overlayResource;
+
+// ---- calibration (optional, derived series) -----------------------------------
+
+const calibResource = useAbortableResource<{ models: CalibrationEntry[]; note: string }>(
+  (signal) => windyApi.calibration(signal),
+  () => [],
+);
+const { data: calibData } = calibResource;
+const calibBusy = ref(false);
+const calibMessage = ref<string | null>(null);
+const calibError = ref<string | null>(null);
+
+async function trainCalibration(): Promise<void> {
+  calibBusy.value = true;
+  calibError.value = null;
+  calibMessage.value = null;
+  try {
+    const res = await windyApi.calibrationTrain(fromUtc.value, toUtc.value);
+    const models = (res.models as Record<string, { status: string; factor?: number }>) ?? {};
+    calibMessage.value = Object.entries(models)
+      .map(([id, m]) => `${id}: ${m.status}${m.factor ? ` (factor ${m.factor})` : ""}`)
+      .join(" · ");
+    await calibResource.refresh();
+  } catch (e) {
+    calibError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    calibBusy.value = false;
+  }
+}
+
+const CALIB_FALLBACK_NOTE =
+  "Optional explainable calibration: one bounded multiplicative factor per model, trained on real measured actuals " +
+  "against archived issues with a chronological holdout. Archived forecast values are never modified; the factor only " +
+  "scales the derived accuracy view.";
 
 const accuracyRows = computed(() => {
   const models = accuracyData.value?.models ?? {};
@@ -341,15 +377,39 @@ const overlayOption = computed<Record<string, unknown>>(() => {
           </div>
 
           <StateBlock
-            v-if="accuracyData && Object.keys(accuracyData.models).length === 0"
+            v-if="accuracyData && !accuracyData.has_measured_actuals"
             kind="empty"
             :relaxed="true"
           >
-            Actuals not imported (or no archived issue overlaps them) — accuracy not available. Import actuals above and
-            collect forecasts daily; comparisons appear once an archived issue's valid time has actuals.
+            No measured actuals — accuracy unavailable. Import real measured production above; hypothetical modelled
+            values are never substituted for measurements.
+          </StateBlock>
+          <StateBlock
+            v-else-if="accuracyData && Object.keys(accuracyData.models).length === 0"
+            kind="empty"
+            :relaxed="true"
+          >
+            Actuals exist but no archived issue with a known issue time overlaps them yet — keep collecting (or backfill
+            from Historical runs); comparisons appear automatically.
           </StateBlock>
           <template v-else-if="accuracyData">
-            <p class="text-paper-400 mb-2 font-mono text-[10px]">{{ accuracyData.note }}</p>
+            <p class="text-paper-400 mb-2 font-mono text-[10px]">
+              {{ accuracyData.note }}
+              Matched hours are complete UTC hours: {{ accuracyData.actual_hours_in_range }} complete,
+              {{ accuracyData.actual_hours_partial }} partial (not scored),
+              {{ accuracyData.actual_intervals_unaligned }} unaligned intervals.
+            </p>
+            <div class="mb-2 flex items-center gap-2">
+              <label class="text-paper-300 flex items-center gap-1.5 font-mono text-[10px]">
+                <input v-model="useCalibration" type="checkbox" class="accent-sodium-300" />
+                apply calibrated view (derived series — archive unchanged)
+              </label>
+              <span
+                v-for="(factor, id) in accuracyData.calibration_applied"
+                :key="id"
+                class="border-sodium-300/40 text-sodium-200 border px-1.5 py-0.5 font-mono text-[10px]"
+              >{{ id }} ×{{ factor }}</span>
+            </div>
             <div class="overflow-x-auto">
               <table class="w-full font-mono text-[10px]">
                 <thead>
@@ -377,6 +437,56 @@ const overlayOption = computed<Record<string, unknown>>(() => {
               </table>
             </div>
           </template>
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Calibration (optional, derived series)" :default-open="false" lazy>
+          <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
+            {{ calibData?.note ?? CALIB_FALLBACK_NOTE }}
+            Site assumptions (loss factor, provisional hub height, manufacturer-class curve) remain visible on the
+            Forecast screen — a calibrated factor is not a calibrated plant curve.
+          </p>
+          <div class="mb-2 flex items-center gap-2">
+            <button
+              type="button"
+              class="border-ink-600 text-paper-100 hover:border-sodium-300/60 disabled:opacity-50 border px-3 py-1.5 font-mono text-[11px] transition-colors"
+              :disabled="calibBusy"
+              @click="trainCalibration"
+            >
+              {{ calibBusy ? "Training…" : "Train on current range" }}
+            </button>
+            <span class="text-paper-400 font-mono text-[10px]">{{ fromUtc }} → {{ toUtc }}</span>
+          </div>
+          <p v-if="calibMessage" class="text-sodium-200 mb-2 font-mono text-[10px]">{{ calibMessage }}</p>
+          <p v-if="calibError" class="text-heat-300 mb-2 font-mono text-[10px]">{{ calibError }}</p>
+          <div v-if="calibData?.models?.length" class="overflow-x-auto">
+            <table class="w-full font-mono text-[10px]">
+              <thead>
+                <tr class="text-paper-400 border-ink-700 border-b text-left">
+                  <th class="py-1.5 pr-3">model</th>
+                  <th class="py-1.5 pr-3">status</th>
+                  <th class="py-1.5 pr-3">factor</th>
+                  <th class="py-1.5 pr-3">train h</th>
+                  <th class="py-1.5 pr-3">holdout h</th>
+                  <th class="py-1.5 pr-3">val MAE before→after</th>
+                  <th class="py-1.5 pr-3">val WAPE before→after</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in calibData.models" :key="c.model_id" class="border-ink-800 border-b">
+                  <td class="py-1.5 pr-3" :style="{ color: modelColor(c.model_id) }">{{ c.model_id }}</td>
+                  <td class="py-1.5 pr-3">
+                    <span :class="c.status === 'calibrated' ? 'text-sodium-200' : 'text-heat-300'">{{ c.status === "calibrated" ? "calibrated" : "NOT CALIBRATED" }}</span>
+                  </td>
+                  <td class="py-1.5 pr-3">{{ c.factor }}</td>
+                  <td class="py-1.5 pr-3">{{ c.n_train_hours }}</td>
+                  <td class="py-1.5 pr-3">{{ c.n_val_hours }}</td>
+                  <td class="py-1.5 pr-3">{{ c.val_mae_before ?? "—" }} → {{ c.val_mae_after ?? "—" }}</td>
+                  <td class="py-1.5 pr-3">{{ c.val_wape_before ?? "—" }} → {{ c.val_wape_after ?? "—" }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="text-paper-400 font-mono text-[10px]">No calibration trained yet.</p>
         </CollapsibleSection>
 
         <CollapsibleSection title="Aligned series (actual vs archived issues)">

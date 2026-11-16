@@ -16,24 +16,28 @@ from .registry import get_model
 from .store import load_curve, load_site
 
 
-def run_backfill(
+def run_backfill_one(
     settings,
     model_id: str,
-    run_date: str,
-    run_hour: int,
+    run_iso: str,
     days: int = 10,
     client: OpenMeteoClient | None = None,
 ) -> dict:
-    if not model_id or not run_date:
-        raise ValueError("model_id and run_date (YYYY-MM-DD) are required")
+    """Fetch and archive ONE run identified by its UTC issue stamp
+    (`YYYY-MM-DDTHH:00`). Shared by the single-run API/CLI path and the batch
+    workflow; preserves every v1 immutability guarantee."""
+    date_part, _, hour_part = run_iso.partition("T")
+    try:
+        run_hour = int((hour_part or "00")[:2])
+    except ValueError as exc:
+        raise ValueError(f"invalid run stamp: {run_iso!r}") from exc
     spec = get_model(model_id)
     if run_hour not in (0, 6, 12, 18):
         raise ValueError("run_hour must be 0, 6, 12 or 18 (UTC run cycles)")
     try:
-        datetime.strptime(run_date, "%Y-%m-%d")
+        datetime.strptime(date_part, "%Y-%m-%d")
     except ValueError as exc:
         raise ValueError("run_date must be YYYY-MM-DD") from exc
-    run_iso = f"{run_date}T{run_hour:02d}:00"
     days = max(1, min(int(days), spec.request_days))
     run_issued = normalize_run_iso(run_iso)
 
@@ -101,4 +105,19 @@ def run_backfill(
     return result
 
 
-__all__ = ["run_backfill", "ModelRunUnavailable"]
+def run_backfill(
+    settings,
+    model_id: str,
+    run_date: str,
+    run_hour: int,
+    days: int = 10,
+    client: OpenMeteoClient | None = None,
+) -> dict:
+    if not model_id or not run_date:
+        raise ValueError("model_id and run_date (YYYY-MM-DD) are required")
+    if run_hour not in (0, 6, 12, 18):
+        raise ValueError("run_hour must be 0, 6, 12 or 18 (UTC run cycles)")
+    return run_backfill_one(settings, model_id, f"{run_date}T{run_hour:02d}:00", days, client=client)
+
+
+__all__ = ["run_backfill", "run_backfill_one", "ModelRunUnavailable"]

@@ -176,8 +176,12 @@ export interface AccuracyResponse {
   from_utc: string;
   to_utc: string;
   actual_hours_in_range: number;
+  actual_hours_partial: number;
+  actual_intervals_unaligned: number;
   lead_bins: string[];
   models: Record<string, { bins: Record<string, AccuracyBin>; total: AccuracyBin | null }>;
+  calibration_applied: Record<string, number>;
+  has_measured_actuals: boolean;
   note: string;
 }
 
@@ -185,6 +189,8 @@ export interface OverlayHour {
   valid_at_utc: string;
   actual_mwh?: number;
   actual_mw?: number;
+  actual_partial?: boolean;
+  actual_covered_hours?: number;
   models?: Record<string, number>;
 }
 
@@ -194,6 +200,67 @@ export interface OverlayResponse {
   to_utc: string;
   lead_bin: string | null;
   hours: OverlayHour[];
+  calibration_applied: Record<string, number>;
+  note: string;
+}
+
+export interface BatchPreview {
+  dry_run: true;
+  total_planned: number;
+  total_skipped: number;
+  est_points: number;
+  per_model: { model_id: string; planned: number; skipped: number; est_points: number }[];
+  note: string;
+}
+
+export interface BatchJobResult {
+  seq: number;
+  model_id: string;
+  run_issued_utc: string;
+  status: string;
+  detail: string | null;
+}
+
+export interface BatchJob {
+  id: number;
+  created_at_utc: string;
+  status: string;
+  cursor_index: number;
+  n_stored: number;
+  n_already: number;
+  n_unavailable: number;
+  n_failed: number;
+  n_skipped: number;
+  last_error: string | null;
+  params: { models: string[]; date_from: string; date_to: string; cycles: number[]; days: number; max_requests: number };
+  planned_total: number;
+  results: BatchJobResult[];
+}
+
+export interface ArchiveHealthModel {
+  model_id: string;
+  label: string;
+  known_issue_cycles: number;
+  issue_unknown_runs: number;
+  first_issue_utc: string | null;
+  last_issue_utc: string | null;
+  total_points: number;
+  missing_cycles: string[];
+  n_missing_cycles: number | null;
+  note: string;
+}
+
+export interface CalibrationEntry {
+  model_id: string;
+  factor: number;
+  n_train_hours: number;
+  n_val_hours: number;
+  val_mae_before: number | null;
+  val_mae_after: number | null;
+  val_wape_before: number | null;
+  val_wape_after: number | null;
+  trained_at_utc: string;
+  status: string;
   note: string;
 }
 
@@ -279,13 +346,26 @@ export const windyApi = {
     getJson<CompareResponse>(`/compare?run_id=${runId}&target_date=${encodeURIComponent(targetDate)}`, signal),
   backfill: (modelId: string, runDate: string, runHour: number, days = 10) =>
     postJson<BackfillResult>("/backfill", { model_id: modelId, run_date: runDate, run_hour: runHour, days }),
-  accuracy: (fromUtc: string, toUtc: string, signal?: AbortSignal) =>
-    getJson<AccuracyResponse>(`/accuracy?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}`, signal),
-  overlay: (fromUtc: string, toUtc: string, leadBin: string | null, signal?: AbortSignal) =>
-    getJson<OverlayResponse>(
-      `/accuracy/overlay?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}${leadBin ? `&lead_bin=${encodeURIComponent(leadBin)}` : ""}`,
+  accuracy: (fromUtc: string, toUtc: string, useCalibration: boolean, signal?: AbortSignal) =>
+    getJson<AccuracyResponse>(
+      `/accuracy?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}${useCalibration ? "&use_calibration=true" : ""}`,
       signal,
     ),
+  overlay: (fromUtc: string, toUtc: string, leadBin: string | null, useCalibration: boolean, signal?: AbortSignal) =>
+    getJson<OverlayResponse>(
+      `/accuracy/overlay?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}${leadBin ? `&lead_bin=${encodeURIComponent(leadBin)}` : ""}${useCalibration ? "&use_calibration=true" : ""}`,
+      signal,
+    ),
+  batchPreview: (body: Record<string, unknown>) => postJson<BatchPreview>("/backfill/batch", { ...body, dry_run: true }),
+  batchStart: (body: Record<string, unknown>) => postJson<{ job_id: number; status: string }>("/backfill/batch", body),
+  batchList: (signal?: AbortSignal) => getJson<{ jobs: Omit<BatchJob, "results" | "planned_total">[] }>("/backfill/batch", signal),
+  batchGet: (id: number, signal?: AbortSignal) => getJson<BatchJob>(`/backfill/batch/${id}`, signal),
+  batchCancel: (id: number) => postJson<{ job_id: number; status: string }>(`/backfill/batch/${id}/cancel`, {}),
+  batchResume: (id: number) => postJson<{ job_id: number; status: string }>(`/backfill/batch/${id}/resume`, {}),
+  archiveHealth: (signal?: AbortSignal) => getJson<{ models: ArchiveHealthModel[] }>("/archive/health", signal),
+  calibration: (signal?: AbortSignal) =>
+    getJson<{ site_id: string; models: CalibrationEntry[]; note: string }>("/calibration", signal),
+  calibrationTrain: (fromUtc: string, toUtc: string) => postJson<Record<string, unknown>>("/calibration/train", { from_utc: fromUtc, to_utc: toUtc }),
   actualsPreview: (file: File, mapping: ActualsMapping) =>
     postMultipart<ActualsPreview>("/actuals/preview", file, { mapping: JSON.stringify(mapping) }),
   actualsImport: (file: File, mapping: ActualsMapping, onConflict: "reject" | "replace") =>
