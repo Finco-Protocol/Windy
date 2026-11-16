@@ -12,11 +12,14 @@ venv/
 .coverage
 htmlcov/
 
-# Local data — never commit generated databases or secrets
+# Local data — never commit generated databases, uploads or secrets
 data/
+uploads/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite3
+*.log
 .env
 .env.*
 !.env.example
