@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import VChart from "vue-echarts";
 
 import AppFooter from "@/components/AppFooter.vue";
@@ -7,6 +7,7 @@ import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
 import { localToUtc, nowLocalForTz } from "@/utils/availability";
+import { scenarioSeries } from "@/utils/chartGaps";
 import {
   windyApi,
   type Inventory,
@@ -79,6 +80,21 @@ function selectRun(id: number | null): void {
   pinned.value = null; // fresh selection follows the live configuration
 }
 
+// Site change resets ALL site-scoped transient state: selected WTG ids, bulk
+// preview/confirmation, selected run, pinned revision, messages and the local
+// time defaults. Abortable resources abort their stale in-flight requests, so
+// no response computed for the previous site can land for the new one.
+watch(siteId, (newSite, oldSite) => {
+  if (newSite === oldSite) return;
+  selected.value = new Set();
+  confirmOpen.value = false;
+  previewSiteId.value = null;
+  bulkError.value = null;
+  bulkMessage.value = null;
+  selectRun(null);
+  refreshDefaultStart();
+});
+
 // ---- bulk edit form --------------------------------------------------------------
 
 const search = ref("");
@@ -140,6 +156,10 @@ const bulkPreview = computed<BulkPreview | { error: string } | null>(() => {
   };
 });
 
+// site the pending confirmation was prepared for — a Site A confirmation must
+// never be submitted against Site B
+const previewSiteId = ref<string | null>(null);
+
 function requestPreview(): void {
   bulkError.value = null;
   bulkMessage.value = null;
@@ -147,10 +167,18 @@ function requestPreview(): void {
     bulkError.value = bulkPreview.value.error;
     return;
   }
+  previewSiteId.value = siteId.value; // snap the site at preview time
   confirmOpen.value = true;
 }
 
 async function confirmApply(): Promise<void> {
+  if (previewSiteId.value !== null && previewSiteId.value !== siteId.value) {
+    confirmOpen.value = false;
+    selected.value = new Set();
+    bulkError.value = "site changed since preview — selection reset, prepare the change again";
+    return;
+  }
+  const targetSite = siteId.value;
   confirmOpen.value = false;
   bulkBusy.value = true;
   bulkError.value = null;
@@ -166,7 +194,7 @@ async function confirmApply(): Promise<void> {
             end_local: endLocal.value || null,
             ...(capMode.value === "percent" ? { cap_percent: capPercent.value } : { cap_mw: capMw.value }),
           };
-    const res = await windyApi.constraintsAdd(siteId.value, [row]);
+    const res = await windyApi.constraintsAdd(targetSite, [row]);
     bulkMessage.value = `revision ${res.revision}: ${bulkKind.value} applied to ${selected.value.size} unit(s)` +
       (res.warnings.length ? ` — ${res.warnings.join("; ")}` : "");
     selected.value = new Set();
@@ -264,6 +292,7 @@ const axisLabel = { color: "#93896f", fontSize: 10, fontFamily: "JetBrains Mono,
 const scenarioOption = computed<Record<string, unknown> | undefined>(() => {
   const sc = scenario.value;
   if (!sc) return undefined;
+  const series = scenarioSeries(sc.points);
   return {
     backgroundColor: "transparent",
     grid: { left: 48, right: 12, top: 12, bottom: 24 },
@@ -287,7 +316,9 @@ const scenarioOption = computed<Record<string, unknown> | undefined>(() => {
         type: "line",
         showSymbol: false,
         connectNulls: false,
-        data: sc.points.filter((p) => p.base_mw !== null).map((p) => [p.valid_at_utc, p.base_mw]),
+        // ALL timestamps kept — missing hours stay [ts, null] so the line
+        // visually breaks instead of bridging the gap
+        data: series.base,
         lineStyle: { width: 1.6, color: "#f4ecd8" },
         itemStyle: { color: "#f4ecd8" },
       },
@@ -296,7 +327,7 @@ const scenarioOption = computed<Record<string, unknown> | undefined>(() => {
         type: "line",
         showSymbol: false,
         connectNulls: false,
-        data: sc.points.filter((p) => p.adjusted_mw !== null).map((p) => [p.valid_at_utc, p.adjusted_mw]),
+        data: series.adjusted,
         lineStyle: { width: 1.4, color: "#c792ea" },
         itemStyle: { color: "#c792ea" },
         areaStyle: { opacity: 0.08, color: "#c792ea" },

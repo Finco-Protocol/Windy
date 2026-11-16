@@ -78,7 +78,7 @@ def test_one_missing_wind_hour_makes_window_incomplete(client):
     sub = w24["available_hours_subtotal"]
     assert sub["hours"] == 23
     assert sub["adjusted_mwh"] is not None
-    assert sub["note"].startswith("subtotal over computed hours only")
+    assert sub["note"].startswith("subtotal over covered hours only")
     # the missing hour itself is a null point, never a fabricated zero
     first = next(p for p in pts if p["valid_at_utc"] == "2026-11-13T00:00:00Z")
     assert first["status"] == "missing-wind" and first["adjusted_mw"] is None

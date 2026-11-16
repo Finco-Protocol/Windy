@@ -205,14 +205,22 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         w = csv.writer(buf)
         w.writerow([
             "site_id", "model_id", "run_issued_utc", "inventory_revision", "constraints_revision",
-            "algorithm_version", "valid_at_utc", "interval_hours", "baseline_mw", "scenario_base_mw",
-            "adjusted_mw", "pre_export_mw", "availability_loss_mwh", "export_loss_mwh", "status",
+            "algorithm_version", "curve_mode", "baseline_comparable", "valid_at_utc", "interval_hours",
+            "baseline_mw", "baseline_mwh", "scenario_base_mw", "scenario_base_mwh",
+            "adjusted_mw", "adjusted_mwh", "pre_export_mw",
+            "availability_loss_mwh", "export_loss_mwh", "status",
         ])
         for p in sc["points"]:
+            ih = p["interval_hours"]
+            baseline_mwh = round(p["base_mw"] * ih, 6) if p["base_mw"] is not None else None
+            scenario_base_mwh = round(p["scenario_base_mw"] * ih, 6) if p["scenario_base_mw"] is not None else None
+            adjusted_mwh = round(p["adjusted_mw"] * ih, 6) if p["adjusted_mw"] is not None else None
             w.writerow([
                 site_id, sc["model_id"], sc["run_issued_utc"] or "", sc["inventory_revision"],
-                sc["constraints_revision"], sc["algorithm_version"], p["valid_at_utc"], p["interval_hours"],
-                p["base_mw"], p["scenario_base_mw"], p["adjusted_mw"], p["pre_export_mw"],
+                sc["constraints_revision"], sc["algorithm_version"], sc["summary"]["curve_mode"],
+                sc["baseline_comparable"], p["valid_at_utc"], ih,
+                p["base_mw"], baseline_mwh, p["scenario_base_mw"], scenario_base_mwh,
+                p["adjusted_mw"], adjusted_mwh, p["pre_export_mw"],
                 p["lost_to_unit_mwh"], p["lost_to_export_mwh"], p["status"],
             ])
         buf.seek(0)
