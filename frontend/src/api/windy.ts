@@ -350,11 +350,27 @@ export interface ScenarioPoint {
 }
 
 export interface ScenarioWindow {
+  window_hours: number;
+  start_valid_utc: string | null;
+  end_valid_utc: string | null;
+  expected_hours: number;
+  valid_hours: number;
+  missing_hours: number;
+  coverage: number | null;
+  complete: boolean;
+  short_horizon?: boolean;
   base_mwh: number | null;
   adjusted_mwh: number | null;
   lost_unit_mwh: number | null;
   lost_export_mwh: number | null;
-  hours: number;
+  available_hours_subtotal: {
+    hours: number;
+    base_mwh: number;
+    adjusted_mwh: number;
+    lost_unit_mwh: number;
+    lost_export_mwh: number;
+    note: string;
+  };
 }
 
 export interface ScenarioResponse {
@@ -367,11 +383,13 @@ export interface ScenarioResponse {
   algorithm_version: string;
   installed_mw: number;
   n_turbines: number;
+  baseline_comparable: boolean;
+  baseline_comparable_reason: string | null;
   points: ScenarioPoint[];
   summary: {
     installed_mw: number;
     curve_mode: string;
-    windows: { "24h": ScenarioWindow; "7d": ScenarioWindow };
+    windows: { "24h": ScenarioWindow; "7d": ScenarioWindow; "10d": ScenarioWindow };
   };
   note: string;
 }

@@ -235,8 +235,18 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         return {
             "scenario_revision_id": row["id"],
             "created_at_utc": row["created_at_utc"],
-            "summary": _json.loads(row["summary_json"]),
-            "points_available_at": f"/api/assets/{site_id}/scenario?run_id={run_id}",
+            "summary": json.loads(row["summary_json"]),
+            "points_available_at": (
+                f"/api/assets/{site_id}/scenario?run_id={run_id}"
+                f"&inventory_revision={scenario['inventory_revision']}&constraints_revision={scenario['constraints_revision']}"
+            ),
+            "retrieval": {
+                "run_id": run_id,
+                "site_id": site_id,
+                "inventory_revision": scenario["inventory_revision"],
+                "constraints_revision": scenario["constraints_revision"],
+                "note": "pinned to the exact revisions this snapshot was computed from — reopening reproduces THIS revision, not the currently active configuration",
+            },
         }
 
     @app.get("/api/assets/{site_id}/scenario/revisions")
@@ -244,16 +254,22 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         store.load_site(settings.db_path, site_id)
         with dbm.session(settings.db_path) as conn:
             rows = conn.execute(
-                "SELECT id, model_id, run_id, run_issued_utc, inventory_revision, constraints_revision, "
-                "algorithm_version, created_at_utc, summary_json FROM scenario_revisions "
-                "LEFT JOIN forecast_runs ON forecast_runs.id = scenario_revisions.run_id "
-                "WHERE scenario_revisions.site_id=? ORDER BY scenario_revisions.id DESC LIMIT 100",
+                "SELECT sr.id AS id, sr.site_id AS site_id, sr.model_id AS model_id, sr.run_id AS run_id, "
+                "fr.run_issued_utc AS run_issued_utc, sr.inventory_revision AS inventory_revision, "
+                "sr.constraints_revision AS constraints_revision, sr.algorithm_version AS algorithm_version, "
+                "sr.created_at_utc AS created_at_utc, sr.summary_json AS summary_json "
+                "FROM scenario_revisions sr LEFT JOIN forecast_runs fr ON fr.id = sr.run_id "
+                "WHERE sr.site_id=? ORDER BY sr.id DESC LIMIT 100",
                 (site_id,),
             ).fetchall()
         out = []
         for r in rows:
             item = dict(r)
-            item["summary"] = _json.loads(item.pop("summary_json") or "{}")
+            item["summary"] = json.loads(item.pop("summary_json") or "{}")
+            item["retrieve_at"] = (
+                f"/api/assets/{site_id}/scenario?run_id={item['run_id']}"
+                f"&inventory_revision={item['inventory_revision']}&constraints_revision={item['constraints_revision']}"
+            )
             out.append(item)
         return {"revisions": out}
 

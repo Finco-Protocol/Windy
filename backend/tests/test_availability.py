@@ -262,11 +262,12 @@ def test_case5_mixed_ratings_and_validation(client):
     assert inv["installed_mw"] == pytest.approx(10 * 3.0 + 26 * 2.0, abs=1e-6)
 
     # 3.0 MW units on the 2.75-max GE curve need explicit scaled-reference;
-    # without opt-in → explicit missing-curve, never a silent mismatch
+    # without opt-in → explicit incompatible-curve (null), never a silent mismatch
     run_id = _push_run(api, fake, ws=15.0)
     sc = _scenario(api, "farm-a", run_id)
-    assert all(p["status"] == "missing-curve" for p in sc["points"]), \
+    assert all(p["status"] == "incompatible-curve" for p in sc["points"]), \
         "a 2.75 MW-max curve must not be silently used for 3.0 MW units without opt-in"
+    assert sc["baseline_comparable"] is False
 
     # validation rejects: fractional count, negative cap, over-nameplate cap, NaN
     r = api.post("/api/assets", json={
@@ -289,7 +290,8 @@ def test_case5_mixed_ratings_and_validation(client):
     assert r.status_code == 400
 
     # scaled-reference opt-in: smaller site where the GE curve is weaker than
-    # the units — normalised shape × per-unit rating, labelled
+    # the units — normalised shape × per-unit rating, labelled; explicit values
+    # at 6/8/10 m/s from the GE shape normalized to the 3.0 MW rating
     r = api.post("/api/assets", json={
         "id": "scaled-site", "label": "Scaled", "latitude": 45, "longitude": 16,
         "capacity_mw": 30.0, "turbine_count": 10, "turbine_rated_mw": 3.0, "hub_height_m": 90,
@@ -302,6 +304,18 @@ def test_case5_mixed_ratings_and_validation(client):
     assert sc_s["summary"]["curve_mode"] == "scaled-reference"
     ps = next(p for p in sc_s["points"] if p["status"] == "ok")
     assert ps["adjusted_mw"] == pytest.approx(30.0, abs=1e-2)  # 10 × (2.78/2.78×3.0) clipped at farm cap
+
+    # explicit mid-curve values: GE(6/8/10 m/s)/2.78 × 3.0 per unit × 10 units
+    from app.power import load_curve
+
+    ge = load_curve()
+    for i, ws in enumerate((6.0, 8.0, 10.0)):
+        day = f"2026-11-1{i}"  # distinct run issues so each run is stored separately
+        run_w = _push_run(api, fake, ws=ws, site_id="scaled-site", day=day)
+        sc_w = _scenario(api, "scaled-site", run_w)
+        pw = next(p for p in sc_w["points"] if p["status"] == "ok")
+        expected_per_unit = ge.power_mw_per_turbine(ws) / 2.78 * 3.0
+        assert pw["adjusted_mw"] == pytest.approx(min(10 * expected_per_unit, 30.0), abs=1e-2), f"ws={ws}"
 
 
 # ---- case 6: scale (250 turbines, one bulk request) + isolation ------------------
@@ -397,11 +411,19 @@ def test_revisions_immutable_after_publish(client):
     assert rev_a == rev_b, "published scenario revision A must be unchanged"
 
     # revision A (50 MW cap) and revision B (60 MW cap) differ as expected —
-    # window values are ENERGY over the 6 archived hours (50 MW × 6 h = 300 MWh)
+    # the run archives 6 hours so the 24h window is INCOMPLETE: full-window
+    # total is null/not-comparable, and the available-hours subtotal (6 h × cap)
+    # is reported separately and clearly labelled
     summary_b = json.loads(json.dumps(pub_b["summary"], sort_keys=True))
     summary_a_parsed = json.loads(summary_a)
-    assert summary_a_parsed["windows"]["24h"]["adjusted_mwh"] == pytest.approx(6 * 50.0, abs=1e-2)
-    assert summary_b["windows"]["24h"]["adjusted_mwh"] == pytest.approx(6 * 60.0, abs=1e-2)
+    w_a = summary_a_parsed["windows"]["24h"]
+    w_b = summary_b["windows"]["24h"]
+    assert w_a["complete"] is False and w_a["adjusted_mwh"] is None
+    assert w_a["coverage"] == pytest.approx(6 / 24, abs=1e-3)
+    assert w_a["available_hours_subtotal"]["hours"] == 6
+    assert w_a["available_hours_subtotal"]["adjusted_mwh"] == pytest.approx(6 * 50.0, abs=1e-2)
+    assert w_b["available_hours_subtotal"]["adjusted_mwh"] == pytest.approx(6 * 60.0, abs=1e-2)
+    assert "10d" in summary_b["windows"] and summary_b["windows"]["10d"]["short_horizon"] is True
 
     # republishing identical inputs is idempotent
     pub_a2 = api.post("/api/assets/farm-a/scenario/publish", json={"run_id": run_id, "constraints_revision": 1}).json()

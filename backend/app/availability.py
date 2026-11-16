@@ -48,6 +48,11 @@ from .collect import iso_z, parse_utc
 ALGORITHM_VERSION = "1"
 KINDS = ("offline", "curtailment", "export_cap")
 TOLERANCE = 1e-9
+# Direct curve mode requires the reference curve's rated power to match the
+# unit's rated power within this narrow relative tolerance; any larger mismatch
+# in EITHER direction must be an explicit opt-in scaled-reference or an
+# incompatible-curve null — never a silent clip or reuse.
+CURVE_MATCH_TOLERANCE = 0.02
 
 
 class AvailabilityError(ValueError):
@@ -483,17 +488,30 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
             (run_id,),
         ).fetchall()
 
-        curve_mode_used = "direct"
-        real_turbines = inv["turbines"]
-        installed = inv["installed_mw"]
-        allow_scaled = bool(int(site.get("allow_scaled_reference") or 0))
+    curve_mode_used = "direct"
+    real_turbines = inv["turbines"]
+    installed = inv["installed_mw"]
+    allow_scaled = bool(int(site.get("allow_scaled_reference") or 0))
+    # Baseline comparability: the archived baseline modeled_power_mw was computed
+    # from the site configuration AT INGESTION. If the current inventory differs
+    # (installed MW mismatch) or any unit needs a scaled/incompatible curve, the
+    # archived baseline is NOT a valid "unconstrained" reference for loss
+    # identities — the scenario-equivalent base is reported separately.
+    asset_capacity = float(site.get("capacity_mw") or 0.0)
+    baseline_comparable = True
+    baseline_reasons: list[str] = []
+    if abs(installed - asset_capacity) > 0.05:
+        baseline_comparable = False
+        baseline_reasons.append(
+            f"current inventory installed {installed} MW differs from the asset capacity at ingestion ({asset_capacity} MW)"
+        )
 
     rows_out: list[dict] = []
     for p in points:
         valid = p["valid_at_utc"]
         hours = float(p["interval_hours"] or 1.0)
         wind = p["wind_speed_mps"]
-        base_mw = p["modeled_power_mw"]  # v1 baseline (already includes loss, farm cap)
+        base_mw = p["modeled_power_mw"]  # v1 baseline (site config at ingestion)
 
         if wind is None or not real_turbines:
             rows_out.append(
@@ -502,6 +520,7 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
                     "base_mw": base_mw,
                     "adjusted_mw": None,
                     "pre_export_mw": None,
+                    "scenario_base_mw": None,
                     "lost_to_unit_mwh": None,
                     "lost_to_export_mwh": None,
                     "interval_hours": hours,
@@ -513,6 +532,7 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
         pre_export = 0.0
         base_sum = 0.0
         curve_ok = True
+        curve_error: str | None = None
         for t in real_turbines:
             curve_row, _mode = _unit_curve(curve_by_id, t["curve_id"], site.get("power_curve_id") or "")
             if curve_row is None:
@@ -525,19 +545,22 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
                 break
             rated_t = float(t["rated_mw"])
             curve_rated = float(pc.rated_power_mw or 0.0)
-            if curve_rated >= rated_t - 1e-6:
-                # curve reaches the unit's nameplate: use directly
+            if curve_rated <= 0:
+                curve_ok = False
+                curve_error = "missing-curve"
+                break
+            if abs(curve_rated - rated_t) / rated_t <= CURVE_MATCH_TOLERANCE:
+                # physically compatible reference curve (narrow tolerance, either direction)
                 base_i = raw * (1.0 - loss_factor)
             elif allow_scaled:
-                # scaled-reference: normalized shape × per-unit rating — labelled
-                if curve_rated <= 0:
-                    curve_ok = False
-                    break
+                # explicit opt-in: normalized shape × per-unit rating — REFERENCE/UNVERIFIED
                 base_i = (raw / curve_rated) * rated_t * (1.0 - loss_factor)
                 curve_mode_used = "scaled-reference"
             else:
-                # a weaker curve must not be silently reused for a bigger unit
+                # rated mismatch in either direction without opt-in: never a
+                # silent clip or pseudo-accurate reuse
                 curve_ok = False
+                curve_error = "incompatible-curve"
                 break
             # The per-unit nameplate clamp is part of the machine, not an
             # operational restriction: loss accounting measures against the
@@ -556,10 +579,11 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
                     "base_mw": base_mw,
                     "adjusted_mw": None,
                     "pre_export_mw": None,
+                    "scenario_base_mw": None,
                     "lost_to_unit_mwh": None,
                     "lost_to_export_mwh": None,
                     "interval_hours": hours,
-                    "status": "missing-curve",
+                    "status": curve_error or "missing-curve",
                 }
             )
             continue
@@ -567,12 +591,14 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
         export_cap = _farm_export_cap(cons["constraints"], valid)
         limit = export_cap if export_cap is not None else installed
         adjusted = min(pre_export, limit)
-        lost_unit = max(base_sum - pre_export, 0.0) * hours
+        scenario_base = min(base_sum, installed)
+        lost_unit = max(scenario_base - pre_export, 0.0) * hours
         lost_export = max(pre_export - adjusted, 0.0) * hours
         rows_out.append(
             {
                 "valid_at_utc": valid,
                 "base_mw": base_mw,
+                "scenario_base_mw": round(scenario_base, 6),
                 "adjusted_mw": round(adjusted, 6),
                 "pre_export_mw": round(pre_export, 6),
                 "lost_to_unit_mwh": round(lost_unit, 6),
@@ -582,32 +608,84 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
             }
         )
 
-    # coverage-aware summaries per available window (never padded)
-    def window_mwh(hours: float) -> dict:
+    # coverage-aware summaries per available window (never padded, never
+    # zero-filled): a window totals only COMPLETE hours with computed values;
+    # any missing/invalid hour makes the full-window total null/not-comparable
+    # and the available-hours subtotal is reported separately. Intervals are
+    # counted when their valid_at lies inside the window (interval-based
+    # policy, documented); a 10-day window is included and flagged
+    # short-horizon when the archived run cannot reach it.
+    spec = None
+    try:
+        from .registry import get_model
+
+        spec = get_model(run["model_id"])
+    except KeyError:
+        spec = None
+    model_max_h = spec.max_lead_hours if spec else None
+
+    def window_mwh(window_hours: float) -> dict:
         n = len(rows_out)
-        if n == 0:
-            return {"base_mwh": None, "adjusted_mwh": None, "lost_unit_mwh": None, "lost_export_mwh": None, "hours": 0}
-        first = parse_utc(rows_out[0]["valid_at_utc"])
-        last = parse_utc(rows_out[-1]["valid_at_utc"])
-        limit_t = iso_z(first + timedelta(hours=hours))
-        sel = [r for r in rows_out if r["valid_at_utc"] < limit_t]
-        return {
-            "base_mwh": round(sum((r["base_mw"] or 0.0) * r["interval_hours"] for r in sel), 3),
-            "adjusted_mwh": round(sum((r["adjusted_mw"] or 0.0) * r["interval_hours"] for r in sel), 3),
-            "lost_unit_mwh": round(sum(r["lost_to_unit_mwh"] or 0.0 for r in sel), 3),
-            "lost_export_mwh": round(sum(r["lost_to_export_mwh"] or 0.0 for r in sel), 3),
-            "hours": len(sel),
+        first = parse_utc(rows_out[0]["valid_at_utc"]) if n else None
+        last = parse_utc(rows_out[-1]["valid_at_utc"]) if n else None
+        end_t = (first + timedelta(hours=window_hours)) if first else None
+        # interval policy: a point belongs to the window when its valid_at lies
+        # inside [first, first + window); durations are the archived per-point
+        # interval_hours, never an assumed constant spacing
+        sel = [r for r in rows_out if end_t and parse_utc(r["valid_at_utc"]) < end_t]
+        valid_rows = [r for r in sel if r["status"] == "ok" and r["adjusted_mw"] is not None]
+        # hours of the window without a computed value: gaps (invalid/missing
+        # wind/curve) AND hours beyond the archived horizon — both make the
+        # window incomplete; the archived-span distinction is `short_horizon`
+        missing = max(0, int(round(window_hours - len(valid_rows))))
+        archived_span_h = ((last - first).total_seconds() / 3600.0 + float(rows_out[-1]["interval_hours"] or 1.0)) if n else 0.0
+        expected_hours = min(window_hours, archived_span_h)
+        coverage = round(len(valid_rows) / window_hours, 4) if window_hours else None
+        complete = bool(sel) and missing == 0 and len(valid_rows) >= window_hours - 1e-6
+        out: dict = {
+            "window_hours": window_hours,
+            "start_valid_utc": rows_out[0]["valid_at_utc"] if n else None,
+            "end_valid_utc": rows_out[-1]["valid_at_utc"] if n else None,
+            "expected_hours": round(expected_hours, 3),
+            "valid_hours": len(valid_rows),
+            "missing_hours": missing,
+            "coverage": coverage,
+            "complete": complete,
+            "base_mwh": round(sum((r["base_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3) if complete else None,
+            "adjusted_mwh": round(sum((r["adjusted_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3) if complete else None,
+            "lost_unit_mwh": round(sum(r["lost_to_unit_mwh"] or 0.0 for r in valid_rows), 3) if complete else None,
+            "lost_export_mwh": round(sum(r["lost_to_export_mwh"] or 0.0 for r in valid_rows), 3) if complete else None,
         }
+        # available-hours subtotal: computed values over the covered hours only,
+        # always present and clearly labelled as PARTIAL when incomplete
+        out["available_hours_subtotal"] = {
+            "hours": len(valid_rows),
+            "base_mwh": round(sum((r["base_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3),
+            "adjusted_mwh": round(sum((r["adjusted_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3),
+            "lost_unit_mwh": round(sum(r["lost_to_unit_mwh"] or 0.0 for r in valid_rows), 3),
+            "lost_export_mwh": round(sum(r["lost_to_export_mwh"] or 0.0 for r in valid_rows), 3),
+            "note": "subtotal over computed hours only; NOT comparable to a full-window total",
+        }
+        if n and archived_span_h < window_hours - 1e-6:
+            out["short_horizon"] = True
+        if model_max_h is not None and model_max_h < window_hours - 1e-6:
+            out["short_horizon"] = True
+        return out
 
     summary = {
         "installed_mw": installed,
-        "available_max_mw_now": None,
-        "offline_count": 0,
-        "curtailed_count": 0,
-        "farm_export_cap_active": None,
         "curve_mode": curve_mode_used,
-        "windows": {"24h": window_mwh(24), "7d": window_mwh(24 * 7)},
+        "windows": {"24h": window_mwh(24), "7d": window_mwh(24 * 7), "10d": window_mwh(24 * 10)},
     }
+
+    if curve_mode_used != "direct" and baseline_comparable:
+        baseline_comparable = False
+        baseline_reasons.append(f"curve mode is '{curve_mode_used}' — scenario base is not the archived site configuration")
+    if not baseline_comparable:
+        baseline_reasons.append(
+            "loss identities use scenario_base_mw (the scenario-equivalent unconstrained base), "
+            "not the archived baseline"
+        )
 
     return {
         "site_id": site_id,
@@ -621,11 +699,13 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
         "n_turbines": len(real_turbines),
         "points": rows_out,
         "summary": summary,
+        "baseline_comparable": baseline_comparable,
+        "baseline_comparable_reason": "; ".join(baseline_reasons) if baseline_reasons else None,
         "note": (
             "Availability-adjusted scenario: derived from the immutable archived run under the "
             "pinned inventory/constraint revisions (append-only). The 50% cap means 50% of rated "
             "MW as a maximum, not a multiplier of instantaneous output. Losses applied exactly "
-            "once (in base), matching the v1 baseline."
+            "once; window totals are coverage-aware and null when the window is incomplete."
         ),
     }
 

@@ -6,6 +6,7 @@ import AppFooter from "@/components/AppFooter.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
+import { localToUtc, nowLocalForTz } from "@/utils/availability";
 import {
   windyApi,
   type Inventory,
@@ -68,12 +69,96 @@ const bulkKind = ref<"offline" | "curtailment">("offline");
 const capMode = ref<"percent" | "mw">("percent");
 const capPercent = ref<number>(100);
 const capMw = ref<number>(1.375);
-const startLocal = ref<string>("2026-11-13T00:00");
+const startLocal = ref<string>(nowLocalForTz(siteData.value?.site.timezone ?? "Europe/Podgorica"));
 const endLocal = ref<string>("");
 const bulkBusy = ref(false);
 const bulkError = ref<string | null>(null);
 const bulkMessage = ref<string | null>(null);
 const exportCapMw = ref<number | null>(null);
+const confirmOpen = ref(false);
+
+const tz = computed(() => siteData.value?.site.timezone ?? "Europe/Podgorica");
+
+function refreshDefaultStart(): void {
+  startLocal.value = nowLocalForTz(tz.value);
+  endLocal.value = "";
+}
+
+const startUtcPreview = computed(() => localToUtc(startLocal.value, tz.value));
+const endUtcPreview = computed(() => (endLocal.value ? localToUtc(endLocal.value, tz.value) : null));
+
+// two-step preview/confirm: affected units, cap meaning and computed UTC times
+// are shown BEFORE anything is persisted
+interface BulkPreview {
+  units: string[];
+  kind: string;
+  cap: string;
+  start_local: string;
+  start_utc?: string;
+  end_local: string;
+  end_utc?: string;
+  warnings: string[];
+}
+
+const bulkPreview = computed<BulkPreview | { error: string } | null>(() => {
+  if (selected.value.size === 0) return null;
+  if (startUtcPreview.value.error) return { error: startUtcPreview.value.error };
+  if (endLocal.value && endUtcPreview.value?.error) return { error: endUtcPreview.value.error };
+  const cap =
+    bulkKind.value === "offline"
+      ? "offline → 0 MW"
+      : capMode.value === "percent"
+        ? `max ${capPercent.value}% of rated MW`
+        : `max ${capMw.value} MW`;
+  return {
+    units: [...selected.value].sort(),
+    kind: bulkKind.value,
+    cap,
+    start_local: startLocal.value,
+    start_utc: startUtcPreview.value.utc,
+    end_local: endLocal.value || "(open-ended)",
+    end_utc: endUtcPreview.value?.utc ?? "(open-ended)",
+    warnings: [startUtcPreview.value.warning, endUtcPreview.value?.warning].filter(Boolean) as string[],
+  };
+});
+
+function requestPreview(): void {
+  bulkError.value = null;
+  bulkMessage.value = null;
+  if (bulkPreview.value && "error" in bulkPreview.value && bulkPreview.value.error) {
+    bulkError.value = bulkPreview.value.error;
+    return;
+  }
+  confirmOpen.value = true;
+}
+
+async function confirmApply(): Promise<void> {
+  confirmOpen.value = false;
+  bulkBusy.value = true;
+  bulkError.value = null;
+  bulkMessage.value = null;
+  try {
+    const row: Record<string, unknown> =
+      bulkKind.value === "offline"
+        ? { kind: "offline", unit_ids: [...selected.value], start_local: startLocal.value, end_local: endLocal.value || null }
+        : {
+            kind: "curtailment",
+            unit_ids: [...selected.value],
+            start_local: startLocal.value,
+            end_local: endLocal.value || null,
+            ...(capMode.value === "percent" ? { cap_percent: capPercent.value } : { cap_mw: capMw.value }),
+          };
+    const res = await windyApi.constraintsAdd(siteId.value, [row]);
+    bulkMessage.value = `revision ${res.revision}: ${bulkKind.value} applied to ${selected.value.size} unit(s)` +
+      (res.warnings.length ? ` — ${res.warnings.join("; ")}` : "");
+    selected.value = new Set();
+    await Promise.all([refreshConstraints(), statusResource.refresh(), scenarioResource.refresh()]);
+  } catch (e) {
+    bulkError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    bulkBusy.value = false;
+  }
+}
 
 const turbines = computed(() => inventory.value?.turbines ?? []);
 const filteredTurbines = computed(() => {
@@ -113,33 +198,7 @@ async function generateInventory(): Promise<void> {
   }
 }
 
-async function applyBulk(): Promise<void> {
-  if (selected.value.size === 0) return;
-  bulkBusy.value = true;
-  bulkError.value = null;
-  bulkMessage.value = null;
-  try {
-    const row: Record<string, unknown> =
-      bulkKind.value === "offline"
-        ? { kind: "offline", unit_ids: [...selected.value], start_local: startLocal.value, end_local: endLocal.value || null }
-        : {
-            kind: "curtailment",
-            unit_ids: [...selected.value],
-            start_local: startLocal.value,
-            end_local: endLocal.value || null,
-            ...(capMode.value === "percent" ? { cap_percent: capPercent.value } : { cap_mw: capMw.value }),
-          };
-    const res = await windyApi.constraintsAdd(siteId.value, [row]);
-    bulkMessage.value = `revision ${res.revision}: ${bulkKind.value} applied to ${selected.value.size} unit(s)` +
-      (res.warnings.length ? ` — ${res.warnings.join("; ")}` : "");
-    selected.value = new Set();
-    await Promise.all([refreshConstraints(), statusResource.refresh()]);
-  } catch (e) {
-    bulkError.value = e instanceof Error ? e.message : String(e);
-  } finally {
-    bulkBusy.value = false;
-  }
-}
+// bulk persistence goes through requestPreview() → confirmApply()
 
 async function applyExportCap(): Promise<void> {
   bulkBusy.value = true;
@@ -159,6 +218,7 @@ async function applyExportCap(): Promise<void> {
     }
     await refreshConstraints();
     await statusResource.refresh();
+    await scenarioResource.refresh();
   } catch (e) {
     bulkError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -171,7 +231,7 @@ async function deleteConstraint(id: number): Promise<void> {
   bulkError.value = null;
   try {
     await windyApi.constraintsDelete(siteId.value, [id]);
-    await Promise.all([refreshConstraints(), statusResource.refresh()]);
+    await Promise.all([refreshConstraints(), statusResource.refresh(), scenarioResource.refresh()]);
   } catch (e) {
     bulkError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -358,10 +418,32 @@ function capLabel(c: OperationalConstraint): string {
                 </label>
                 <button
                   type="button"
+                  class="border-ink-600 text-paper-100 hover:border-sodium-300/60 disabled:opacity-50 border px-3 py-1.5 font-mono text-[11px]"
+                  :disabled="selected.size === 0"
+                  @click="refreshDefaultStart"
+                >now ({{ tz }})</button>
+                <button
+                  type="button"
                   class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 disabled:opacity-50 border px-3 py-1.5 font-mono text-[11px]"
                   :disabled="bulkBusy || selected.size === 0"
-                  @click="applyBulk"
-                >Apply to {{ selected.size }} unit(s)</button>
+                  @click="requestPreview"
+                >Preview {{ selected.size }} unit(s)</button>
+              </div>
+              <div v-if="bulkPreview && !('error' in bulkPreview) && confirmOpen" class="border-sodium-300/40 bg-sodium-300/5 space-y-1 border p-2 font-mono text-[10px]">
+                <p class="text-sodium-200">Confirm before persisting:</p>
+                <p class="text-paper-100">{{ bulkPreview.cap }}</p>
+                <p class="text-paper-300">units: {{ bulkPreview.units.join(", ") }}</p>
+                <p class="text-paper-300">
+                  {{ bulkPreview.start_local }} ({{ tz }}) → <span class="text-sodium-200">{{ bulkPreview.start_utc }}</span>
+                  → {{ bulkPreview.end_local }} → <span class="text-sodium-200">{{ bulkPreview.end_utc }}</span>
+                </p>
+                <p v-for="w in bulkPreview.warnings" :key="w" class="text-heat-300">{{ w }}</p>
+                <button
+                  type="button"
+                  class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 border px-2 py-1"
+                  :disabled="bulkBusy"
+                  @click="confirmApply"
+                >Confirm &amp; persist</button>
               </div>
               <div class="flex flex-wrap items-center gap-2">
                 <span class="text-paper-400 font-mono text-[10px]">farm export cap MW (empty/0 = remove)</span>
@@ -430,13 +512,36 @@ function capLabel(c: OperationalConstraint): string {
             <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
               {{ scenario.note }} Curve mode: <span class="text-paper-100">{{ scenario.summary.curve_mode }}</span>.
               <span v-if="scenario.summary.curve_mode === 'scaled-reference'" class="text-heat-300">REFERENCE/UNVERIFIED — scaled normalized shape.</span>
+              Pinned inputs: inventory revision <span class="text-paper-100">{{ scenario.inventory_revision }}</span>,
+              constraints revision <span class="text-paper-100">{{ scenario.constraints_revision }}</span>,
+              model {{ scenario.model_id }} issued {{ scenario.run_issued_utc ?? "unknown" }},
+              algorithm v{{ scenario.algorithm_version }}.
+              <span v-if="scenario.baseline_comparable === false" class="text-heat-300">
+                {{ scenario.baseline_comparable_reason }}
+              </span>
             </p>
             <div class="mb-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
               <div v-for="(w, name) in scenario.summary.windows" :key="name" class="border-ink-700 bg-ink-900/40 border p-2 font-mono text-[10px]">
-                <p class="text-paper-400">{{ name }} ({{ w.hours }} h archived)</p>
-                <p class="text-paper-100">base {{ w.base_mwh ?? "—" }} MWh</p>
-                <p class="text-sodium-200">adjusted {{ w.adjusted_mwh ?? "—" }} MWh</p>
-                <p class="text-paper-400">unit-loss {{ w.lost_unit_mwh ?? "—" }} · export-loss {{ w.lost_export_mwh ?? "—" }}</p>
+                <p class="text-paper-400">
+                  {{ name }}
+                  <span class="text-paper-100">{{ w.valid_hours }}/{{ w.window_hours }} h</span>
+                  <span v-if="w.short_horizon" class="text-heat-300">short-horizon</span>
+                </p>
+                <p class="text-paper-100">
+                  base
+                  <template v-if="w.complete">{{ w.base_mwh }} MWh</template>
+                  <template v-else>n/a ({{ w.missing_hours }} missing)</template>
+                </p>
+                <p class="text-sodium-200">
+                  adjusted
+                  <template v-if="w.complete">{{ w.adjusted_mwh }} MWh</template>
+                  <template v-else>n/a (incomplete)</template>
+                </p>
+                <p class="text-paper-400">
+                  unit-loss {{ w.lost_unit_mwh ?? "—" }} · export-loss {{ w.lost_export_mwh ?? "—" }}
+                  <template v-if="!w.complete"> · subtotal {{ w.available_hours_subtotal.hours }} h: {{ w.available_hours_subtotal.adjusted_mwh }} MWh</template>
+                </p>
+                <p class="text-paper-400">coverage {{ w.coverage ?? "—" }}</p>
               </div>
             </div>
             <VChart style="height: 18rem" :option="scenarioOption" autoresize />
