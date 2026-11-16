@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS assets (
   timezone TEXT NOT NULL DEFAULT 'Europe/Podgorica',
   power_curve_id TEXT,
   assumptions_json TEXT NOT NULL DEFAULT '{}',
-  notes TEXT
+  notes TEXT,
+  allow_scaled_reference INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS power_curves (
@@ -160,6 +161,49 @@ CREATE TABLE IF NOT EXISTS calibrations (
   note TEXT,
   UNIQUE (site_id, model_id)
 );
+
+CREATE TABLE IF NOT EXISTS turbines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  unit_id TEXT NOT NULL,
+  name TEXT,
+  rated_mw REAL NOT NULL,
+  curve_id TEXT,
+  config_revision INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  UNIQUE (site_id, unit_id, config_revision)
+);
+
+CREATE TABLE IF NOT EXISTS operational_constraints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  kind TEXT NOT NULL,
+  unit_ids_json TEXT,
+  cap_mw REAL,
+  cap_percent REAL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT,
+  revision INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT 'owner',
+  superseded_by INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS scenario_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES forecast_runs(id),
+  inventory_revision INTEGER NOT NULL,
+  constraints_revision INTEGER NOT NULL,
+  algorithm_version TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  summary_json TEXT,
+  UNIQUE (site_id, run_id, inventory_revision, constraints_revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_turbines_rev ON turbines(site_id, config_revision);
+CREATE INDEX IF NOT EXISTS idx_constraints_rev ON operational_constraints(site_id, revision);
 """
 
 
@@ -168,6 +212,50 @@ MIGRATION_3_SQL = """
 -- site-specific (NULL = generic reference curve). Additive only.
 ALTER TABLE backfill_jobs ADD COLUMN site_id TEXT NOT NULL DEFAULT 'krnovo';
 ALTER TABLE power_curves ADD COLUMN site_id TEXT;
+"""
+
+MIGRATION_4_SQL = """
+-- v4: turbine inventory, time-dependent operational constraints and published
+-- scenario revisions. Additive only; existing rows are untouched.
+CREATE TABLE IF NOT EXISTS turbines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  unit_id TEXT NOT NULL,
+  name TEXT,
+  rated_mw REAL NOT NULL,
+  curve_id TEXT,
+  config_revision INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  UNIQUE (site_id, unit_id, config_revision)
+);
+CREATE TABLE IF NOT EXISTS operational_constraints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  kind TEXT NOT NULL,
+  unit_ids_json TEXT,
+  cap_mw REAL,
+  cap_percent REAL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT,
+  revision INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT 'owner',
+  superseded_by INTEGER
+);
+CREATE TABLE IF NOT EXISTS scenario_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  run_id INTEGER NOT NULL REFERENCES forecast_runs(id),
+  inventory_revision INTEGER NOT NULL,
+  constraints_revision INTEGER NOT NULL,
+  algorithm_version TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  summary_json TEXT,
+  UNIQUE (site_id, run_id, inventory_revision, constraints_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_turbines_rev ON turbines(site_id, config_revision);
+CREATE INDEX IF NOT EXISTS idx_constraints_rev ON operational_constraints(site_id, revision);
 """
 
 
@@ -195,6 +283,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.execute("ALTER TABLE backfill_jobs ADD COLUMN site_id TEXT NOT NULL DEFAULT 'krnovo'")
             if "site_id" not in _columns(conn, "power_curves"):
                 conn.execute("ALTER TABLE power_curves ADD COLUMN site_id TEXT")
+        if current < 4:
+            conn.executescript(MIGRATION_4_SQL)
+            if "allow_scaled_reference" not in _columns(conn, "assets"):
+                conn.execute("ALTER TABLE assets ADD COLUMN allow_scaled_reference INTEGER NOT NULL DEFAULT 0")
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

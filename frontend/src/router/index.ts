@@ -30,6 +30,12 @@ export const router = createRouter({
       // Site registry (list/create) — per-site isolation everywhere else.
       component: () => import("@/views/AssetsView.vue"),
     },
+    {
+      path: "/availability",
+      name: "availability",
+      // Availability & curtailment — turbine inventory + operating constraints.
+      component: () => import("@/views/AvailabilityView.vue"),
+    },
   ],
 });
 
