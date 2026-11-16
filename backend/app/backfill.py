@@ -22,6 +22,7 @@ def run_backfill_one(
     run_iso: str,
     days: int = 10,
     client: OpenMeteoClient | None = None,
+    site_id: str = "krnovo",
 ) -> dict:
     """Fetch and archive ONE run identified by its UTC issue stamp
     (`YYYY-MM-DDTHH:00`). Shared by the single-run API/CLI path and the batch
@@ -41,7 +42,7 @@ def run_backfill_one(
     days = max(1, min(int(days), spec.request_days))
     run_issued = normalize_run_iso(run_iso)
 
-    site_row = load_site(settings.db_path, "krnovo")
+    site_row = load_site(settings.db_path, site_id)
     curve = load_curve(settings.db_path, site_row.get("power_curve_id"))
     client = client or OpenMeteoClient(timeout_s=settings.om_timeout_s, max_retries=settings.om_max_retries)
 
@@ -112,12 +113,13 @@ def run_backfill(
     run_hour: int,
     days: int = 10,
     client: OpenMeteoClient | None = None,
+    site_id: str = "krnovo",
 ) -> dict:
     if not model_id or not run_date:
         raise ValueError("model_id and run_date (YYYY-MM-DD) are required")
     if run_hour not in (0, 6, 12, 18):
         raise ValueError("run_hour must be 0, 6, 12 or 18 (UTC run cycles)")
-    return run_backfill_one(settings, model_id, f"{run_date}T{run_hour:02d}:00", days, client=client)
+    return run_backfill_one(settings, model_id, f"{run_date}T{run_hour:02d}:00", days, client=client, site_id=site_id)
 
 
 __all__ = ["run_backfill", "run_backfill_one", "ModelRunUnavailable"]

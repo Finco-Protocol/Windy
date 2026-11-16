@@ -123,11 +123,18 @@ def _read_xlsx(data: bytes) -> tuple[list[str], list[dict]]:
 
 
 def parse_number(raw) -> tuple[float | None, str | None]:
-    """Float parse with European decimal-comma support. Returns (value, warning)."""
+    """Float parse with European decimal-comma support. Returns (value, warning).
+
+    Non-finite values (NaN/inf) are rejected as unparseable — they must never
+    enter the stored actuals or be silently aggregated into a scored hour.
+    """
+    import math
+
     if raw is None or raw == "":
         return None, None
     if isinstance(raw, (int, float)):
-        return float(raw), None
+        v = float(raw)
+        return (v, None) if math.isfinite(v) else (None, "non-finite number (NaN/inf) rejected")
     s = str(raw).strip().replace(" ", "").replace("\u00a0", "")
     if not s:
         return None, None
@@ -136,9 +143,12 @@ def parse_number(raw) -> tuple[float | None, str | None]:
         s = s.replace(",", ".")
         warning = f"decimal comma interpreted: {raw!r} -> {s}"
     try:
-        return float(s), warning
+        v = float(s)
     except ValueError:
         return None, f"unparseable number: {raw!r}"
+    if not math.isfinite(v):
+        return None, "non-finite number (NaN/inf) rejected"
+    return v, warning
 
 
 def parse_timestamp(raw, timestamp_kind: str, tz: ZoneInfo) -> tuple[datetime | None, str | None, str | None]:

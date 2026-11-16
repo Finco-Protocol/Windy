@@ -82,7 +82,7 @@ def test_30min_actuals_aggregate(client):
     assert acc["models"]["gfs_seamless"]["total"]["actual_energy_mwh"] == 4.0  # hour 1 only
 
 
-def test_boundary_straddling_interval_is_unaligned(client):
+def test_boundary_straddling_interval_marks_hour_unscoreable(client):
     api, fake, _s = client
     _push_hourly_forecast(api, fake, "2026-11-14", 3)
     rows = [("2026-11-14T00:00", 1), ("2026-11-14T01:00", 1)]
@@ -91,9 +91,14 @@ def test_boundary_straddling_interval_is_unaligned(client):
 
     acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T03:00:00Z")
     assert acc["actual_intervals_unaligned"] == 1
-    # hours 0 and 1 keep only their aligned interval → complete anyway (1×1h);
-    # the straddler contributes nothing
-    assert acc["actual_hours_in_range"] == 2
+    # V1.2 stricter rule: an hour containing a boundary-crossing interval is
+    # NOT scoreable (reported with a reason) even if another aligned interval
+    # would have covered it — no quiet fixing of untrusted source data.
+    assert acc["actual_hours_in_range"] == 1  # hour 1 only
+    ov = api.get("/api/accuracy/overlay", params={"from_utc": "2026-11-14T00:00:00Z", "to_utc": "2026-11-14T03:00:00Z"}).json()
+    h0 = next(h for h in ov["hours"] if h["valid_at_utc"] == "2026-11-14T00:00:00Z")
+    assert h0.get("actual_partial") is True
+    assert h0.get("actual_reason") == "boundary-crossing interval"
     assert acc["models"]["gfs_seamless"]["total"]["actual_energy_mwh"] == 1.0  # hour 1 = 1 MWh
 
 
@@ -131,3 +136,81 @@ def test_hourly_energy_equals_average_mw_for_complete_hour(client):
     gfs = acc["models"]["gfs_seamless"]["total"]
     assert gfs["actual_energy_mwh"] == 7.0  # only hour 1 pairs (lead > 0)
     assert gfs["n_pairs"] == 1
+
+
+# ---- V1.2 strict coverage: overlap / gap / mixed / limits -----------------------
+
+
+def acc_overlay_hours(api, f, t):
+    return api.get("/api/accuracy/overlay", params={"from_utc": f, "to_utc": t}).json()["hours"]
+
+
+def test_overlapping_intervals_are_not_complete(client):
+    """Durations summing to an hour with overlaps must NOT score the hour —
+    the union rule detects the overlap and reports the reason."""
+    api, _fake, _s = client
+    # hour 0: three 15-min intervals starting every 10 minutes → overlaps
+    rows = [("2026-11-14T00:00", 1), ("2026-11-14T00:10", 1), ("2026-11-14T00:20", 1)]
+    _import_rows(api, rows, 0.25)
+    # hour 1: one clean hour
+    _import_rows(api, [("2026-11-14T01:00", 2)], 1.0)
+
+    acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z")
+    assert acc["actual_hours_in_range"] == 1
+    h0 = next(h for h in acc_overlay_hours(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z") if h["valid_at_utc"] == "2026-11-14T00:00:00Z")
+    assert h0.get("actual_partial") is True
+    assert h0.get("actual_reason") == "overlapping intervals"
+
+
+def test_gap_even_when_durations_sum_to_one_hour(client):
+    """Durations that would sum to an hour, but with a gap: union < 1 h → not
+    scoreable, reason 'gap in coverage'."""
+    api, _fake, _s = client
+    # 00:00–00:15 and 00:45–01:00: sum 30 min here; the point is the hole in
+    # the middle — union 30 min, boundaries covered, reason = gap.
+    _import_rows(api, [("2026-11-14T00:00", 1), ("2026-11-14T00:45", 1)], 0.25)
+    _import_rows(api, [("2026-11-14T01:00", 2)], 1.0)
+
+    acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z")
+    assert acc["actual_hours_in_range"] == 1
+    h0 = next(h for h in acc_overlay_hours(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z") if h["valid_at_utc"] == "2026-11-14T00:00:00Z")
+    assert h0.get("actual_partial") is True
+    assert h0.get("actual_reason") == "gap in coverage"
+
+
+def test_mixed_15_30_60_minute_intervals_form_complete_hour(client):
+    api, _fake, _s = client
+    _import_rows(api, [("2026-11-14T00:00", 1), ("2026-11-14T00:15", 1)], 0.25)  # 15+15
+    _import_rows(api, [("2026-11-14T00:30", 2)], 0.5)  # +30 → hour 0 complete
+    _import_rows(api, [("2026-11-14T01:00", 2), ("2026-11-14T01:30", 2)], 0.5)  # 30+30
+    _import_rows(api, [("2026-11-14T02:00", 3)], 1.0)  # 60
+
+    acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T03:00:00Z")
+    assert acc["actual_hours_in_range"] == 3, "15/30/60-minute mixed coverage must form complete hours"
+    assert acc["actual_hours_partial"] == 0
+
+
+def test_reading_over_site_limit_marks_hour_unscoreable(client):
+    api, _fake, _s = client
+    # default site capacity is 71.5 MW; 80 MWh in one hour → 80 MW → over limit
+    _import_rows(api, [("2026-11-14T00:00", 80)], 1.0)
+    _import_rows(api, [("2026-11-14T01:00", 10)], 1.0)
+
+    acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z")
+    assert acc["actual_intervals_over_limit"] == 1
+    assert acc["actual_hours_in_range"] == 1  # only the sane hour scores
+    h0 = next(h for h in acc_overlay_hours(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z") if h["valid_at_utc"] == "2026-11-14T00:00:00Z")
+    assert h0.get("actual_reason") == "reading exceeds site physical limit"
+
+
+def test_nan_and_inf_readings_rejected_at_import(client):
+    api, _fake, _s = client
+    csv_text = "ts,mwh\n2026-11-14T00:00:00Z,nan\n2026-11-14T01:00:00Z,inf\n2026-11-14T02:00:00Z,5\n"
+    mapping = '{"timestamp_col":"ts","value_col":"mwh","value_kind":"energy_mwh","tz":"UTC","interval_hours":1.0}'
+    r = api.post(
+        "/api/actuals/import",
+        files={"file": ("nan.csv", io.BytesIO(csv_text.encode()), "text/csv")},
+        data={"mapping": mapping, "on_conflict": "replace"},
+    )
+    assert r.status_code == 400, "non-finite readings must block the import"
+    assert api.get("/api/actuals").json()["rows"] == [], "nothing persisted"

@@ -3,6 +3,7 @@ import { computed, onScopeDispose, ref } from "vue";
 
 import AppFooter from "@/components/AppFooter.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
+import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
 import {
   modelColor,
@@ -16,17 +17,19 @@ import {
   type SiteResponse,
 } from "@/api/windy";
 import { useAbortableResource } from "@/composables/useAbortableResource";
+import { useActiveSite } from "@/composables/useActiveSite";
 
 // Screen B — Historical Runs. Every row is an archived forecast issue: what a
 // model predicted at a specific run cycle, stored immutably with its raw
 // provenance. Backfill is deliberately bounded to ONE run per action.
 
-const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(signal), () => []);
+const { siteId } = useActiveSite();
+const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(siteId.value, signal), () => [siteId.value]);
 const { data: siteData, loading: siteLoading, error: siteError } = siteResource;
 const modelFilter = ref<string | null>(null);
 const runsResource = useAbortableResource<{ runs: RunSummary[] }>(
-  (signal) => windyApi.runs(modelFilter.value, signal),
-  () => [modelFilter.value],
+  (signal) => windyApi.runs(modelFilter.value, siteId.value, signal),
+  () => [modelFilter.value, siteId.value],
 );
 const { error: runsError } = runsResource;
 
@@ -39,14 +42,14 @@ const selectedId = ref<number | null>(null);
 const targetDate = ref<string>(new Date(Date.now() - 86400_000).toISOString().slice(0, 10));
 
 const detailResource = useAbortableResource<RunDetail | null>(
-  async (signal) => (selectedId.value === null ? null : windyApi.runDetail(selectedId.value, signal)),
-  () => [selectedId.value],
+  async (signal) => (selectedId.value === null ? null : windyApi.runDetail(selectedId.value, siteId.value, signal)),
+  () => [selectedId.value, siteId.value],
 );
 const { error: detailError } = detailResource;
 
 const compareResource = useAbortableResource<CompareResponse | null>(
-  async (signal) => (selectedId.value === null ? null : windyApi.compare(selectedId.value, targetDate.value, signal)),
-  () => [selectedId.value, targetDate.value],
+  async (signal) => (selectedId.value === null ? null : windyApi.compare(selectedId.value, targetDate.value, siteId.value, signal)),
+  () => [selectedId.value, targetDate.value, siteId.value],
 );
 const { data: compareData, error: compareError } = compareResource;
 
@@ -67,6 +70,7 @@ async function backfill(): Promise<void> {
     const res = await windyApi.backfill(bfModel.value, bfDate.value, bfHour.value);
     bfResult.value = `${res.model_id} run ${res.run_issued_utc} ${res.created ? "archived" : "already archived"} · ${res.points} hourly points`;
     await runsResource.refresh();
+    await healthResource.refresh();
   } catch (e) {
     bfError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -83,8 +87,8 @@ function issueBadge(source: string): string {
 // ---- archive health ------------------------------------------------------------
 
 const healthResource = useAbortableResource<{ models: ArchiveHealthModel[] }>(
-  (signal) => windyApi.archiveHealth(signal),
-  () => [],
+  (signal) => windyApi.archiveHealth(siteId.value, signal),
+  () => [siteId.value],
 );
 const { data: healthData } = healthResource;
 
@@ -130,6 +134,7 @@ function batchBody(): Record<string, unknown> {
     cycles: selectedCycles.value,
     days: batchDays.value,
     max_requests: batchMaxRequests.value,
+    site_id: siteId.value,
   };
 }
 
@@ -210,9 +215,12 @@ const RECENT_RESULTS = 24;
 
       <template v-else>
         <div class="flex flex-wrap items-center justify-between gap-3">
-          <h1 class="text-paper-50 font-mono text-lg tracking-wide">Historical runs</h1>
+          <div class="flex items-center gap-3">
+            <SiteSelector />
+            <h1 class="text-paper-50 font-mono text-lg tracking-wide">Historical runs</h1>
+          </div>
           <a
-            href="/api/export/forecast.csv"
+            :href="`/api/export/forecast.csv?site_id=${encodeURIComponent(siteId)}`"
             class="border-ink-700 text-paper-300 hover:border-sodium-300/60 hover:text-sodium-200 border px-3 py-1 font-mono text-[11px] transition-colors"
           >Download archive CSV</a>
         </div>
@@ -243,6 +251,8 @@ const RECENT_RESULTS = 24;
                   <th class="py-1.5 pr-3">first → last issue (UTC)</th>
                   <th class="py-1.5 pr-3">points</th>
                   <th class="py-1.5 pr-3">missing cycles</th>
+                  <th class="py-1.5 pr-3">last fetch (UTC)</th>
+                  <th class="py-1.5 pr-3">last error</th>
                 </tr>
               </thead>
               <tbody>
@@ -255,6 +265,8 @@ const RECENT_RESULTS = 24;
                   <td class="py-1.5 pr-3" :class="m.n_missing_cycles ? 'text-sodium-200' : 'text-paper-300'">
                     {{ m.n_missing_cycles ?? "—" }}<span v-if="m.missing_cycles.length" class="text-paper-400"> ({{ m.missing_cycles.join(", ") }})</span>
                   </td>
+                  <td class="text-paper-300 py-1.5 pr-3">{{ m.last_fetched_utc ?? "—" }}</td>
+                  <td class="py-1.5 pr-3" :class="m.last_error ? 'text-heat-300' : 'text-paper-400'">{{ m.last_error ?? "—" }}</td>
                 </tr>
               </tbody>
             </table>

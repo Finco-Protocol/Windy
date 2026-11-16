@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -48,7 +48,8 @@ CREATE TABLE IF NOT EXISTS power_curves (
   cut_in_mps REAL,
   rated_mps REAL,
   cut_out_mps REAL,
-  points_json TEXT NOT NULL
+  points_json TEXT NOT NULL,
+  site_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS forecast_runs (
@@ -129,7 +130,8 @@ CREATE TABLE IF NOT EXISTS backfill_jobs (
   n_unavailable INTEGER NOT NULL DEFAULT 0,
   n_failed INTEGER NOT NULL DEFAULT 0,
   n_skipped INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT
+  last_error TEXT,
+  site_id TEXT NOT NULL DEFAULT 'krnovo'
 );
 
 CREATE TABLE IF NOT EXISTS backfill_results (
@@ -161,6 +163,18 @@ CREATE TABLE IF NOT EXISTS calibrations (
 """
 
 
+MIGRATION_3_SQL = """
+-- v3: multi-site — every batch job belongs to a site; a curve may be marked
+-- site-specific (NULL = generic reference curve). Additive only.
+ALTER TABLE backfill_jobs ADD COLUMN site_id TEXT NOT NULL DEFAULT 'krnovo';
+ALTER TABLE power_curves ADD COLUMN site_id TEXT;
+"""
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Apply pending migrations in order. SCHEMA_SQL is idempotent (IF NOT
     EXISTS) and covers fresh databases; the version stamp gates re-runs."""
@@ -174,6 +188,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if current < SCHEMA_VERSION:
         if current < 2:
             conn.executescript(MIGRATION_2_SQL)
+        if current < 3:
+            # ALTER TABLE ... ADD COLUMN fails if the column already exists;
+            # guard per column so partially-migrated databases converge.
+            if "site_id" not in _columns(conn, "backfill_jobs"):
+                conn.execute("ALTER TABLE backfill_jobs ADD COLUMN site_id TEXT NOT NULL DEFAULT 'krnovo'")
+            if "site_id" not in _columns(conn, "power_curves"):
+                conn.execute("ALTER TABLE power_curves ADD COLUMN site_id TEXT")
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

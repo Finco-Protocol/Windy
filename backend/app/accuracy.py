@@ -73,45 +73,115 @@ def _lead_hours(issued: str, valid: str) -> float | None:
 # --- actual-side hourly aggregation ---------------------------------------------
 
 
-def hourly_actuals(conn, site_id: str, from_utc: str, to_utc: str) -> tuple[dict[str, dict], int]:
-    """Aggregate measured intervals into UTC hours.
+def hourly_actuals(conn, site_id: str, from_utc: str, to_utc: str, capacity_mw: float | None = None) -> tuple[dict[str, dict], dict]:
+    """Aggregate measured intervals into UTC hours with strict coverage rules.
 
-    An interval contributes to the hour of its start when it lies fully inside
-    that hour: [start, end) ⊆ [hour_floor, hour_floor + 1h). A full-hour
-    interval 00:00→01:00 therefore belongs to hour 00 (end == boundary is
-    allowed); anything straddling a boundary (e.g. 00:10→01:10) or longer than
-    an hour is counted as unaligned and excluded — reported, never silently
-    redistributed. A hour with total coverage >= 0.999 h is `complete`.
+    A scored hour must be covered by a **non-overlapping continuous union** of
+    measured intervals that starts at the hour boundary and ends at the next
+    one (tolerance 1 s). Intervals may be 15/30/60 minutes or mixed. An hour is
+    excluded — with an explicit reason — when intervals overlap, leave a gap,
+    miss a boundary, cross an hour boundary, have invalid duration, contain
+    non-finite readings, or exceed a sensible physical limit
+    (`power_mw > capacity_mw × 1.05` when capacity is known). Energy is never
+    invented and stored data is never modified: bad hours are simply not
+    scoreable.
 
-    Returns ({hour_prefix "YYYY-MM-DDTHH": {energy_mwh, covered_hours, n, complete}},
-    n_unaligned_intervals).
+    Returns ({hour_prefix: {energy_mwh, covered_hours, n, complete, reason}},
+    counts {unaligned, invalid, over_limit}).
     """
     from datetime import timedelta as _timedelta
 
+    tol = 1.0 / 3600.0  # 1 second, in hours
     rows = conn.execute(
-        "SELECT interval_start_utc, interval_end_utc, energy_mwh FROM actual_points "
+        "SELECT interval_start_utc, interval_end_utc, energy_mwh, power_mw FROM actual_points "
         "WHERE site_id=? AND interval_start_utc >= ? AND interval_start_utc < ?",
         (site_id, from_utc, to_utc),
     ).fetchall()
+
     hours: dict[str, dict] = {}
-    unaligned = 0
+    counts = {"unaligned": 0, "invalid": 0, "over_limit": 0}
+
     for r in rows:
         start = datetime_from_iso(r["interval_start_utc"])
         end = datetime_from_iso(r["interval_end_utc"])
+        energy = r["energy_mwh"]
+        power = r["power_mw"]
         hour_floor = start.replace(minute=0, second=0, microsecond=0)
         hour_ceil = hour_floor + _timedelta(hours=1)
-        if end <= start or end > hour_ceil:
-            unaligned += 1
-            continue
-        duration = (end - start).total_seconds() / 3600.0
         prefix = hour_floor.strftime("%Y-%m-%dT%H")
-        slot = hours.setdefault(prefix, {"energy_mwh": 0.0, "covered_hours": 0.0, "n": 0})
-        slot["energy_mwh"] += r["energy_mwh"] or 0.0
-        slot["covered_hours"] += duration
+        slot = hours.setdefault(
+            prefix,
+            {"energy_mwh": 0.0, "covered_hours": 0.0, "n": 0, "complete": False, "reason": None, "intervals": []},
+        )
+
+        bad_duration = end <= start
+        crosses_boundary = (not bad_duration) and end > hour_ceil
+        nonfinite = energy is None or power is None or not (math_isfinite(energy) and math_isfinite(power))
+        over_limit = capacity_mw is not None and power is not None and math_isfinite(power) and power > capacity_mw * 1.05
+
+        if bad_duration or crosses_boundary or nonfinite or over_limit:
+            if bad_duration or nonfinite:
+                counts["invalid"] += 1
+            elif crosses_boundary:
+                counts["unaligned"] += 1
+            else:
+                counts["over_limit"] += 1
+            slot["n"] += 1
+            if slot["reason"] is None:
+                if bad_duration:
+                    slot["reason"] = "invalid duration"
+                elif crosses_boundary:
+                    slot["reason"] = "boundary-crossing interval"
+                elif nonfinite:
+                    slot["reason"] = "non-finite reading"
+                else:
+                    slot["reason"] = "reading exceeds site physical limit"
+            continue
+
+        slot["energy_mwh"] += energy
         slot["n"] += 1
-    for slot in hours.values():
-        slot["complete"] = slot["covered_hours"] >= 0.999
-    return hours, unaligned
+        slot["intervals"].append((start, end, energy))
+
+    for prefix, slot in hours.items():
+        if slot["reason"] is not None:
+            continue
+        hour_start = datetime_from_iso(hour_stamp(prefix))
+        hour_end = hour_start + _timedelta(hours=1)
+        ivs = sorted(slot["intervals"])
+        overlap = any(ivs[i + 1][0] < ivs[i][1] - _timedelta(seconds=1) for i in range(len(ivs) - 1))
+        union_h = 0.0
+        merged: list = []
+        for s, e, _energy in ivs:
+            if merged and s <= merged[-1][1] + _timedelta(seconds=1):
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        for s, e in merged:
+            union_h += (e - s).total_seconds() / 3600.0
+
+        if overlap:
+            slot["reason"] = "overlapping intervals"
+        elif union_h < 1.0 - tol:
+            slot["reason"] = "gap in coverage"
+        elif ivs and (ivs[0][0] > hour_start + _timedelta(seconds=1) or ivs[-1][1] < hour_end - _timedelta(seconds=1)):
+            slot["reason"] = "hour boundary not covered"
+        else:
+            slot["complete"] = True
+            slot["covered_hours"] = union_h
+        slot.pop("intervals", None)
+
+    complete = {h: s for h, s in hours.items() if s["complete"]}
+    # keep only summary fields on the returned hours
+    for s in hours.values():
+        s.pop("intervals", None)
+        s.setdefault("covered_hours", 0.0)
+    return hours, counts
+
+
+def math_isfinite(v) -> bool:
+    import math
+
+    return isinstance(v, (int, float)) and math.isfinite(v)
 
 
 def hour_stamp(hour_prefix: str) -> str:
@@ -121,16 +191,29 @@ def hour_stamp(hour_prefix: str) -> str:
 # --- shared pair collection ------------------------------------------------------
 
 
-def collect_best_pairs(db_path, site_id: str, from_utc: str, to_utc: str) -> dict:
-    """Best-issue forecast/actual pairs per model over complete actual hours.
+def collect_best_pairs(db_path, site_id: str, from_utc: str, to_utc: str, per_bin: bool = False) -> dict:
+    """Forecast/actual pairs per model over complete actual hours.
 
-    Returns {per_model: {model_id: [{valid_at, run_issued_utc, f_mw, f_mwh, a_mwh}]},
-    actual_hours: {...}, counts: {complete, partial, unaligned}}.
+    Selection policy (auditable, deterministic):
+
+    - per_bin=True — the pair-selection key is (model, valid_hour, lead_bin):
+      within each lead bin, the LATEST qualifying archived issue wins. The same
+      actual hour can therefore contribute to the 1-, 2-, 3-, 5- and 7-day bins
+      when issues at those leads actually exist; a recent day-ahead issue can
+      never displace a genuine older 3-day prediction from its own bin.
+    - per_bin=False (overall / calibration policy) — at most ONE forecast per
+      (model, valid_hour): the latest known issue as of that hour. Overall
+      totals are computed from this deduplicated set, never by summing bins.
+
+    Both policies exclude issue-unknown forecasts, reanalysis and any issue
+    at/after the valid time itself.
     """
     f = parse_z(from_utc)
     t = parse_z(to_utc)
     with dbm.session(db_path) as conn:
-        hours, unaligned = hourly_actuals(conn, site_id, f, t)
+        capacity_row = conn.execute("SELECT capacity_mw FROM assets WHERE id=?", (site_id,)).fetchone()
+        capacity = float(capacity_row["capacity_mw"]) if capacity_row else None
+        hours, coverage_counts = hourly_actuals(conn, site_id, f, t, capacity_mw=capacity)
         forecast_rows = conn.execute(
             """
             SELECT fr.model_id, fr.run_issued_utc, fp.valid_at_utc,
@@ -151,25 +234,37 @@ def collect_best_pairs(db_path, site_id: str, from_utc: str, to_utc: str) -> dic
     complete_hours = {h: s for h, s in hours.items() if s["complete"]}
     partial = sum(1 for s in hours.values() if not s["complete"])
 
-    # best issue per (model, valid hour): latest issued wins
-    best: dict[tuple[str, str], dict] = {}
+    counts = {
+        "complete": len(complete_hours),
+        "partial": partial,
+        "unaligned": coverage_counts["unaligned"],
+        "invalid": coverage_counts["invalid"],
+        "over_limit": coverage_counts["over_limit"],
+    }
+
+    best: dict[tuple, dict] = {}
     for r in forecast_rows:
         hour_prefix = r["valid_at_utc"][:13]
         if hour_prefix not in complete_hours:
             continue
-        key = (r["model_id"], hour_prefix)
+        lead = _lead_hours(r["run_issued_utc"], hour_stamp(hour_prefix))
+        if lead is None:
+            continue
+        label = lead_bin_label(lead) if per_bin else ""
+        key = (r["model_id"], hour_prefix, label)
         prev = best.get(key)
         if prev is None or r["run_issued_utc"] > prev["run_issued_utc"]:
             best[key] = {
                 "valid_at": hour_stamp(hour_prefix),
                 "run_issued_utc": r["run_issued_utc"],
+                "lead_hours": lead,
                 "f_mw": r["modeled_power_mw"],
                 "f_mwh": r["interval_energy_mwh"],
                 "a_mwh": complete_hours[hour_prefix]["energy_mwh"],
             }
 
     per_model: dict[str, list[dict]] = {}
-    for (model_id, _h), item in best.items():
+    for (model_id, _h, _label), item in best.items():
         per_model.setdefault(model_id, []).append(item)
     for pairs in per_model.values():
         pairs.sort(key=lambda p: p["valid_at"])
@@ -177,11 +272,7 @@ def collect_best_pairs(db_path, site_id: str, from_utc: str, to_utc: str) -> dic
     return {
         "per_model": per_model,
         "actual_hours": hours,
-        "counts": {
-            "complete": len(complete_hours),
-            "partial": partial,
-            "unaligned": unaligned,
-        },
+        "counts": counts,
         "from_utc": f,
         "to_utc": t,
     }
@@ -241,63 +332,77 @@ class BinMetrics:
 
 
 def accuracy(db_path, site_id: str, from_utc: str, to_utc: str, use_calibration: bool = False) -> dict:
-    """Per-model, per-lead-bin MAE/bias/WAPE over archived runs ∩ complete actual hours."""
+    """Per-model metrics over archived runs ∩ complete actual hours.
+
+    Bins use per-lead selection (the same actual hour may appear in several
+    bins — each from its own latest qualifying issue). The `total` block is a
+    DEDUPLICATED overall score: the latest known issue per valid hour only,
+    never a sum over bins.
+    """
     if parse_z(to_utc) <= parse_z(from_utc):
         raise ValueError("to_utc must be after from_utc")
-    collected = collect_best_pairs(db_path, site_id, from_utc, to_utc)
-    counts = collected["counts"]
+    bin_collected = collect_best_pairs(db_path, site_id, from_utc, to_utc, per_bin=True)
+    overall_collected = collect_best_pairs(db_path, site_id, from_utc, to_utc, per_bin=False)
+    counts = bin_collected["counts"]
     n_complete = counts["complete"]
     factors = _load_factors(db_path, site_id) if use_calibration else {}
     applied: dict[str, float] = {}
 
     models: dict[str, dict] = {}
-    for model_id, pairs in collected["per_model"].items():
+    all_models = sorted(set(bin_collected["per_model"]) | set(overall_collected["per_model"]))
+    for model_id in all_models:
         factor = factors.get(model_id, 1.0)
         if use_calibration and model_id in factors:
             applied[model_id] = factor
+
+        # per-lead-bin metrics: each bin independently selects its own pairs
         bins = {label: BinMetrics() for label in BIN_LABELS}
-        for pair in pairs:
-            lead = _lead_hours(pair["run_issued_utc"], pair["valid_at"])
-            if lead is None:
-                continue
-            label = lead_bin_label(lead)
+        for pair in bin_collected["per_model"].get(model_id, []):
+            label = lead_bin_label(pair["lead_hours"])
             if label is None:
                 continue
             item = _apply_factor(pair, factor) if factor != 1.0 else pair
             # a complete hour's energy (MWh) equals its average power (MW)
             bins[label].add(item["f_mw"], item["a_mwh"], item["f_mwh"], item["a_mwh"], item["valid_at"])
         bins_out: dict[str, dict] = {}
-        total = BinMetrics()
         for label in BIN_LABELS:
             m = bins[label]
             if m.n == 0:
                 continue
-            total.abs_err_mw += m.abs_err_mw
-            total.err_mw += m.err_mw
-            total.abs_err_mwh += m.abs_err_mwh
-            total.actual_mwh += m.actual_mwh
-            total.forecast_mwh += m.forecast_mwh
-            total.n += m.n
-            total.hours |= m.hours
             bins_out[label] = m.to_dict(n_complete)
+
+        # overall: deduplicated (one forecast per valid hour), computed directly
+        total = BinMetrics()
+        for pair in overall_collected["per_model"].get(model_id, []):
+            if lead_bin_label(pair["lead_hours"]) is None:
+                continue
+            item = _apply_factor(pair, factor) if factor != 1.0 else pair
+            total.add(item["f_mw"], item["a_mwh"], item["f_mwh"], item["a_mwh"], item["valid_at"])
         models[model_id] = {"bins": bins_out, "total": total.to_dict(n_complete) if total.n else None}
 
     return {
         "site_id": site_id,
-        "from_utc": collected["from_utc"],
-        "to_utc": collected["to_utc"],
+        "from_utc": bin_collected["from_utc"],
+        "to_utc": bin_collected["to_utc"],
         "actual_hours_in_range": n_complete,
         "actual_hours_partial": counts["partial"],
         "actual_intervals_unaligned": counts["unaligned"],
+        "actual_intervals_invalid": counts["invalid"],
+        "actual_intervals_over_limit": counts["over_limit"],
         "lead_bins": BIN_LABELS,
         "models": models,
         "calibration_applied": applied,
-        "has_measured_actuals": n_complete + counts["partial"] + counts["unaligned"] > 0,
+        "has_measured_actuals": n_complete + counts["partial"] + counts["unaligned"] + counts["invalid"] > 0,
+        "selection_policy": (
+            "bins: latest archived issue per (model, valid hour, lead bin) — one hour may appear "
+            "in several bins; overall: latest known issue per (model, valid hour), deduplicated"
+        ),
         "note": (
-            "Actual meter intervals are aggregated to complete UTC hours (partial/unaligned "
-            "hours are reported, never scored). MAE/bias in MW; WAPE over hourly energy (MWh). "
-            "Only archived runs with a known issue time and valid_at strictly after the issue "
-            "are compared — no reanalysis or current-forecast substitution."
+            "A scored hour is a non-overlapping continuous union of measured intervals spanning "
+            "the full UTC hour (gaps/overlaps/boundary misses are reported, never scored). "
+            "MAE/bias in MW; WAPE over hourly energy (MWh). Only archived runs with a known "
+            "issue time and valid_at strictly after the issue are compared — no reanalysis or "
+            "current-forecast substitution."
         ),
     }
 
@@ -316,7 +421,7 @@ def overlay(
         raise ValueError(f"lead_bin must be one of {BIN_LABELS}")
     if parse_z(to_utc) <= parse_z(from_utc):
         raise ValueError("to_utc must be after from_utc")
-    collected = collect_best_pairs(db_path, site_id, from_utc, to_utc)
+    collected = collect_best_pairs(db_path, site_id, from_utc, to_utc, per_bin=lead_bin is not None)
     factors = _load_factors(db_path, site_id) if use_calibration else {}
 
     by_valid: dict[str, dict] = {}
@@ -328,14 +433,14 @@ def overlay(
         else:
             entry["actual_partial"] = True
             entry["actual_covered_hours"] = round(slot["covered_hours"], 4)
+            if slot.get("reason"):
+                entry["actual_reason"] = slot["reason"]
 
     for model_id, pairs in collected["per_model"].items():
         factor = factors.get(model_id, 1.0)
         for pair in pairs:
-            if lead_bin is not None:
-                lead = _lead_hours(pair["run_issued_utc"], pair["valid_at"])
-                if lead is None or lead_bin_label(lead) != lead_bin:
-                    continue
+            if lead_bin is not None and lead_bin_label(pair["lead_hours"]) != lead_bin:
+                continue  # per-bin collection already filtered; double-guard
             value = pair["f_mwh"] * factor
             by_valid.setdefault(pair["valid_at"], {"valid_at_utc": pair["valid_at"]}).setdefault("models", {})[model_id] = round(value, 4)
 

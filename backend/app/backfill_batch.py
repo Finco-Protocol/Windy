@@ -61,6 +61,7 @@ class BatchParams:
     days: int
     max_requests: int
     dry_run: bool = False
+    site_id: str = "krnovo"
 
 
 def parse_params(body: dict) -> BatchParams:
@@ -94,6 +95,10 @@ def parse_params(body: dict) -> BatchParams:
     if not 1 <= max_requests <= MAX_REQUESTS_CAP:
         raise BatchError(f"max_requests must be 1..{MAX_REQUESTS_CAP}")
 
+    site_id = str(body.get("site_id") or "krnovo")
+    if not site_id or not site_id.replace("-", "").replace("_", "").isalnum():
+        raise BatchError("site_id must be a simple slug (letters, digits, -, _)")
+
     return BatchParams(
         models=tuple(models),
         date_from=date_from,
@@ -102,6 +107,7 @@ def parse_params(body: dict) -> BatchParams:
         days=days,
         max_requests=max_requests,
         dry_run=bool(body.get("dry_run")),
+        site_id=site_id,
     )
 
 
@@ -172,8 +178,9 @@ def create_job(db_path, params: BatchParams) -> int:
     now = iso_z(datetime.now(timezone.utc))
     with dbm.session(db_path) as conn:
         cur = conn.execute(
-            "INSERT INTO backfill_jobs (created_at_utc, params_json, planned_runs_json, status) VALUES (?, ?, ?, 'paused')",
-            (now, dbm.j(params.__dict__), dbm.j(planned)),
+            "INSERT INTO backfill_jobs (created_at_utc, params_json, planned_runs_json, status, site_id) "
+            "VALUES (?, ?, ?, 'paused', ?)",
+            (now, dbm.j(params.__dict__), dbm.j(planned), params.site_id),
         )
         job_id = int(cur.lastrowid)
     return job_id
@@ -196,13 +203,19 @@ def get_job(db_path, job_id: int) -> dict | None:
     return job
 
 
-def list_jobs(db_path, limit: int = 20) -> list[dict]:
+def list_jobs(db_path, limit: int = 20, site_id: str | None = None) -> list[dict]:
+    q = (
+        "SELECT id, created_at_utc, status, cursor_index, n_stored, n_already, n_unavailable, "
+        "n_failed, n_skipped, last_error, site_id, params_json FROM backfill_jobs"
+    )
+    args: list = []
+    if site_id:
+        q += " WHERE site_id=?"
+        args.append(site_id)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
     with dbm.session(db_path) as conn:
-        rows = conn.execute(
-            "SELECT id, created_at_utc, status, cursor_index, n_stored, n_already, n_unavailable, "
-            "n_failed, n_skipped, last_error, params_json FROM backfill_jobs ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        rows = conn.execute(q, args).fetchall()
     jobs = []
     for r in rows:
         job = dict(r)
@@ -255,8 +268,11 @@ def _worker(db_path, job_id: int, client: OpenMeteoClient, settings) -> None:
     """Run the planned tasks from the persisted cursor, checkpointing each one."""
     try:
         with dbm.session(db_path) as conn:
-            row = conn.execute("SELECT planned_runs_json FROM backfill_jobs WHERE id=?", (job_id,)).fetchone()
+            row = conn.execute(
+                "SELECT planned_runs_json, site_id FROM backfill_jobs WHERE id=?", (job_id,)
+            ).fetchone()
             planned = json.loads(row["planned_runs_json"])
+            site_id = row["site_id"] or "krnovo"
         consecutive_failures = 0
         from .backfill import run_backfill_one
 
@@ -281,6 +297,7 @@ def _worker(db_path, job_id: int, client: OpenMeteoClient, settings) -> None:
                     item["run_iso"],
                     item["request_days"],
                     client=client,
+                    site_id=site_id,
                 )
                 counter = "n_stored" if result["created"] else "n_already"
                 _record_result(db_path, job_id, seq, item, "stored" if result["created"] else "already-archived", None, counter)

@@ -5,6 +5,7 @@ import VChart from "vue-echarts";
 import AppFooter from "@/components/AppFooter.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SegmentedToggle from "@/components/SegmentedToggle.vue";
+import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
 import {
   modelColor,
@@ -18,12 +19,14 @@ import {
   type SiteResponse,
 } from "@/api/windy";
 import { useAbortableResource } from "@/composables/useAbortableResource";
+import { useActiveSite } from "@/composables/useActiveSite";
 
 // Screen C — Actual vs Forecast. Actuals are measured generation from the
 // user's CSV/XLSX; forecast values come exclusively from archived runs. Where
 // actuals are missing the app says so — it never invents accuracy.
 
-const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(signal), () => []);
+const { siteId } = useActiveSite();
+const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(siteId.value, signal), () => [siteId.value]);
 const { data: siteData, loading: siteLoading, error: siteError } = siteResource;
 
 // ---- upload + mapping ---------------------------------------------------------
@@ -76,7 +79,7 @@ async function doPreview(): Promise<void> {
   importError.value = null;
   importResult.value = null;
   try {
-    preview.value = await windyApi.actualsPreview(file.value, mapping.value);
+    preview.value = await windyApi.actualsPreview(file.value, mapping.value, siteId.value);
   } catch (e) {
     preview.value = null;
     importError.value = e instanceof Error ? e.message : String(e);
@@ -90,7 +93,7 @@ async function doImport(): Promise<void> {
   busy.value = true;
   importError.value = null;
   try {
-    importResult.value = await windyApi.actualsImport(file.value, mapping.value, onConflict.value);
+    importResult.value = await windyApi.actualsImport(file.value, mapping.value, onConflict.value, siteId.value);
     if (importResult.value.imported) await Promise.all([accuracyResource.refresh(), overlayResource.refresh()]);
   } catch (e) {
     importError.value = e instanceof Error ? e.message : String(e);
@@ -116,21 +119,21 @@ const leadBin = ref<string>("");
 
 const useCalibration = ref(false);
 const accuracyResource = useAbortableResource<AccuracyResponse>(
-  (signal) => windyApi.accuracy(fromUtc.value, toUtc.value, useCalibration.value, signal),
-  () => [fromUtc.value, toUtc.value, useCalibration.value],
+  (signal) => windyApi.accuracy(fromUtc.value, toUtc.value, useCalibration.value, siteId.value, signal),
+  () => [fromUtc.value, toUtc.value, useCalibration.value, siteId.value],
 );
 const { data: accuracyData } = accuracyResource;
 const overlayResource = useAbortableResource<OverlayResponse>(
-  (signal) => windyApi.overlay(fromUtc.value, toUtc.value, leadBin.value || null, useCalibration.value, signal),
-  () => [fromUtc.value, toUtc.value, leadBin.value, useCalibration.value],
+  (signal) => windyApi.overlay(fromUtc.value, toUtc.value, leadBin.value || null, useCalibration.value, siteId.value, signal),
+  () => [fromUtc.value, toUtc.value, leadBin.value, useCalibration.value, siteId.value],
 );
 const { data: overlayData } = overlayResource;
 
 // ---- calibration (optional, derived series) -----------------------------------
 
 const calibResource = useAbortableResource<{ models: CalibrationEntry[]; note: string }>(
-  (signal) => windyApi.calibration(signal),
-  () => [],
+  (signal) => windyApi.calibration(siteId.value, signal),
+  () => [siteId.value],
 );
 const { data: calibData } = calibResource;
 const calibBusy = ref(false);
@@ -142,7 +145,7 @@ async function trainCalibration(): Promise<void> {
   calibError.value = null;
   calibMessage.value = null;
   try {
-    const res = await windyApi.calibrationTrain(fromUtc.value, toUtc.value);
+    const res = await windyApi.calibrationTrain(fromUtc.value, toUtc.value, siteId.value);
     const models = (res.models as Record<string, { status: string; factor?: number }>) ?? {};
     calibMessage.value = Object.entries(models)
       .map(([id, m]) => `${id}: ${m.status}${m.factor ? ` (factor ${m.factor})` : ""}`)
@@ -168,6 +171,18 @@ const accuracyRows = computed(() => {
     if (data.total) rows.push({ model, bin: "all leads", binObj: data.total });
   }
   return rows;
+});
+
+// Honest ranking: only when ≥2 models have deduplicated overall scores over a
+// meaningful number of complete hours. Never a "score" from thin data.
+const ranking = computed<string | null>(() => {
+  const models = accuracyData.value?.models ?? {};
+  const eligible = Object.entries(models)
+    .filter(([, d]) => d.total && d.total.n_pairs >= 24 && (d.total.coverage ?? 0) >= 0.5)
+    .map(([id, d]) => ({ id, mae: d.total?.mae_mw ?? Number.POSITIVE_INFINITY }));
+  if (eligible.length < 2) return null;
+  eligible.sort((a, b) => a.mae - b.mae);
+  return "ranking by overall MAE (≥24 matched hours, coverage ≥50%): " + eligible.map((e) => `${e.id} (${e.mae} MW)`).join(" > ");
 });
 
 const axisLabel = { color: "#93896f", fontSize: 10, fontFamily: "JetBrains Mono, monospace" };
@@ -223,7 +238,10 @@ const overlayOption = computed<Record<string, unknown>>(() => {
       <StateBlock v-else-if="siteLoading" kind="loading" caption="Connecting…" />
 
       <template v-else>
-        <h1 class="text-paper-50 font-mono text-lg tracking-wide">Actual vs forecast</h1>
+        <div class="flex items-center gap-3">
+          <SiteSelector />
+          <h1 class="text-paper-50 font-mono text-lg tracking-wide">Actual vs forecast</h1>
+        </div>
         <p class="text-paper-400 font-mono text-[10px] leading-relaxed">
           Import measured generation (CSV, or XLSX). Timestamps are stored in UTC; naive local times are interpreted in the site
           timezone ({{ siteData?.site.timezone }}) with explicit DST handling. Overwriting existing rows requires the explicit
@@ -397,8 +415,11 @@ const overlayOption = computed<Record<string, unknown>>(() => {
               {{ accuracyData.note }}
               Matched hours are complete UTC hours: {{ accuracyData.actual_hours_in_range }} complete,
               {{ accuracyData.actual_hours_partial }} partial (not scored),
-              {{ accuracyData.actual_intervals_unaligned }} unaligned intervals.
+              {{ accuracyData.actual_intervals_unaligned }} unaligned,
+              {{ accuracyData.actual_intervals_invalid }} invalid readings,
+              {{ accuracyData.actual_intervals_over_limit }} over site limit.
             </p>
+            <p v-if="ranking" class="text-sodium-200 mb-2 font-mono text-[10px]">{{ ranking }}</p>
             <div class="mb-2 flex items-center gap-2">
               <label class="text-paper-300 flex items-center gap-1.5 font-mono text-[10px]">
                 <input v-model="useCalibration" type="checkbox" class="accent-sodium-300" />
