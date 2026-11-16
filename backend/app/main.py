@@ -21,9 +21,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import accuracy as accuracy_mod
+from . import calibration as calibration_mod
 from . import db as dbm
 from . import store
 from .actuals import ActualsError, parse_actuals, persist_actuals
+from .backfill_batch import (
+    BatchError,
+    create_job,
+    get_job,
+    list_jobs,
+    mark_interrupted_jobs_paused,
+    parse_params,
+    plan_preview,
+    request_cancel,
+    start_job,
+)
 from .collect import collect_site, iso_z, parse_utc
 from .config import Settings
 from .openmeteo import OMError, OpenMeteoClient
@@ -31,6 +43,10 @@ from .registry import SOURCE_PROVIDER, WINDY_MODELS
 from .scheduler import start_scheduler
 
 log = logging.getLogger("windy")
+
+# Upload guard for the single-user local app: generous for meter CSVs/XLSX,
+# but bounded so a stray huge file cannot exhaust memory.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 
 
 def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | None = None) -> FastAPI:
@@ -40,13 +56,18 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.ensure_db(settings.db_path)
+        # Jobs left 'running' by a dead process are checkpoint-safe but must not
+        # silently continue: mark them paused; resume is an explicit user action.
+        n_interrupted = mark_interrupted_jobs_paused(settings.db_path)
+        if n_interrupted:
+            log.info("marked %d interrupted backfill job(s) as paused", n_interrupted)
         app.state.scheduler = start_scheduler(app, settings) if settings.scheduler_enabled else None
         log.info("Windy backend ready (db=%s, scheduler=%s)", settings.db_path, bool(app.state.scheduler))
         yield
         if app.state.scheduler:
             app.state.scheduler.shutdown(wait=False)
 
-    app = FastAPI(title="Windy", version="1.0.0", lifespan=lifespan)
+    app = FastAPI(title="Windy", version="1.1.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.om_client = client
 
@@ -78,6 +99,9 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     @app.exception_handler(ValueError)
     async def _value_error(_req: Request, exc: ValueError):
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # BatchError subclasses ValueError; declared for clarity in OpenAPI errors.
+    _ = BatchError
 
     # ---- basics ------------------------------------------------------------
 
@@ -153,6 +177,118 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
             )
         except MRU as exc:
             raise HTTPException(status_code=404, detail=f"UNAVAILABLE: {exc}") from exc
+
+    # ---- batch historical backfill -------------------------------------------
+
+    @app.post("/api/backfill/batch")
+    def backfill_batch(body: dict):
+        """Dry-run preview or start of a bounded batch backfill job."""
+        params = parse_params(body or {})
+        if params.dry_run:
+            return plan_preview(params)
+        job_id = create_job(settings.db_path, params)
+        start_job(settings.db_path, job_id, client, settings)
+        return {"job_id": job_id, "status": "running"}
+
+    @app.get("/api/backfill/batch")
+    def backfill_batch_list():
+        return {"jobs": list_jobs(settings.db_path)}
+
+    @app.get("/api/backfill/batch/{job_id}")
+    def backfill_batch_get(job_id: int):
+        job = get_job(settings.db_path, job_id)
+        if job is None:
+            raise KeyError(f"no backfill job {job_id}")
+        return job
+
+    @app.post("/api/backfill/batch/{job_id}/cancel")
+    def backfill_batch_cancel(job_id: int):
+        if get_job(settings.db_path, job_id) is None:
+            raise KeyError(f"no backfill job {job_id}")
+        request_cancel(settings.db_path, job_id)
+        return {"job_id": job_id, "status": get_job(settings.db_path, job_id)["status"]}
+
+    @app.post("/api/backfill/batch/{job_id}/resume")
+    def backfill_batch_resume(job_id: int):
+        job = get_job(settings.db_path, job_id)
+        if job is None:
+            raise KeyError(f"no backfill job {job_id}")
+        if job["status"] not in ("paused", "cancelled", "failed"):
+            raise ValueError(f"job {job_id} is '{job['status']}' — only paused/cancelled/failed jobs can resume")
+        start_job(settings.db_path, job_id, client, settings)
+        return {"job_id": job_id, "status": "running"}
+
+    # ---- archive health ---------------------------------------------------------
+
+    @app.get("/api/archive/health")
+    def archive_health():
+        """Coverage per model: verified issue cycles vs unknown-issue live
+        fallbacks, first/last issue, points, and missing 6-hourly cycles within
+        the archived window."""
+        out = []
+        with dbm.session(settings.db_path) as conn:
+            points_per_model = {
+                r["model_id"]: r["n"]
+                for r in conn.execute(
+                    "SELECT fr.model_id AS model_id, COUNT(*) AS n FROM forecast_points fp "
+                    "JOIN forecast_runs fr ON fr.id = fp.run_id WHERE fr.site_id='krnovo' AND fr.status='ok' "
+                    "GROUP BY fr.model_id"
+                ).fetchall()
+            }
+            for spec in WINDY_MODELS:
+                runs = conn.execute(
+                    "SELECT run_issued_utc, id FROM forecast_runs "
+                    "WHERE site_id='krnovo' AND model_id=? AND status='ok' ORDER BY run_issued_utc",
+                    (spec.id,),
+                ).fetchall()
+                known = [r for r in runs if r["run_issued_utc"] is not None]
+                n_points = points_per_model.get(spec.id, 0)
+                entry = {
+                    "model_id": spec.id,
+                    "label": spec.label,
+                    "known_issue_cycles": len(set(r["run_issued_utc"] for r in known)),
+                    "issue_unknown_runs": len(runs) - len(known),
+                    "first_issue_utc": known[0]["run_issued_utc"] if known else None,
+                    "last_issue_utc": known[-1]["run_issued_utc"] if known else None,
+                    "total_points": n_points,
+                    "missing_cycles": [],
+                    "n_missing_cycles": None,
+                    "note": "issue-unknown runs (live fallback) are not scoreable and never counted as verified history",
+                }
+                if known:
+                    expected = set()
+                    cur = parse_utc(known[0]["run_issued_utc"])
+                    last = parse_utc(known[-1]["run_issued_utc"])
+                    while cur <= last:
+                        expected.add(cur.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                        cur += timedelta(hours=6)
+                    have = set(r["run_issued_utc"] for r in known)
+                    missing = sorted(expected - have)
+                    entry["n_missing_cycles"] = len(missing)
+                    entry["missing_cycles"] = missing[:12]
+                out.append(entry)
+        return {"models": out}
+
+    # ---- calibration (optional, derived series only) ------------------------------
+
+    @app.get("/api/calibration")
+    def calibration_get():
+        return {
+            "site_id": "krnovo",
+            "models": calibration_mod.get_calibrations(settings.db_path, "krnovo"),
+            "note": (
+                "Optional explainable calibration (bounded per-model multiplicative factor). "
+                "Archived forecast values are never modified; factors apply to derived views only."
+            ),
+        }
+
+    @app.post("/api/calibration/train")
+    def calibration_train(body: dict):
+        from_utc = str((body or {}).get("from_utc") or "")
+        to_utc = str((body or {}).get("to_utc") or "")
+        if not from_utc or not to_utc:
+            raise ValueError("from_utc and to_utc are required")
+        return calibration_mod.train(settings.db_path, "krnovo", from_utc, to_utc)
 
     # ---- forecast display ----------------------------------------------------
 
@@ -336,9 +472,11 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- actuals -----------------------------------------------------------------
 
     def _read_upload(file: UploadFile) -> tuple[str, bytes]:
-        data = file.file.read()
+        data = file.file.read(MAX_UPLOAD_BYTES + 1)
         if not data:
             raise ActualsError("uploaded file is empty")
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"upload exceeds {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit")
         return file.filename or "upload.csv", data
 
     @app.post("/api/actuals/preview")
@@ -420,12 +558,17 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- accuracy -----------------------------------------------------------------
 
     @app.get("/api/accuracy")
-    def accuracy(from_utc: str, to_utc: str):
-        return accuracy_mod.accuracy(settings.db_path, "krnovo", from_utc, to_utc)
+    def accuracy(from_utc: str, to_utc: str, use_calibration: bool = Query(False)):
+        return accuracy_mod.accuracy(settings.db_path, "krnovo", from_utc, to_utc, use_calibration=use_calibration)
 
     @app.get("/api/accuracy/overlay")
-    def accuracy_overlay(from_utc: str, to_utc: str, lead_bin: str | None = None):
-        return accuracy_mod.overlay(settings.db_path, "krnovo", from_utc, to_utc, lead_bin)
+    def accuracy_overlay(
+        from_utc: str,
+        to_utc: str,
+        lead_bin: str | None = None,
+        use_calibration: bool = Query(False),
+    ):
+        return accuracy_mod.overlay(settings.db_path, "krnovo", from_utc, to_utc, lead_bin, use_calibration=use_calibration)
 
     # ---- export ---------------------------------------------------------------------
 

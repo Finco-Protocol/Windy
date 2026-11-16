@@ -2,6 +2,7 @@
 
 import io
 
+from app.db import SCHEMA_VERSION
 from tests.conftest import make_raw_run
 
 
@@ -9,7 +10,7 @@ def test_health(client):
     api, _fake, settings = client
     h = api.get("/api/health").json()
     assert h["ok"] is True
-    assert h["schema_version"] == "1"
+    assert h["schema_version"] == str(SCHEMA_VERSION)
     assert str(settings.db_path) == h["db_path"]
 
 

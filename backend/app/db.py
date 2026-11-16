@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -111,6 +111,75 @@ CREATE INDEX IF NOT EXISTS idx_points_valid ON forecast_points(valid_at_utc);
 CREATE INDEX IF NOT EXISTS idx_actual_valid ON actual_points(site_id, interval_start_utc);
 """
 
+# --- versioned migrations -------------------------------------------------------
+# Each migration runs once, in order, on existing databases; SCHEMA_SQL above
+# already contains the v2 tables so fresh databases create them directly.
+# Migrations are additive only — never destructive, never reset user data.
+
+MIGRATION_2_SQL = """
+CREATE TABLE IF NOT EXISTS backfill_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+  params_json TEXT NOT NULL,
+  planned_runs_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  cursor_index INTEGER NOT NULL DEFAULT 0,
+  n_stored INTEGER NOT NULL DEFAULT 0,
+  n_already INTEGER NOT NULL DEFAULT 0,
+  n_unavailable INTEGER NOT NULL DEFAULT 0,
+  n_failed INTEGER NOT NULL DEFAULT 0,
+  n_skipped INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS backfill_results (
+  job_id INTEGER NOT NULL REFERENCES backfill_jobs(id) ON DELETE CASCADE,
+  seq INTEGER NOT NULL,
+  model_id TEXT NOT NULL,
+  run_issued_utc TEXT NOT NULL,
+  status TEXT NOT NULL,
+  detail TEXT,
+  PRIMARY KEY (job_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS calibrations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL,
+  model_id TEXT NOT NULL,
+  factor REAL NOT NULL,
+  n_train_hours INTEGER NOT NULL,
+  n_val_hours INTEGER NOT NULL,
+  val_mae_before REAL,
+  val_mae_after REAL,
+  val_wape_before REAL,
+  val_wape_after REAL,
+  trained_at_utc TEXT NOT NULL,
+  status TEXT NOT NULL,
+  note TEXT,
+  UNIQUE (site_id, model_id)
+);
+"""
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply pending migrations in order. SCHEMA_SQL is idempotent (IF NOT
+    EXISTS) and covers fresh databases; the version stamp gates re-runs."""
+    current = 0
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row:
+        try:
+            current = int(row["value"])
+        except ValueError:
+            current = 0
+    if current < SCHEMA_VERSION:
+        if current < 2:
+            conn.executescript(MIGRATION_2_SQL)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     """Open a connection with WAL, FK enforcement and a busy timeout."""
@@ -138,14 +207,10 @@ def session(db_path: str | Path) -> Iterator[sqlite3.Connection]:
 
 
 def init_db(db_path: str | Path) -> None:
-    """Create schema if missing and stamp the schema version."""
+    """Create schema if missing, apply pending migrations, stamp the version."""
     with session(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
+        _migrate(conn)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
