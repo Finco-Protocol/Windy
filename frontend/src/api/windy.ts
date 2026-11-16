@@ -293,6 +293,117 @@ export interface AssetCreate {
   timezone: string;
   power_curve_id: string;
   notes?: string;
+  reconcile_nameplate?: boolean;
+  allow_scaled_reference?: boolean;
+}
+
+export interface Turbine {
+  unit_id: string;
+  name: string | null;
+  rated_mw: number;
+  curve_id: string | null;
+  created_at_utc: string;
+}
+
+export interface Inventory {
+  site_id: string;
+  revision: number;
+  n_turbines: number;
+  installed_mw: number;
+  turbines: Turbine[];
+}
+
+export interface OperationalConstraint {
+  id: number;
+  kind: "offline" | "curtailment" | "export_cap";
+  unit_ids: string[] | null;
+  cap_mw: number | null;
+  cap_percent: number | null;
+  start_utc: string;
+  end_utc: string | null;
+  revision: number;
+  created_at_utc: string;
+  created_by: string;
+}
+
+export interface SiteOperatingStatus {
+  site_id: string;
+  installed_mw: number;
+  available_max_mw: number;
+  offline_count: number;
+  curtailed_count: number;
+  farm_export_cap_mw: number | null;
+  n_turbines: number;
+  inventory_revision: number;
+  constraints_revision: number;
+}
+
+export interface ScenarioPoint {
+  valid_at_utc: string;
+  base_mw: number | null;
+  adjusted_mw: number | null;
+  pre_export_mw: number | null;
+  lost_to_unit_mwh: number | null;
+  lost_to_export_mwh: number | null;
+  interval_hours: number;
+  status: string;
+}
+
+export interface ScenarioWindow {
+  window_hours: number;
+  start_valid_utc: string | null;
+  end_valid_utc: string | null;
+  expected_hours: number;
+  valid_hours: number;
+  missing_hours: number;
+  coverage: number | null;
+  complete: boolean;
+  short_horizon?: boolean;
+  base_mwh: number | null;
+  adjusted_mwh: number | null;
+  lost_unit_mwh: number | null;
+  lost_export_mwh: number | null;
+  available_hours_subtotal: {
+    hours: number;
+    base_mwh: number;
+    adjusted_mwh: number;
+    lost_unit_mwh: number;
+    lost_export_mwh: number;
+    note: string;
+  };
+}
+
+export interface ScenarioResponse {
+  site_id: string;
+  run_id: number;
+  model_id: string;
+  run_issued_utc: string | null;
+  inventory_revision: number;
+  constraints_revision: number;
+  algorithm_version: string;
+  installed_mw: number;
+  n_turbines: number;
+  baseline_comparable: boolean;
+  baseline_comparable_reason: string | null;
+  points: ScenarioPoint[];
+  summary: {
+    installed_mw: number;
+    curve_mode: string;
+    windows: { "24h": ScenarioWindow; "7d": ScenarioWindow; "10d": ScenarioWindow };
+  };
+  note: string;
+}
+
+export interface ScenarioRevision {
+  id: number;
+  model_id: string;
+  run_id: number;
+  run_issued_utc: string | null;
+  inventory_revision: number;
+  constraints_revision: number;
+  algorithm_version: string;
+  created_at_utc: string;
+  summary: { installed_mw?: number; curve_mode?: string; windows?: Record<string, ScenarioWindow> };
 }
 
 export interface CalibrationEntry {
@@ -371,6 +482,15 @@ async function postMultipart<T>(path: string, file: File, fields: Record<string,
   return (await res.json()) as T;
 }
 
+async function delJson<T>(path: string): Promise<T> {
+  const res = await fetch(BASE + path, { method: "DELETE" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`windy api ${res.status}: ${text.slice(0, 300) || res.statusText}`);
+  }
+  return (await res.json()) as T;
+}
+
 export interface ActualsMapping {
   timestamp_col: string;
   value_col: string;
@@ -437,6 +557,31 @@ export const windyApi = {
       `/actuals?site_id=${encodeURIComponent(siteId)}`,
       signal,
     ),
+  inventory: (siteId: string, signal?: AbortSignal) => getJson<Inventory>(`/assets/${encodeURIComponent(siteId)}/turbines`, signal),
+  inventoryGenerate: (siteId: string, count: number, ratingMw: number, unitPrefix = "WTG") =>
+    postJson<Inventory>(`/assets/${encodeURIComponent(siteId)}/turbines/generate`, { count, rating_mw: ratingMw, unit_prefix: unitPrefix }),
+  inventoryBulkRatings: (siteId: string, edits: { unit_id: string; rated_mw: number }[]) =>
+    postJson<Inventory>(`/assets/${encodeURIComponent(siteId)}/turbines/bulk-ratings`, { edits }),
+  inventoryDelete: (siteId: string) => delJson<Inventory>(`/assets/${encodeURIComponent(siteId)}/turbines`),
+  constraints: (siteId: string, signal?: AbortSignal) => getJson<{ site_id: string; revision: number; constraints: OperationalConstraint[] }>(`/assets/${encodeURIComponent(siteId)}/constraints`, signal),
+  constraintsAdd: (siteId: string, rows: Record<string, unknown>[]) =>
+    postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[]; warnings: string[] }>(
+      `/assets/${encodeURIComponent(siteId)}/constraints`,
+      { rows },
+    ),
+  constraintsDelete: (siteId: string, ids: number[]) =>
+    postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[] }>(`/assets/${encodeURIComponent(siteId)}/constraints/delete`, { ids }),
+  operatingStatus: (siteId: string, signal?: AbortSignal) =>
+    getJson<SiteOperatingStatus>(`/assets/${encodeURIComponent(siteId)}/status`, signal),
+  scenario: (siteId: string, runId: number, signal?: AbortSignal) =>
+    getJson<ScenarioResponse>(`/assets/${encodeURIComponent(siteId)}/scenario?run_id=${runId}`, signal),
+  scenarioPublish: (siteId: string, runId: number) =>
+    postJson<{ scenario_revision_id: number; created_at_utc: string; summary: Record<string, unknown> }>(
+      `/assets/${encodeURIComponent(siteId)}/scenario/publish`,
+      { run_id: runId },
+    ),
+  scenarioRevisions: (siteId: string, signal?: AbortSignal) =>
+    getJson<{ revisions: ScenarioRevision[] }>(`/assets/${encodeURIComponent(siteId)}/scenario/revisions`, signal),
 };
 
 /** Model display colors, stable across all three screens. */

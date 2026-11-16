@@ -7,6 +7,7 @@ const links = [
   { to: "/", label: "Forecast" },
   { to: "/history", label: "Historical runs" },
   { to: "/actuals", label: "Actuals & accuracy" },
+  { to: "/availability", label: "Availability" },
   { to: "/sites", label: "Sites" },
 ];
 </script>

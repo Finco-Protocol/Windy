@@ -44,3 +44,7 @@ class Settings:
         self.frontend_dist = _env_path("WINDY_FRONTEND_DIST", dist_default)
         # Default forecast collection depth (days); clamped per-model in registry.
         self.collect_days = int(os.environ.get("WINDY_COLLECT_DAYS", "10"))
+        # Site the scheduled (twice-daily) collection runs for. Deliberately a
+        # single explicit site so newly created sites can never flood the
+        # provider from the background scheduler; collect others manually.
+        self.collect_site_id = os.environ.get("WINDY_COLLECT_SITE_ID", "krnovo")

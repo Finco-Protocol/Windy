@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import accuracy as accuracy_mod
+from . import availability as availability_mod
 from . import calibration as calibration_mod
 from . import db as dbm
 from . import store
@@ -132,6 +133,145 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     @app.get("/api/power-curves")
     def curves_list():
         return {"curves": store.list_curves(settings.db_path)}
+
+    # ---- availability & curtailment ------------------------------------------------
+
+    from .availability import AvailabilityError
+
+    @app.exception_handler(AvailabilityError)
+    async def _availability_error(_req: Request, exc: AvailabilityError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.get("/api/assets/{site_id}/turbines")
+    def turbines_get(site_id: str, revision: int | None = Query(None)):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.get_inventory(settings.db_path, site_id, revision)
+
+    @app.post("/api/assets/{site_id}/turbines/generate")
+    def turbines_generate(site_id: str, body: dict):
+        store.load_site(settings.db_path, site_id)
+        body = body or {}
+        return availability_mod.generate_inventory(
+            settings.db_path, site_id, body.get("count"), body.get("rating_mw"), str(body.get("unit_prefix") or "WTG")
+        )
+
+    @app.post("/api/assets/{site_id}/turbines/bulk-ratings")
+    def turbines_bulk_ratings(site_id: str, body: dict):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.bulk_edit_ratings(settings.db_path, site_id, (body or {}).get("edits") or [])
+
+    @app.delete("/api/assets/{site_id}/turbines")
+    def turbines_delete(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.delete_inventory(settings.db_path, site_id)
+
+    @app.get("/api/assets/{site_id}/constraints")
+    def constraints_get(site_id: str, revision: int | None = Query(None)):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.get_constraints(settings.db_path, site_id, revision)
+
+    @app.post("/api/assets/{site_id}/constraints")
+    def constraints_add(site_id: str, body: dict):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.add_constraints(settings.db_path, site_id, (body or {}).get("rows") or [])
+
+    @app.post("/api/assets/{site_id}/constraints/delete")
+    def constraints_delete(site_id: str, body: dict):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.delete_constraints(settings.db_path, site_id, (body or {}).get("ids") or [])
+
+    @app.get("/api/assets/{site_id}/status")
+    def availability_status(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.site_status(settings.db_path, site_id)
+
+    @app.get("/api/assets/{site_id}/scenario")
+    def scenario_get(site_id: str, run_id: int, inventory_revision: int | None = Query(None), constraints_revision: int | None = Query(None)):
+        store.load_site(settings.db_path, site_id)
+        return availability_mod.scenario_for_run(settings.db_path, site_id, run_id, inventory_revision, constraints_revision)
+
+    @app.post("/api/assets/{site_id}/scenario/publish")
+    def scenario_publish(site_id: str, body: dict):
+        """Publish a scenario revision snapshot (summary pinned to immutable
+        inputs). Republishing the same inputs is an idempotent no-op."""
+        import json as _json
+
+        store.load_site(settings.db_path, site_id)
+        body = body or {}
+        run_id = int(body.get("run_id"))
+        inv_rev = body.get("inventory_revision")
+        cons_rev = body.get("constraints_revision")
+        scenario = availability_mod.scenario_for_run(settings.db_path, site_id, run_id, inv_rev, cons_rev)
+        summary = {
+            "installed_mw": scenario["installed_mw"],
+            "n_turbines": scenario["n_turbines"],
+            "curve_mode": scenario["summary"]["curve_mode"],
+            "windows": scenario["summary"]["windows"],
+            "note": scenario["note"],
+        }
+        now = iso_z(datetime.now(timezone.utc))
+        with dbm.session(settings.db_path) as conn:
+            conn.execute(
+                "INSERT INTO scenario_revisions (site_id, model_id, run_id, inventory_revision, "
+                "constraints_revision, algorithm_version, created_at_utc, summary_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(site_id, run_id, inventory_revision, constraints_revision) DO NOTHING",
+                (
+                    site_id,
+                    scenario["model_id"],
+                    run_id,
+                    scenario["inventory_revision"],
+                    scenario["constraints_revision"],
+                    availability_mod.ALGORITHM_VERSION,
+                    now,
+                    dbm.j(summary),
+                ),
+            )
+            row = conn.execute(
+                "SELECT id, created_at_utc, summary_json FROM scenario_revisions "
+                "WHERE site_id=? AND run_id=? AND inventory_revision=? AND constraints_revision=?",
+                (site_id, run_id, scenario["inventory_revision"], scenario["constraints_revision"]),
+            ).fetchone()
+        return {
+            "scenario_revision_id": row["id"],
+            "created_at_utc": row["created_at_utc"],
+            "summary": json.loads(row["summary_json"]),
+            "points_available_at": (
+                f"/api/assets/{site_id}/scenario?run_id={run_id}"
+                f"&inventory_revision={scenario['inventory_revision']}&constraints_revision={scenario['constraints_revision']}"
+            ),
+            "retrieval": {
+                "run_id": run_id,
+                "site_id": site_id,
+                "inventory_revision": scenario["inventory_revision"],
+                "constraints_revision": scenario["constraints_revision"],
+                "note": "pinned to the exact revisions this snapshot was computed from — reopening reproduces THIS revision, not the currently active configuration",
+            },
+        }
+
+    @app.get("/api/assets/{site_id}/scenario/revisions")
+    def scenario_revisions_list(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        with dbm.session(settings.db_path) as conn:
+            rows = conn.execute(
+                "SELECT sr.id AS id, sr.site_id AS site_id, sr.model_id AS model_id, sr.run_id AS run_id, "
+                "fr.run_issued_utc AS run_issued_utc, sr.inventory_revision AS inventory_revision, "
+                "sr.constraints_revision AS constraints_revision, sr.algorithm_version AS algorithm_version, "
+                "sr.created_at_utc AS created_at_utc, sr.summary_json AS summary_json "
+                "FROM scenario_revisions sr LEFT JOIN forecast_runs fr ON fr.id = sr.run_id "
+                "WHERE sr.site_id=? ORDER BY sr.id DESC LIMIT 100",
+                (site_id,),
+            ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["summary"] = json.loads(item.pop("summary_json") or "{}")
+            item["retrieve_at"] = (
+                f"/api/assets/{site_id}/scenario?run_id={item['run_id']}"
+                f"&inventory_revision={item['inventory_revision']}&constraints_revision={item['constraints_revision']}"
+            )
+            out.append(item)
+        return {"revisions": out}
 
     @app.get("/api/site")
     def site(site_id: str = Query("krnovo")):

@@ -187,7 +187,13 @@ def create_asset(db_path, fields: dict) -> dict:
     lat = _float(fields, "latitude", -90.0, 90.0)
     lon = _float(fields, "longitude", -180.0, 180.0)
     capacity = _float(fields, "capacity_mw", 0.001, 10000.0)
-    turbine_count = int(_float(fields, "turbine_count", 1, 10000))
+    count_raw = fields.get("turbine_count")
+    try:
+        turbine_count = int(count_raw)
+    except (TypeError, ValueError):
+        raise ValueError("turbine_count must be a whole number (never a decimal)") from None
+    if turbine_count != float(count_raw) or turbine_count < 1:
+        raise ValueError("turbine_count must be a positive whole number (never a decimal)")
     turbine_rated = _float(fields, "turbine_rated_mw", 0.01, 20.0)
     hub = _float(fields, "hub_height_m", 10.0, 300.0)
     loss_raw = fields.get("loss_factor", 0)
@@ -204,6 +210,18 @@ def create_asset(db_path, fields: dict) -> dict:
         raise ValueError(f"unknown timezone: {tz_name!r}") from None
 
     curve_id = str(_req("power_curve_id")).strip()
+    # Nameplate reconciliation: installed capacity (capacity_mw) and
+    # count × common rating are separate fields; a disagreement must be
+    # explicitly reconciled (mixed-fleet mode), never silently accepted.
+    implied = turbine_count * turbine_rated
+    reconcile = bool(fields.get("reconcile_nameplate"))
+    if abs(implied - capacity) > 0.05 and not reconcile:
+        raise ValueError(
+            f"installed capacity ({capacity} MW) does not match turbine_count × rating "
+            f"({implied} MW). Pass reconcile_nameplate=true ONLY for an explicitly declared "
+            "mixed fleet (per-unit ratings will define the true nameplate)."
+        )
+    allow_scaled = 1 if bool(fields.get("allow_scaled_reference")) else 0
     with dbm.session(db_path) as conn:
         curve = conn.execute(
             "SELECT id, site_id FROM power_curves WHERE id=?", (curve_id,)
@@ -217,8 +235,9 @@ def create_asset(db_path, fields: dict) -> dict:
             """
             INSERT INTO assets (id, name, country, latitude, longitude, capacity_mw,
                                 turbine_count, turbine_model, turbine_rated_mw, hub_height_m,
-                                loss_factor, timezone, power_curve_id, assumptions_json, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                loss_factor, timezone, power_curve_id, assumptions_json, notes,
+                                allow_scaled_reference)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -244,9 +263,14 @@ def create_asset(db_path, fields: dict) -> dict:
                             f"Explicitly selected curve '{curve_id}'"
                             + (" (site-specific)." if curve["site_id"] else " — generic REFERENCE curve, not site-specific; modelled MWh are unverified estimates.")
                         ),
+                        "nameplate": (
+                            f"installed {capacity} MW declared; count × common rating = {implied} MW"
+                            + (" (explicitly reconciled mixed fleet — per-unit turbine inventory defines the true nameplate)" if reconcile and abs(implied - capacity) > 0.05 else "")
+                        ),
                     }
                 ),
                 str(fields.get("notes") or "User-created asset."),
+                allow_scaled,
             ),
         )
     return load_site(db_path, site_id)
