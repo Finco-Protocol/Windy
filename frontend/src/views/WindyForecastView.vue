@@ -5,15 +5,18 @@ import VChart from "vue-echarts";
 import AppFooter from "@/components/AppFooter.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SegmentedToggle from "@/components/SegmentedToggle.vue";
+import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
 import { modelColor, windyApi, type ForecastResponse, type ForecastModel, type SiteResponse } from "@/api/windy";
 import { useAbortableResource } from "@/composables/useAbortableResource";
+import { useActiveSite } from "@/composables/useActiveSite";
 
 // Screen A — Forecast. Everything shown here comes from the backend archive:
 // the same data Historical Runs stores, so the UI can never display something
 // that was not persisted with its provenance.
 
-const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(signal), () => []);
+const { siteId } = useActiveSite();
+const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(siteId.value, signal), () => [siteId.value]);
 const { data: siteData, loading: siteLoading, error: siteError } = siteResource;
 
 const DAYS_OPTIONS = [
@@ -21,7 +24,10 @@ const DAYS_OPTIONS = [
   { value: 10, label: "10 days" },
 ] as const;
 const days = ref<7 | 10>(7);
-const fcResource = useAbortableResource<ForecastResponse>((signal) => windyApi.forecast(days.value, signal), () => [days.value]);
+const fcResource = useAbortableResource<ForecastResponse>(
+  (signal) => windyApi.forecast(days.value, siteId.value, signal),
+  () => [days.value, siteId.value],
+);
 const { data: fcData, loading: fcLoading, error: fcError } = fcResource;
 
 // ---- collection -----------------------------------------------------------
@@ -35,7 +41,7 @@ async function fetchNow(): Promise<void> {
   collectError.value = null;
   collectMessage.value = null;
   try {
-    const res = await windyApi.collect(days.value);
+    const res = await windyApi.collect(days.value, siteId.value);
     const parts = res.models.map((m) => `${m.model_id}: ${m.status}${m.run_issued_utc ? ` (${m.run_issued_utc})` : ""}`);
     collectMessage.value = `Collected ${res.collected_at_utc} — ${parts.join(" · ")}`;
     await fcResource.refresh();
@@ -182,11 +188,14 @@ const curveUncalibrated = computed(() => fcData.value?.power_curve.status !== "m
 
       <template v-else-if="siteData">
         <div class="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h1 class="text-paper-50 font-mono text-lg tracking-wide">{{ siteData.site.name }}</h1>
-            <p class="text-paper-300 font-mono text-[11px]">
-              {{ siteData.site.capacity_mw }} MW · {{ siteData.site.turbine_count }} × {{ siteData.site.turbine_rated_mw }} MW · hub {{ siteData.site.hub_height_m }} m (provisional)
-            </p>
+          <div class="flex items-center gap-3">
+            <SiteSelector />
+            <div>
+              <h1 class="text-paper-50 font-mono text-lg tracking-wide">{{ siteData.site.name }}</h1>
+              <p class="text-paper-300 font-mono text-[11px]">
+                {{ siteData.site.capacity_mw }} MW · {{ siteData.site.turbine_count }} × {{ siteData.site.turbine_rated_mw }} MW · hub {{ siteData.site.hub_height_m }} m (provisional)
+              </p>
+            </div>
           </div>
           <div class="flex items-center gap-3">
             <SegmentedToggle v-model="days" :options="DAYS_OPTIONS" inline divided />

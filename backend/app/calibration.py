@@ -6,13 +6,19 @@ model (median of actual/modelled over training hours, bounded to
 
 Integrity rules:
 
+- Declared deterministic training-selection policy: **the latest known issue
+  per (model, valid hour)** — exactly one forecast per measured hour, so
+  training never sees the same actual hour repeated across lead bins. The
+  policy is persisted in each calibration row's note.
 - Training requires imported REAL measured actuals joined to archived
   known-issue forecasts, a minimum number of matched hours, and a validation
   holdout that is strictly LATER in time than the training window (chronological
   80/20 split) — no leakage, in-sample vs out-of-sample clearly reported.
 - Calibration is a DERIVED series: stored forecast runs, points and raw
   payloads are never modified. Applying a factor multiplies forecast values in
-  accuracy metrics/overlays only (see accuracy.use_calibration).
+  accuracy metrics/overlays only (see accuracy.use_calibration). Calibrated
+  comparisons are RETROSPECTIVE analyses over the archived range — they are
+  not a claim about what was knowable at the original issuance time.
 - With insufficient data the stored status is `not-calibrated-insufficient`
   and the factor is 1.0 — the UI shows `NOT CALIBRATED / insufficient actuals`
   instead of inventing a correction.
@@ -115,7 +121,8 @@ def train(db_path, site_id: str, from_utc: str, to_utc: str) -> dict:
                     {"factor": 1.0, "n_train_hours": len(train_pairs), "n_val_hours": len(val_pairs),
                      "trained_at_utc": trained_at, "status": "not-calibrated-insufficient",
                      "note": f"insufficient matched hours (train {len(train_pairs)}/{MIN_TRAIN_HOURS}, "
-                             f"holdout {len(val_pairs)}/{MIN_VAL_HOURS} required)"},
+                             f"holdout {len(val_pairs)}/{MIN_VAL_HOURS} required); selection policy: "
+                             "latest known issue per (model, valid hour)"},
                 )
                 results[model_id] = {
                     "status": "not-calibrated-insufficient",
@@ -137,8 +144,10 @@ def train(db_path, site_id: str, from_utc: str, to_utc: str) -> dict:
                     "trained_at_utc": trained_at, "status": "calibrated",
                     "note": (
                         f"robust median factor {factor} (raw {raw_factor:.4f}, bounded to "
-                        f"[{FACTOR_MIN}, {FACTOR_MAX}]); chronological 80/20 split, holdout strictly "
-                        "later in time; derived series only — archived forecasts untouched"
+                        f"[{FACTOR_MIN}, {FACTOR_MAX}]); selection policy: latest known issue per "
+                        "(model, valid hour); chronological 80/20 split, holdout strictly later "
+                        "in time; derived series only — archived forecasts untouched; retrospective "
+                        "analysis, not what was knowable at issuance"
                     ),
                 },
             )

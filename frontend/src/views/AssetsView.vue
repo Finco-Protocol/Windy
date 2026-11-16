@@ -1,0 +1,180 @@
+<script setup lang="ts">
+import { computed, reactive, ref } from "vue";
+
+import AppFooter from "@/components/AppFooter.vue";
+import CollapsibleSection from "@/components/CollapsibleSection.vue";
+import StateBlock from "@/components/StateBlock.vue";
+import { windyApi, type AssetCreate, type AssetSummary, type PowerCurveSummary } from "@/api/windy";
+import { useAbortableResource } from "@/composables/useAbortableResource";
+
+// Sites — list and create. Configuration that shapes derived MWh (hub height,
+// capacity, turbines, curve, losses) is fixed at creation for this phase: there
+// is deliberately no edit path, so archived forecast snapshots can never be
+// silently relabelled under changed settings.
+
+const res = useAbortableResource<{ assets: AssetSummary[] }>((signal) => windyApi.assets(signal), () => []);
+const { data: assetsData, loading, error, refresh } = res;
+const assets = computed(() => assetsData.value?.assets ?? []);
+const curvesRes = useAbortableResource<{ curves: PowerCurveSummary[] }>((signal) => windyApi.powerCurves(signal), () => []);
+const curves = computed(() => curvesRes.data.value?.curves ?? []);
+
+const busy = ref(false);
+const createError = ref<string | null>(null);
+const createdNote = ref<string | null>(null);
+const form = reactive<AssetCreate>({
+  label: "",
+  country: "",
+  latitude: 45.0,
+  longitude: 16.0,
+  capacity_mw: 10,
+  turbine_count: 5,
+  turbine_rated_mw: 2,
+  hub_height_m: 90,
+  loss_factor: 0,
+  timezone: "Europe/Podgorica",
+  power_curve_id: "",
+  notes: "",
+});
+
+async function create(): Promise<void> {
+  busy.value = true;
+  createError.value = null;
+  createdNote.value = null;
+  try {
+    const site = await windyApi.assetCreate({ ...form });
+    createdNote.value = `created site "${site.id}" — configuration is fixed for this phase; the selected curve is ${
+      curves.value.find((c) => c.id === site.power_curve_id)?.site_specific ? "site-specific" : "a GENERIC reference curve (modelled MWh are unverified)"
+    }`;
+    form.label = "";
+    form.country = "";
+    await refresh();
+  } catch (e) {
+    createError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+</script>
+
+<template>
+  <div class="flex min-h-screen flex-col">
+    <main class="mx-auto w-full max-w-5xl flex-1 space-y-3 px-4 py-3 sm:space-y-6 sm:px-6 sm:py-6">
+      <h1 class="text-paper-50 font-mono text-lg tracking-wide">Sites</h1>
+      <p class="text-paper-400 font-mono text-[10px] leading-relaxed">
+        Each site keeps its own forecasts, actuals, accuracy and backfill jobs — nothing is shared across sites. All data on the
+        other screens belongs to the site chosen in the selector.
+      </p>
+
+      <CollapsibleSection title="Registered sites">
+        <StateBlock v-if="error" kind="error">{{ error }}</StateBlock>
+        <StateBlock v-else-if="loading" kind="loading" loading-py="py-8" caption="Loading…" />
+        <div v-else-if="assets.length" class="overflow-x-auto">
+          <table class="w-full font-mono text-[10px]">
+            <thead>
+              <tr class="text-paper-400 border-ink-700 border-b text-left">
+                <th class="py-1.5 pr-3">id</th>
+                <th class="py-1.5 pr-3">label</th>
+                <th class="py-1.5 pr-3">lat / lon</th>
+                <th class="py-1.5 pr-3">capacity</th>
+                <th class="py-1.5 pr-3">turbines</th>
+                <th class="py-1.5 pr-3">hub</th>
+                <th class="py-1.5 pr-3">tz</th>
+                <th class="py-1.5 pr-3">curve</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="a in assets" :key="a.id" class="border-ink-800 border-b">
+                <td class="text-paper-100 py-1.5 pr-3">{{ a.id }}</td>
+                <td class="py-1.5 pr-3">{{ a.name }}</td>
+                <td class="text-paper-300 py-1.5 pr-3">{{ a.latitude }} / {{ a.longitude }}</td>
+                <td class="text-paper-300 py-1.5 pr-3">{{ a.capacity_mw }} MW</td>
+                <td class="text-paper-300 py-1.5 pr-3">{{ a.turbine_count }} × {{ a.turbine_rated_mw }}</td>
+                <td class="text-paper-300 py-1.5 pr-3">{{ a.hub_height_m }} m</td>
+                <td class="text-paper-300 py-1.5 pr-3">{{ a.timezone }}</td>
+                <td class="py-1.5 pr-3">
+                  <span
+                    class="border px-1.5 py-0.5"
+                    :class="a.curve_site_specific ? 'border-sodium-300/40 text-sodium-200' : 'border-heat-500/40 text-heat-300'"
+                  >{{ a.curve_label ?? "—" }}{{ a.curve_reference_only ? " · reference/unverified" : "" }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <StateBlock v-else kind="empty">No sites.</StateBlock>
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Add a site" :default-open="false">
+        <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
+          The power curve must be chosen explicitly — a generic curve is prominently labelled reference/unverified and its
+          modelled MWh are never presented as calibrated production. Configuration is fixed after creation in this phase
+          (a future "new configuration revision" path would version snapshots instead of rewriting them).
+        </p>
+        <div class="grid gap-2 sm:grid-cols-2">
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">label *</span>
+            <input v-model="form.label" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">country</span>
+            <input v-model="form.country" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">latitude * (−90…90)</span>
+            <input v-model.number="form.latitude" type="number" step="0.0001" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">longitude * (−180…180)</span>
+            <input v-model.number="form.longitude" type="number" step="0.0001" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">capacity MW *</span>
+            <input v-model.number="form.capacity_mw" type="number" step="0.1" min="0.1" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">turbine count *</span>
+            <input v-model.number="form.turbine_count" type="number" min="1" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">turbine rating MW *</span>
+            <input v-model.number="form.turbine_rated_mw" type="number" step="0.1" min="0.1" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">hub height m * (10–300)</span>
+            <input v-model.number="form.hub_height_m" type="number" step="1" min="10" max="300" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">loss factor (0–0.999)</span>
+            <input v-model.number="form.loss_factor" type="number" step="0.01" min="0" max="0.999" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">timezone (IANA) *</span>
+            <input v-model="form.timezone" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
+          <label class="font-mono text-[10px] sm:col-span-2">
+            <span class="text-paper-400 block">power curve * — explicit choice; generic curves are marked reference/unverified</span>
+            <select v-model="form.power_curve_id" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]">
+              <option value="" disabled>select a curve…</option>
+              <option v-for="c in curves" :key="c.id" :value="c.id">
+                {{ c.label }}{{ c.site_specific ? " (site-specific)" : " (generic — reference/unverified)" }}
+              </option>
+            </select>
+          </label>
+        </div>
+        <div class="mt-3 flex items-center gap-3">
+          <button
+            type="button"
+            class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 disabled:opacity-50 border px-3 py-1.5 font-mono text-[11px] transition-colors"
+            :disabled="busy || !form.label || !form.power_curve_id"
+            @click="create"
+          >
+            {{ busy ? "Creating…" : "Create site" }}
+          </button>
+        </div>
+        <p v-if="createdNote" class="text-sodium-200 mt-2 font-mono text-[10px]">{{ createdNote }}</p>
+        <p v-if="createError" class="text-heat-300 mt-2 font-mono text-[10px]">{{ createError }}</p>
+      </CollapsibleSection>
+    </main>
+    <AppFooter />
+  </div>
+</template>

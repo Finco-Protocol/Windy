@@ -24,6 +24,12 @@ export const router = createRouter({
       // Screen C — Actual vs Forecast (CSV import + accuracy).
       component: () => import("@/views/WindyActualsView.vue"),
     },
+    {
+      path: "/sites",
+      name: "sites",
+      // Site registry (list/create) — per-site isolation everywhere else.
+      component: () => import("@/views/AssetsView.vue"),
+    },
   ],
 });
 

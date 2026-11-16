@@ -136,3 +136,151 @@ def seed_defaults(db_path) -> None:
 def ensure_db(db_path) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     seed_defaults(db_path)
+
+
+# --- multi-site assets ------------------------------------------------------------
+
+
+def list_assets(db_path) -> list[dict]:
+    """All assets with their curve's site-specificity flag."""
+    with dbm.session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT a.*, pc.site_id AS curve_site_id, pc.label AS curve_label, pc.status AS curve_status "
+            "FROM assets a LEFT JOIN power_curves pc ON pc.id = a.power_curve_id ORDER BY a.id"
+        ).fetchall()
+    out = []
+    for r in rows:
+        asset = dict(r)
+        assumptions = json.loads(asset.pop("assumptions_json") or "{}")
+        asset["assumptions"] = assumptions
+        asset["curve_site_specific"] = bool(asset.pop("curve_site_id"))
+        asset["curve_reference_only"] = not asset["curve_site_specific"]
+        out.append(asset)
+    return out
+
+
+def create_asset(db_path, fields: dict) -> dict:
+    """Create a new asset with strict validation.
+
+    The power curve must be chosen explicitly and must exist. Configuration
+    that shapes derived MWh (hub height, capacity, turbines, curve, loss) is
+    fixed at creation for this phase: there is no edit path, so archived
+    snapshots can never be silently relabelled under changed settings.
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    def _req(name: str):
+        v = fields.get(name)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            raise ValueError(f"{name} is required")
+        return v
+
+    label = str(_req("label")).strip()
+    if not any(c.isalnum() for c in label):
+        raise ValueError("label must contain at least one alphanumeric character")
+    site_id = str(fields.get("id") or "").strip() or _slugify(label)
+    if len(site_id) < 2:
+        raise ValueError("id is too short — provide an explicit id (>= 2 characters)")
+    if not site_id.replace("-", "").replace("_", "").isalnum():
+        raise ValueError("id must be a simple slug (letters, digits, -, _)")
+
+    lat = _float(fields, "latitude", -90.0, 90.0)
+    lon = _float(fields, "longitude", -180.0, 180.0)
+    capacity = _float(fields, "capacity_mw", 0.001, 10000.0)
+    turbine_count = int(_float(fields, "turbine_count", 1, 10000))
+    turbine_rated = _float(fields, "turbine_rated_mw", 0.01, 20.0)
+    hub = _float(fields, "hub_height_m", 10.0, 300.0)
+    loss_raw = fields.get("loss_factor", 0)
+    try:
+        loss = float(loss_raw)
+    except (TypeError, ValueError):
+        raise ValueError("loss_factor must be a number") from None
+    if not 0.0 <= loss <= 0.999:
+        raise ValueError("loss_factor must be between 0.0 and 0.999")
+    tz_name = str(fields.get("timezone") or "Europe/Podgorica").strip()
+    try:
+        ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(f"unknown timezone: {tz_name!r}") from None
+
+    curve_id = str(_req("power_curve_id")).strip()
+    with dbm.session(db_path) as conn:
+        curve = conn.execute(
+            "SELECT id, site_id FROM power_curves WHERE id=?", (curve_id,)
+        ).fetchone()
+        if curve is None:
+            raise ValueError(f"power curve '{curve_id}' does not exist — choose one explicitly from /api/power-curves")
+        exists = conn.execute("SELECT 1 FROM assets WHERE id=?", (site_id,)).fetchone()
+        if exists:
+            raise ValueError(f"asset id '{site_id}' already exists")
+        conn.execute(
+            """
+            INSERT INTO assets (id, name, country, latitude, longitude, capacity_mw,
+                                turbine_count, turbine_model, turbine_rated_mw, hub_height_m,
+                                loss_factor, timezone, power_curve_id, assumptions_json, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site_id,
+                label,
+                str(fields.get("country") or ""),
+                lat,
+                lon,
+                capacity,
+                turbine_count,
+                str(fields.get("turbine_model") or ""),
+                turbine_rated,
+                hub,
+                loss,
+                tz_name,
+                curve_id,
+                dbm.j(
+                    {
+                        "configuration": (
+                            "Settings fixed at creation for this phase; archived forecast snapshots "
+                            "are never reprocessed or relabelled under changed settings."
+                        ),
+                        "power_curve": (
+                            f"Explicitly selected curve '{curve_id}'"
+                            + (" (site-specific)." if curve["site_id"] else " — generic REFERENCE curve, not site-specific; modelled MWh are unverified estimates.")
+                        ),
+                    }
+                ),
+                str(fields.get("notes") or "User-created asset."),
+            ),
+        )
+    return load_site(db_path, site_id)
+
+
+def _float(fields: dict, name: str, lo: float, hi: float) -> float:
+    v = fields.get(name)
+    if v is None:
+        raise ValueError(f"{name} is required")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number") from None
+    if not lo <= f <= hi:
+        raise ValueError(f"{name} must be between {lo} and {hi}")
+    return f
+
+
+def _slugify(label: str) -> str:
+    import re
+
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", label.strip().lower()).strip("-")
+    return s or "site"
+
+
+def list_curves(db_path) -> list[dict]:
+    with dbm.session(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, label, status, source, provenance, rated_power_mw, cut_in_mps, rated_mps, cut_out_mps, site_id "
+            "FROM power_curves ORDER BY id"
+        ).fetchall()
+    out = []
+    for r in rows:
+        c = dict(r)
+        c["site_specific"] = bool(c.pop("site_id"))
+        out.append(c)
+    return out

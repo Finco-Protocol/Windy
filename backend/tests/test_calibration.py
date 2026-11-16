@@ -101,12 +101,13 @@ def test_calibration_factor_is_bounded(client):
     from app import calibration as cal
 
     n = 384
-    # extreme ratio far outside [0.5, 1.5] → factor clipped to the bound
+    # ratio 2.0 is outside [0.5, 1.5] but stays within the site physical limit
+    # (PF≈30.4 MW × 2 ≈ 60.8 MW < 71.5 MW) → factor clipped to FACTOR_MAX
     start = datetime.fromisoformat("2026-10-01T00:00:00+00:00")
     times = [(start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00") for i in range(n)]
     fake.push_run("gfs_seamless", "2026-10-01T00:00", make_raw_run(times, {"80": [8.0] * n, "100": [8.0] * n}))
     api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-10-01", "run_hour": 0, "days": 16})
-    rows = [(t, round(PF * 9.0, 4)) for t in times]  # ratio 9 → clipped to 1.5
+    rows = [(t, round(PF * 2.0, 4)) for t in times]  # ratio 2 → clipped to 1.5
     csv_text = "ts,mwh\n" + "\n".join(f"{t}:00Z,{e}" for t, e in rows)
     mapping = '{"timestamp_col":"ts","value_col":"mwh","value_kind":"energy_mwh","tz":"UTC","interval_hours":1.0}'
     api.post(

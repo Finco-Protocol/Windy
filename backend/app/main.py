@@ -117,9 +117,25 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
             "scheduler_enabled": settings.scheduler_enabled,
         }
 
+    @app.get("/api/assets")
+    def assets_list():
+        return {"assets": store.list_assets(settings.db_path)}
+
+    @app.post("/api/assets")
+    def assets_create(body: dict):
+        return store.create_asset(settings.db_path, body or {})
+
+    @app.get("/api/assets/{site_id}")
+    def assets_get(site_id: str):
+        return {"site": store.load_site(settings.db_path, site_id)}
+
+    @app.get("/api/power-curves")
+    def curves_list():
+        return {"curves": store.list_curves(settings.db_path)}
+
     @app.get("/api/site")
-    def site():
-        site_row = store.load_site(settings.db_path, "krnovo")
+    def site(site_id: str = Query("krnovo")):
+        site_row = store.load_site(settings.db_path, site_id)
         curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
         return {
             "site": site_row,
@@ -155,10 +171,13 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
 
     @app.post("/api/collect")
     def collect(body: dict | None = None):
-        days = int((body or {}).get("days") or settings.collect_days)
+        body = body or {}
+        site_id = str(body.get("site_id") or "krnovo")
+        store.load_site(settings.db_path, site_id)  # 404 for unknown sites
+        days = int(body.get("days") or settings.collect_days)
         if not 1 <= days <= 16:
             raise ValueError("days must be 1..16")
-        return collect_site(settings.db_path, client, "krnovo", days=days)
+        return collect_site(settings.db_path, client, site_id, days=days)
 
     @app.post("/api/backfill")
     def backfill(body: dict):
@@ -174,6 +193,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                 int(body.get("run_hour", 0)),
                 int(body.get("days") or 10),
                 client=client,
+                site_id=str(body.get("site_id") or "krnovo"),
             )
         except MRU as exc:
             raise HTTPException(status_code=404, detail=f"UNAVAILABLE: {exc}") from exc
@@ -191,8 +211,8 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         return {"job_id": job_id, "status": "running"}
 
     @app.get("/api/backfill/batch")
-    def backfill_batch_list():
-        return {"jobs": list_jobs(settings.db_path)}
+    def backfill_batch_list(site_id: str | None = Query(None)):
+        return {"jobs": list_jobs(settings.db_path, site_id=site_id)}
 
     @app.get("/api/backfill/batch/{job_id}")
     def backfill_batch_get(job_id: int):
@@ -221,26 +241,33 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- archive health ---------------------------------------------------------
 
     @app.get("/api/archive/health")
-    def archive_health():
-        """Coverage per model: verified issue cycles vs unknown-issue live
-        fallbacks, first/last issue, points, and missing 6-hourly cycles within
-        the archived window."""
+    def archive_health(site_id: str = Query("krnovo")):
+        """Coverage per model for one site: verified issue cycles vs unknown-issue
+        live fallbacks, first/last issue, points, missing 6-hourly cycles, last
+        fetch and last recorded error."""
+        store.load_site(settings.db_path, site_id)
         out = []
         with dbm.session(settings.db_path) as conn:
             points_per_model = {
                 r["model_id"]: r["n"]
                 for r in conn.execute(
                     "SELECT fr.model_id AS model_id, COUNT(*) AS n FROM forecast_points fp "
-                    "JOIN forecast_runs fr ON fr.id = fp.run_id WHERE fr.site_id='krnovo' AND fr.status='ok' "
-                    "GROUP BY fr.model_id"
+                    "JOIN forecast_runs fr ON fr.id = fp.run_id WHERE fr.site_id=? AND fr.status='ok' "
+                    "GROUP BY fr.model_id",
+                    (site_id,),
                 ).fetchall()
             }
             for spec in WINDY_MODELS:
                 runs = conn.execute(
                     "SELECT run_issued_utc, id FROM forecast_runs "
-                    "WHERE site_id='krnovo' AND model_id=? AND status='ok' ORDER BY run_issued_utc",
-                    (spec.id,),
+                    "WHERE site_id=? AND model_id=? AND status='ok' ORDER BY run_issued_utc",
+                    (site_id, spec.id),
                 ).fetchall()
+                last_row = conn.execute(
+                    "SELECT fetched_at_utc, error FROM forecast_runs WHERE site_id=? AND model_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (site_id, spec.id),
+                ).fetchone()
                 known = [r for r in runs if r["run_issued_utc"] is not None]
                 n_points = points_per_model.get(spec.id, 0)
                 entry = {
@@ -250,6 +277,8 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     "issue_unknown_runs": len(runs) - len(known),
                     "first_issue_utc": known[0]["run_issued_utc"] if known else None,
                     "last_issue_utc": known[-1]["run_issued_utc"] if known else None,
+                    "last_fetched_utc": last_row["fetched_at_utc"] if last_row else None,
+                    "last_error": last_row["error"] if last_row else None,
                     "total_points": n_points,
                     "missing_cycles": [],
                     "n_missing_cycles": None,
@@ -272,29 +301,32 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- calibration (optional, derived series only) ------------------------------
 
     @app.get("/api/calibration")
-    def calibration_get():
+    def calibration_get(site_id: str = Query("krnovo")):
         return {
-            "site_id": "krnovo",
-            "models": calibration_mod.get_calibrations(settings.db_path, "krnovo"),
+            "site_id": site_id,
+            "models": calibration_mod.get_calibrations(settings.db_path, site_id),
             "note": (
-                "Optional explainable calibration (bounded per-model multiplicative factor). "
-                "Archived forecast values are never modified; factors apply to derived views only."
+                "Optional explainable calibration (bounded per-model multiplicative factor, "
+                "latest-issue-per-hour selection policy). Archived forecast values are never "
+                "modified; factors apply to derived views only. Retrospective analysis — not "
+                "what was knowable at issuance."
             ),
         }
 
     @app.post("/api/calibration/train")
     def calibration_train(body: dict):
+        site_id = str((body or {}).get("site_id") or "krnovo")
         from_utc = str((body or {}).get("from_utc") or "")
         to_utc = str((body or {}).get("to_utc") or "")
         if not from_utc or not to_utc:
             raise ValueError("from_utc and to_utc are required")
-        return calibration_mod.train(settings.db_path, "krnovo", from_utc, to_utc)
+        return calibration_mod.train(settings.db_path, site_id, from_utc, to_utc)
 
     # ---- forecast display ----------------------------------------------------
 
     @app.get("/api/forecast")
-    def forecast(days: int = Query(10, ge=1, le=16)):
-        site_row = store.load_site(settings.db_path, "krnovo")
+    def forecast(days: int = Query(10, ge=1, le=16), site_id: str = Query("krnovo")):
+        site_row = store.load_site(settings.db_path, site_id)
         curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
         tz = ZoneInfo(site_row["timezone"])
         horizon_end = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -411,7 +443,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- runs / history --------------------------------------------------------
 
     @app.get("/api/runs")
-    def runs(model_id: str | None = None, limit: int = Query(200, ge=1, le=1000)):
+    def runs(model_id: str | None = None, limit: int = Query(200, ge=1, le=1000), site_id: str = Query("krnovo")):
         q = """
             SELECT fr.id, fr.model_id, fr.run_issued_utc, fr.dedupe_key, fr.issue_source,
                    fr.fetched_at_utc, fr.forecast_days, fr.status, fr.requested_height_m,
@@ -420,7 +452,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                    (SELECT MAX(valid_at_utc) FROM forecast_points p WHERE p.run_id=fr.id) AS last_valid_utc
             FROM forecast_runs fr WHERE fr.site_id=?
         """
-        args: list = ["krnovo"]
+        args: list = [site_id]
         if model_id:
             q += " AND fr.model_id=?"
             args.append(model_id)
@@ -431,9 +463,11 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         return {"runs": rows}
 
     @app.get("/api/runs/{run_id}")
-    def run_detail(run_id: int):
+    def run_detail(run_id: int, site_id: str = Query("krnovo")):
         with dbm.session(settings.db_path) as conn:
             run = conn.execute("SELECT * FROM forecast_runs WHERE id=?", (run_id,)).fetchone()
+            if run is not None and run["site_id"] != site_id:
+                run = None  # strict site isolation: another site's run does not exist for this caller
             if run is None:
                 raise KeyError(f"no run {run_id}")
             points = [dict(p) for p in conn.execute(
@@ -445,7 +479,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         return out
 
     @app.get("/api/compare")
-    def compare(run_id: int, target_date: str):
+    def compare(run_id: int, target_date: str, site_id: str = Query("krnovo")):
         """What did this archived issue predict for a later target date (UTC)."""
         try:
             datetime.strptime(target_date, "%Y-%m-%d")
@@ -453,7 +487,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
             raise ValueError("target_date must be YYYY-MM-DD") from exc
         with dbm.session(settings.db_path) as conn:
             run = conn.execute("SELECT * FROM forecast_runs WHERE id=?", (run_id,)).fetchone()
-            if run is None:
+            if run is None or run["site_id"] != site_id:
                 raise KeyError(f"no run {run_id}")
             points = [dict(p) for p in conn.execute(
                 "SELECT * FROM forecast_points WHERE run_id=? AND valid_at_utc LIKE ? ORDER BY valid_at_utc",
@@ -480,11 +514,13 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         return file.filename or "upload.csv", data
 
     @app.post("/api/actuals/preview")
-    async def actuals_preview(file: UploadFile = File(...), mapping: str = Form(...)):
+    async def actuals_preview(file: UploadFile = File(...), mapping: str = Form(...), site_id: str = Form("krnovo")):
+        store.load_site(settings.db_path, site_id)  # 404 for unknown sites
         filename, data = _read_upload(file)
         mapping_dict = json.loads(mapping)
         parsed = parse_actuals(filename, data, mapping_dict)
         preview = {
+            "site_id": site_id,
             "fieldnames": parsed.fieldnames,
             "rows_total": parsed.rows_total,
             "rows_parsed": len(parsed.rows),
@@ -497,7 +533,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         if parsed.rows:
             from .actuals import check_conflicts
 
-            existing = check_conflicts(settings.db_path, "krnovo", parsed.rows)
+            existing = check_conflicts(settings.db_path, site_id, parsed.rows)
             preview["n_conflicts_with_db"] = len(existing)
             preview["conflicts"] = existing[:100]
         return preview
@@ -507,7 +543,9 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         file: UploadFile = File(...),
         mapping: str = Form(...),
         on_conflict: str = Form("reject"),
+        site_id: str = Form("krnovo"),
     ):
+        store.load_site(settings.db_path, site_id)  # 404 for unknown sites
         filename, data = _read_upload(file)
         mapping_dict = json.loads(mapping)
         parsed = parse_actuals(filename, data, mapping_dict)
@@ -526,7 +564,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     "errors": parsed.errors[:50],
                 },
             )
-        result = persist_actuals(settings.db_path, "krnovo", filename, mapping_dict, parsed, on_conflict=on_conflict)
+        result = persist_actuals(settings.db_path, site_id, filename, mapping_dict, parsed, on_conflict=on_conflict)
         return result
 
     @app.get("/api/actuals")
@@ -534,21 +572,24 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         from_utc: str = Query("1970-01-01T00:00:00Z"),
         to_utc: str = Query("2999-01-01T00:00:00Z"),
         limit: int = Query(2000, ge=1, le=50000),
+        site_id: str = Query("krnovo"),
     ):
         f = accuracy_mod.parse_z(from_utc)
         t = accuracy_mod.parse_z(to_utc)
         with dbm.session(settings.db_path) as conn:
             rows = [dict(r) for r in conn.execute(
                 "SELECT * FROM actual_points WHERE site_id=? AND interval_start_utc>=? AND interval_start_utc<? ORDER BY interval_start_utc LIMIT ?",
-                ("krnovo", f, t, limit),
+                (site_id, f, t, limit),
             ).fetchall()]
         return {"rows": rows}
 
     @app.get("/api/actuals/imports")
-    def actuals_imports():
+    def actuals_imports(site_id: str = Query("krnovo")):
         with dbm.session(settings.db_path) as conn:
             rows = [dict(r) for r in conn.execute(
-                "SELECT id, filename, imported_at_utc, timezone, rows_total, rows_ok, warnings_json FROM actual_imports ORDER BY id DESC LIMIT 100"
+                "SELECT id, filename, imported_at_utc, timezone, rows_total, rows_ok, warnings_json FROM actual_imports "
+                "WHERE site_id=? ORDER BY id DESC LIMIT 100",
+                (site_id,),
             ).fetchall()]
         for r in rows:
             r["warnings"] = json.loads(r.pop("warnings_json") or "[]")
@@ -558,8 +599,8 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- accuracy -----------------------------------------------------------------
 
     @app.get("/api/accuracy")
-    def accuracy(from_utc: str, to_utc: str, use_calibration: bool = Query(False)):
-        return accuracy_mod.accuracy(settings.db_path, "krnovo", from_utc, to_utc, use_calibration=use_calibration)
+    def accuracy(from_utc: str, to_utc: str, use_calibration: bool = Query(False), site_id: str = Query("krnovo")):
+        return accuracy_mod.accuracy(settings.db_path, site_id, from_utc, to_utc, use_calibration=use_calibration)
 
     @app.get("/api/accuracy/overlay")
     def accuracy_overlay(
@@ -567,22 +608,29 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         to_utc: str,
         lead_bin: str | None = None,
         use_calibration: bool = Query(False),
+        site_id: str = Query("krnovo"),
     ):
-        return accuracy_mod.overlay(settings.db_path, "krnovo", from_utc, to_utc, lead_bin, use_calibration=use_calibration)
+        return accuracy_mod.overlay(settings.db_path, site_id, from_utc, to_utc, lead_bin, use_calibration=use_calibration)
 
     # ---- export ---------------------------------------------------------------------
 
     @app.get("/api/export/forecast.csv")
-    def export_forecast(run_id: int | None = None, model_id: str | None = None, from_utc: str | None = None, to_utc: str | None = None):
+    def export_forecast(
+        run_id: int | None = None,
+        model_id: str | None = None,
+        from_utc: str | None = None,
+        to_utc: str | None = None,
+        site_id: str = Query("krnovo"),
+    ):
         q = """
             SELECT fr.model_id, fr.run_issued_utc, fr.issue_source, fr.fetched_at_utc,
                    fr.source_url, fr.requested_height_m, fr.height_method,
                    fp.valid_at_utc, fp.wind_speed_mps, fp.wind_direction_deg,
                    fp.modeled_power_mw, fp.interval_energy_mwh, fp.interval_hours, fp.status
             FROM forecast_points fp JOIN forecast_runs fr ON fr.id = fp.run_id
-            WHERE fr.site_id = 'krnovo'
+            WHERE fr.site_id = ?
         """
-        args: list = []
+        args: list = [site_id]
         if run_id:
             q += " AND fr.id=?"
             args.append(run_id)
@@ -621,10 +669,12 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         )
 
     @app.get("/api/export/actuals.csv")
-    def export_actuals():
+    def export_actuals(site_id: str = Query("krnovo")):
         with dbm.session(settings.db_path) as conn:
             rows = conn.execute(
-                "SELECT interval_start_utc, interval_end_utc, energy_mwh, power_mw, import_id FROM actual_points WHERE site_id='krnovo' ORDER BY interval_start_utc"
+                "SELECT interval_start_utc, interval_end_utc, energy_mwh, power_mw, import_id FROM actual_points "
+                "WHERE site_id=? ORDER BY interval_start_utc",
+                (site_id,),
             ).fetchall()
         buf = io.StringIO()
         w = csv.writer(buf)

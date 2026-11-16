@@ -178,10 +178,13 @@ export interface AccuracyResponse {
   actual_hours_in_range: number;
   actual_hours_partial: number;
   actual_intervals_unaligned: number;
+  actual_intervals_invalid: number;
+  actual_intervals_over_limit: number;
   lead_bins: string[];
   models: Record<string, { bins: Record<string, AccuracyBin>; total: AccuracyBin | null }>;
   calibration_applied: Record<string, number>;
   has_measured_actuals: boolean;
+  selection_policy: string;
   note: string;
 }
 
@@ -191,6 +194,7 @@ export interface OverlayHour {
   actual_mw?: number;
   actual_partial?: boolean;
   actual_covered_hours?: number;
+  actual_reason?: string;
   models?: Record<string, number>;
 }
 
@@ -232,6 +236,7 @@ export interface BatchJob {
   n_failed: number;
   n_skipped: number;
   last_error: string | null;
+  site_id: string;
   params: { models: string[]; date_from: string; date_to: string; cycles: number[]; days: number; max_requests: number };
   planned_total: number;
   results: BatchJobResult[];
@@ -244,10 +249,50 @@ export interface ArchiveHealthModel {
   issue_unknown_runs: number;
   first_issue_utc: string | null;
   last_issue_utc: string | null;
+  last_fetched_utc: string | null;
+  last_error: string | null;
   total_points: number;
   missing_cycles: string[];
   n_missing_cycles: number | null;
   note: string;
+}
+
+export interface PowerCurveSummary {
+  id: string;
+  label: string;
+  status: string;
+  source: string;
+  provenance: string;
+  rated_power_mw: number;
+  cut_in_mps: number | null;
+  rated_mps: number | null;
+  cut_out_mps: number | null;
+  site_id: string | null;
+  site_specific: boolean;
+}
+
+export interface AssetSummary extends WindySite {
+  curve_site_id?: string | null;
+  curve_label?: string | null;
+  curve_status?: string | null;
+  curve_site_specific?: boolean;
+  curve_reference_only?: boolean;
+}
+
+export interface AssetCreate {
+  id?: string;
+  label: string;
+  country?: string;
+  latitude: number;
+  longitude: number;
+  capacity_mw: number;
+  turbine_count: number;
+  turbine_rated_mw: number;
+  hub_height_m: number;
+  loss_factor?: number;
+  timezone: string;
+  power_curve_id: string;
+  notes?: string;
 }
 
 export interface CalibrationEntry {
@@ -336,43 +381,62 @@ export interface ActualsMapping {
 }
 
 export const windyApi = {
-  site: (signal?: AbortSignal) => getJson<SiteResponse>("/site", signal),
-  forecast: (days: number, signal?: AbortSignal) => getJson<ForecastResponse>(`/forecast?days=${days}`, signal),
-  collect: (days = 10) => postJson<CollectResult>("/collect", { days }),
-  runs: (modelId: string | null, signal?: AbortSignal) =>
-    getJson<{ runs: RunSummary[] }>(`/runs?limit=300${modelId ? `&model_id=${encodeURIComponent(modelId)}` : ""}`, signal),
-  runDetail: (id: number, signal?: AbortSignal) => getJson<RunDetail>(`/runs/${id}`, signal),
-  compare: (runId: number, targetDate: string, signal?: AbortSignal) =>
-    getJson<CompareResponse>(`/compare?run_id=${runId}&target_date=${encodeURIComponent(targetDate)}`, signal),
-  backfill: (modelId: string, runDate: string, runHour: number, days = 10) =>
-    postJson<BackfillResult>("/backfill", { model_id: modelId, run_date: runDate, run_hour: runHour, days }),
-  accuracy: (fromUtc: string, toUtc: string, useCalibration: boolean, signal?: AbortSignal) =>
-    getJson<AccuracyResponse>(
-      `/accuracy?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}${useCalibration ? "&use_calibration=true" : ""}`,
+  site: (siteId: string, signal?: AbortSignal) => getJson<SiteResponse>(`/site?site_id=${encodeURIComponent(siteId)}`, signal),
+  assets: (signal?: AbortSignal) => getJson<{ assets: AssetSummary[] }>("/assets", signal),
+  assetCreate: (body: AssetCreate) => postJson<WindySite>("/assets", body),
+  powerCurves: (signal?: AbortSignal) => getJson<{ curves: PowerCurveSummary[] }>("/power-curves", signal),
+  forecast: (days: number, siteId: string, signal?: AbortSignal) =>
+    getJson<ForecastResponse>(`/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}`, signal),
+  collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
+  runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
+    getJson<{ runs: RunSummary[] }>(
+      `/runs?limit=300&site_id=${encodeURIComponent(siteId)}${modelId ? `&model_id=${encodeURIComponent(modelId)}` : ""}`,
       signal,
     ),
-  overlay: (fromUtc: string, toUtc: string, leadBin: string | null, useCalibration: boolean, signal?: AbortSignal) =>
+  runDetail: (id: number, siteId: string, signal?: AbortSignal) => getJson<RunDetail>(`/runs/${id}?site_id=${encodeURIComponent(siteId)}`, signal),
+  compare: (runId: number, targetDate: string, siteId: string, signal?: AbortSignal) =>
+    getJson<CompareResponse>(
+      `/compare?run_id=${runId}&target_date=${encodeURIComponent(targetDate)}&site_id=${encodeURIComponent(siteId)}`,
+      signal,
+    ),
+  backfill: (modelId: string, runDate: string, runHour: number, days = 10, siteId = "krnovo") =>
+    postJson<BackfillResult>("/backfill", { model_id: modelId, run_date: runDate, run_hour: runHour, days, site_id: siteId }),
+  accuracy: (fromUtc: string, toUtc: string, useCalibration: boolean, siteId: string, signal?: AbortSignal) =>
+    getJson<AccuracyResponse>(
+      `/accuracy?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}&site_id=${encodeURIComponent(siteId)}${useCalibration ? "&use_calibration=true" : ""}`,
+      signal,
+    ),
+  overlay: (fromUtc: string, toUtc: string, leadBin: string | null, useCalibration: boolean, siteId: string, signal?: AbortSignal) =>
     getJson<OverlayResponse>(
-      `/accuracy/overlay?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}${leadBin ? `&lead_bin=${encodeURIComponent(leadBin)}` : ""}${useCalibration ? "&use_calibration=true" : ""}`,
+      `/accuracy/overlay?from_utc=${encodeURIComponent(fromUtc)}&to_utc=${encodeURIComponent(toUtc)}&site_id=${encodeURIComponent(siteId)}${leadBin ? `&lead_bin=${encodeURIComponent(leadBin)}` : ""}${useCalibration ? "&use_calibration=true" : ""}`,
       signal,
     ),
   batchPreview: (body: Record<string, unknown>) => postJson<BatchPreview>("/backfill/batch", { ...body, dry_run: true }),
   batchStart: (body: Record<string, unknown>) => postJson<{ job_id: number; status: string }>("/backfill/batch", body),
-  batchList: (signal?: AbortSignal) => getJson<{ jobs: Omit<BatchJob, "results" | "planned_total">[] }>("/backfill/batch", signal),
+  batchList: (siteId: string, signal?: AbortSignal) =>
+    getJson<{ jobs: Omit<BatchJob, "results" | "planned_total">[] }>(`/backfill/batch?site_id=${encodeURIComponent(siteId)}`, signal),
   batchGet: (id: number, signal?: AbortSignal) => getJson<BatchJob>(`/backfill/batch/${id}`, signal),
   batchCancel: (id: number) => postJson<{ job_id: number; status: string }>(`/backfill/batch/${id}/cancel`, {}),
   batchResume: (id: number) => postJson<{ job_id: number; status: string }>(`/backfill/batch/${id}/resume`, {}),
-  archiveHealth: (signal?: AbortSignal) => getJson<{ models: ArchiveHealthModel[] }>("/archive/health", signal),
-  calibration: (signal?: AbortSignal) =>
-    getJson<{ site_id: string; models: CalibrationEntry[]; note: string }>("/calibration", signal),
-  calibrationTrain: (fromUtc: string, toUtc: string) => postJson<Record<string, unknown>>("/calibration/train", { from_utc: fromUtc, to_utc: toUtc }),
-  actualsPreview: (file: File, mapping: ActualsMapping) =>
-    postMultipart<ActualsPreview>("/actuals/preview", file, { mapping: JSON.stringify(mapping) }),
-  actualsImport: (file: File, mapping: ActualsMapping, onConflict: "reject" | "replace") =>
+  archiveHealth: (siteId: string, signal?: AbortSignal) =>
+    getJson<{ models: ArchiveHealthModel[] }>(`/archive/health?site_id=${encodeURIComponent(siteId)}`, signal),
+  calibration: (siteId: string, signal?: AbortSignal) =>
+    getJson<{ site_id: string; models: CalibrationEntry[]; note: string }>(`/calibration?site_id=${encodeURIComponent(siteId)}`, signal),
+  calibrationTrain: (fromUtc: string, toUtc: string, siteId: string) =>
+    postJson<Record<string, unknown>>("/calibration/train", { from_utc: fromUtc, to_utc: toUtc, site_id: siteId }),
+  actualsPreview: (file: File, mapping: ActualsMapping, siteId: string) =>
+    postMultipart<ActualsPreview>("/actuals/preview", file, { mapping: JSON.stringify(mapping), site_id: siteId }),
+  actualsImport: (file: File, mapping: ActualsMapping, onConflict: "reject" | "replace", siteId: string) =>
     postMultipart<ActualsImportResult>("/actuals/import", file, {
       mapping: JSON.stringify(mapping),
       on_conflict: onConflict,
+      site_id: siteId,
     }),
+  actualsList: (siteId: string, signal?: AbortSignal) =>
+    getJson<{ rows: { interval_start_utc: string; interval_end_utc: string; energy_mwh: number | null; power_mw: number | null }[] }>(
+      `/actuals?site_id=${encodeURIComponent(siteId)}`,
+      signal,
+    ),
 };
 
 /** Model display colors, stable across all three screens. */
