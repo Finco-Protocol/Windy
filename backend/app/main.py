@@ -190,6 +190,46 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         store.load_site(settings.db_path, site_id)
         return availability_mod.scenario_for_run(settings.db_path, site_id, run_id, inventory_revision, constraints_revision)
 
+    @app.get("/api/assets/{site_id}/scenario/export.csv")
+    def scenario_export_csv(
+        site_id: str,
+        run_id: int,
+        inventory_revision: int | None = Query(None),
+        constraints_revision: int | None = Query(None),
+    ):
+        """Hourly scenario values for one pinned revision: baseline vs adjusted,
+        loss split, revision ids and per-point status flags."""
+        store.load_site(settings.db_path, site_id)
+        sc = availability_mod.scenario_for_run(settings.db_path, site_id, run_id, inventory_revision, constraints_revision)
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "site_id", "model_id", "run_issued_utc", "inventory_revision", "constraints_revision",
+            "algorithm_version", "curve_mode", "baseline_comparable", "valid_at_utc", "interval_hours",
+            "baseline_mw", "baseline_mwh", "scenario_base_mw", "scenario_base_mwh",
+            "adjusted_mw", "adjusted_mwh", "pre_export_mw",
+            "availability_loss_mwh", "export_loss_mwh", "status",
+        ])
+        for p in sc["points"]:
+            ih = p["interval_hours"]
+            baseline_mwh = round(p["base_mw"] * ih, 6) if p["base_mw"] is not None else None
+            scenario_base_mwh = round(p["scenario_base_mw"] * ih, 6) if p["scenario_base_mw"] is not None else None
+            adjusted_mwh = round(p["adjusted_mw"] * ih, 6) if p["adjusted_mw"] is not None else None
+            w.writerow([
+                site_id, sc["model_id"], sc["run_issued_utc"] or "", sc["inventory_revision"],
+                sc["constraints_revision"], sc["algorithm_version"], sc["summary"]["curve_mode"],
+                sc["baseline_comparable"], p["valid_at_utc"], ih,
+                p["base_mw"], baseline_mwh, p["scenario_base_mw"], scenario_base_mwh,
+                p["adjusted_mw"], adjusted_mwh, p["pre_export_mw"],
+                p["lost_to_unit_mwh"], p["lost_to_export_mwh"], p["status"],
+            ])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=windy_scenario_{site_id}_run{run_id}.csv"},
+        )
+
     @app.post("/api/assets/{site_id}/scenario/publish")
     def scenario_publish(site_id: str, body: dict):
         """Publish a scenario revision snapshot (summary pinned to immutable
@@ -689,6 +729,26 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         filename, data = _read_upload(file)
         mapping_dict = json.loads(mapping)
         parsed = parse_actuals(filename, data, mapping_dict)
+        # physical limit: readings implying more than capacity × 1.05 are
+        # rejected at import (over-limit hours would never score anyway)
+        site_row = store.load_site(settings.db_path, site_id)
+        capacity = float(site_row["capacity_mw"]) * 1.05
+        over = [
+            {"interval_start_utc": r.interval_start_utc, "power_mw": r.power_mw}
+            for r in parsed.rows
+            if r.power_mw is not None and r.power_mw > capacity
+        ]
+        if over:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        f"{len(over)} reading(s) exceed the site physical limit ({capacity:.2f} MW = "
+                        "capacity × 1.05) — import blocked."
+                    ),
+                    "readings": over[:50],
+                },
+            )
         if parsed.errors:
             # A file with invalid rows is blocked, never partially imported:
             # quiet partial imports would make the archive silently inconsistent.

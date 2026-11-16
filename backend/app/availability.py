@@ -628,43 +628,92 @@ def scenario_for_run(db_path, site_id: str, run_id: int, inventory_revision: int
         n = len(rows_out)
         first = parse_utc(rows_out[0]["valid_at_utc"]) if n else None
         last = parse_utc(rows_out[-1]["valid_at_utc"]) if n else None
-        end_t = (first + timedelta(hours=window_hours)) if first else None
-        # interval policy: a point belongs to the window when its valid_at lies
-        # inside [first, first + window); durations are the archived per-point
-        # interval_hours, never an assumed constant spacing
-        sel = [r for r in rows_out if end_t and parse_utc(r["valid_at_utc"]) < end_t]
-        valid_rows = [r for r in sel if r["status"] == "ok" and r["adjusted_mw"] is not None]
-        # hours of the window without a computed value: gaps (invalid/missing
-        # wind/curve) AND hours beyond the archived horizon — both make the
-        # window incomplete; the archived-span distinction is `short_horizon`
-        missing = max(0, int(round(window_hours - len(valid_rows))))
+        w_start = first
+        w_end = (first + timedelta(hours=window_hours)) if first else None
+        # UTC CONTINUITY policy (V1.4 correction): the window is complete only
+        # when a non-overlapping union of valid intervals covers exactly
+        # [w_start, w_end) within a seconds tolerance. A row is NOT inherently
+        # one hour — 24 × 30-min rows cover 12 h. Intervals crossing the window
+        # end are CLIPPED (energy prorated on the interval-average MW, per the
+        # declared interval-average semantics); overlaps and invalid durations
+        # make the window incomplete rather than silently merged.
+        sel: list[dict] = []
+        invalid = 0
+        unaligned = 0
+        for r in rows_out:
+            st = parse_utc(r["valid_at_utc"])
+            if st >= w_end:
+                break  # sorted by valid_at — everything after is out of window
+            dur = r["interval_hours"]
+            if dur is None or dur <= 0 or dur != dur or dur == float("inf"):
+                invalid += 1
+                continue
+            en = st + timedelta(hours=dur)
+            if en > w_end:
+                unaligned += 1  # clipped at the window edge for totals
+            sel.append({
+                "start": st,
+                "end": min(en, w_end),
+                "adjusted_mw": r["adjusted_mw"],
+                "base_mw": r["base_mw"],
+                "duration": dur,
+                "status": r["status"],
+                "lost_unit": r["lost_to_unit_mwh"],
+                "lost_export": r["lost_to_export_mwh"],
+            })
+        valid_rows = [x for x in sel if x["status"] == "ok" and x["adjusted_mw"] is not None]
+        intervals = sorted((x["start"], x["end"]) for x in valid_rows)
+        has_overlap = any(intervals[i + 1][0] < intervals[i][1] - timedelta(seconds=1) for i in range(len(intervals) - 1))
+        union_h = 0.0
+        merged: list = []
+        for st, en in intervals:
+            if merged and st <= merged[-1][1] + timedelta(seconds=1):
+                merged[-1] = (merged[-1][0], max(merged[-1][1], en))
+            else:
+                merged.append((st, en))
+        for st, en in merged:
+            union_h += (en - st).total_seconds() / 3600.0
+        union_h = round(union_h, 6)
+        # hours of the window without a computed value: union gaps (holes,
+        # invalid durations) AND hours beyond the archived horizon — both make
+        # the window incomplete; the archived-span distinction is short_horizon
+        missing = max(0.0, round(window_hours - union_h, 3))
         archived_span_h = ((last - first).total_seconds() / 3600.0 + float(rows_out[-1]["interval_hours"] or 1.0)) if n else 0.0
-        expected_hours = min(window_hours, archived_span_h)
-        coverage = round(len(valid_rows) / window_hours, 4) if window_hours else None
-        complete = bool(sel) and missing == 0 and len(valid_rows) >= window_hours - 1e-6
+        coverage = round(union_h / window_hours, 4) if window_hours else None
+        complete = bool(sel) and missing <= 1e-6 and not has_overlap and invalid == 0 and unaligned == 0
+        base_mwh = round(sum(x["base_mw"] * x["duration"] for x in valid_rows), 3) if complete else None
+        adjusted_mwh = round(sum(x["adjusted_mw"] * x["duration"] for x in valid_rows), 3) if complete else None
+        lost_unit_mwh = round(sum(x["lost_unit"] or 0.0 for x in valid_rows), 3) if complete else None
+        lost_export_mwh = round(sum(x["lost_export"] or 0.0 for x in valid_rows), 3) if complete else None
         out: dict = {
             "window_hours": window_hours,
             "start_valid_utc": rows_out[0]["valid_at_utc"] if n else None,
             "end_valid_utc": rows_out[-1]["valid_at_utc"] if n else None,
-            "expected_hours": round(expected_hours, 3),
-            "valid_hours": len(valid_rows),
+            "expected_hours": window_hours,
+            "valid_hours": union_h,
+            "n_valid_intervals": len(valid_rows),
             "missing_hours": missing,
+            "overlap": has_overlap,
+            "unaligned_intervals": unaligned,
+            "invalid_durations": invalid,
             "coverage": coverage,
             "complete": complete,
-            "base_mwh": round(sum((r["base_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3) if complete else None,
-            "adjusted_mwh": round(sum((r["adjusted_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3) if complete else None,
-            "lost_unit_mwh": round(sum(r["lost_to_unit_mwh"] or 0.0 for r in valid_rows), 3) if complete else None,
-            "lost_export_mwh": round(sum(r["lost_to_export_mwh"] or 0.0 for r in valid_rows), 3) if complete else None,
+            "base_mwh": base_mwh,
+            "adjusted_mwh": adjusted_mwh,
+            "lost_unit_mwh": lost_unit_mwh,
+            "lost_export_mwh": lost_export_mwh,
         }
-        # available-hours subtotal: computed values over the covered hours only,
-        # always present and clearly labelled as PARTIAL when incomplete
+        # available-hours subtotal: computed values over the covered intervals
+        # only, always present and clearly labelled as PARTIAL when incomplete
+        sub_rows = [x for x in sel if x["status"] == "ok" and x["adjusted_mw"] is not None]
         out["available_hours_subtotal"] = {
-            "hours": len(valid_rows),
-            "base_mwh": round(sum((r["base_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3),
-            "adjusted_mwh": round(sum((r["adjusted_mw"] or 0.0) * r["interval_hours"] for r in valid_rows), 3),
-            "lost_unit_mwh": round(sum(r["lost_to_unit_mwh"] or 0.0 for r in valid_rows), 3),
-            "lost_export_mwh": round(sum(r["lost_to_export_mwh"] or 0.0 for r in valid_rows), 3),
-            "note": "subtotal over computed hours only; NOT comparable to a full-window total",
+            "hours": union_h,
+            "n_intervals": len(sub_rows),
+            "base_mwh": round(sum(x["base_mw"] * x["duration"] for x in sub_rows), 3),
+            "adjusted_mwh": round(sum(x["adjusted_mw"] * x["duration"] for x in sub_rows), 3),
+            "lost_unit_mwh": round(sum(x["lost_unit"] or 0.0 for x in sub_rows), 3),
+            "lost_export_mwh": round(sum(x["lost_export"] or 0.0 for x in sub_rows), 3),
+            "note": "subtotal over covered hours only; NOT comparable to a full-window total",
         }
         if n and archived_span_h < window_hours - 1e-6:
             out["short_horizon"] = True

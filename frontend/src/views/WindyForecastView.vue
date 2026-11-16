@@ -67,10 +67,15 @@ const unionDates = computed<string[]>(() => {
 });
 
 function cumulative(model: ForecastModel): [string, number | null][] {
+  // Cumulative over COMPUTED hours only. After a missing-energy point the
+  // trajectory becomes null (line breaks) — a flat carried-forward line would
+  // silently present a continuous full forecast across missing data.
   let acc = 0;
+  let broken = false;
   return model.points.map((p) => {
-    if (p.interval_energy_mwh !== null) acc += p.interval_energy_mwh;
-    return [p.valid_at_utc, Math.round(acc * 1000) / 1000] as [string, number | null];
+    if (p.interval_energy_mwh === null) broken = true;
+    else acc += p.interval_energy_mwh;
+    return [p.valid_at_utc, broken ? null : Math.round(acc * 1000) / 1000] as [string, number | null];
   });
 }
 
@@ -252,7 +257,7 @@ const curveUncalibrated = computed(() => fcData.value?.power_curve.status !== "m
           </div>
 
           <CollapsibleSection title="Hub-height wind speed (m/s)">
-            <p class="text-paper-400 font-mono text-[10px]">Gaps are missing source levels — never interpolated from 10 m, never zero-filled. ICON-EU ends at 120 h, ICON Global around 180 h.</p>
+            <p class="text-paper-400 font-mono text-[10px]">Gaps are missing source levels — never interpolated from 10 m, never zero-filled. ICON-EU ends at 120 h, ICON Global at 192 h.</p>
             <VChart style="height: 20rem" :option="windOption" autoresize />
           </CollapsibleSection>
 

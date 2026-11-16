@@ -190,10 +190,28 @@ def test_mixed_15_30_60_minute_intervals_form_complete_hour(client):
     assert acc["actual_hours_partial"] == 0
 
 
-def test_reading_over_site_limit_marks_hour_unscoreable(client):
-    api, _fake, _s = client
+def test_reading_over_site_limit_blocked_at_import_and_unscoreable_if_legacy(client):
+    api, _fake, settings = client
     # default site capacity is 71.5 MW; 80 MWh in one hour → 80 MW → over limit
-    _import_rows(api, [("2026-11-14T00:00", 80)], 1.0)
+    r = api.post(
+        "/api/actuals/import",
+        files={"file": ("over.csv", io.BytesIO(b"ts,mwh\n2026-11-14T00:00:00Z,80\n"), "text/csv")},
+        data={"mapping": '{"timestamp_col":"ts","value_col":"mwh","value_kind":"energy_mwh","tz":"UTC","interval_hours":1.0}', "on_conflict": "replace"},
+    )
+    assert r.status_code == 400, "over-limit readings must be blocked at import (V1.4)"
+    assert "physical limit" in r.json()["detail"]["message"]
+
+    # legacy rows inserted before this guard existed must still be excluded
+    # from scoring (defense in depth in hourly_actuals), marked with a reason
+    import sqlite3
+
+    conn = sqlite3.connect(settings.db_path)
+    conn.execute(
+        "INSERT INTO actual_points (site_id, interval_start_utc, interval_end_utc, energy_mwh, power_mw, import_id) "
+        "VALUES ('krnovo', '2026-11-14T00:00:00Z', '2026-11-14T01:00:00Z', 80, 80, 1)"
+    )
+    conn.commit()
+    conn.close()
     _import_rows(api, [("2026-11-14T01:00", 10)], 1.0)
 
     acc = _acc(api, "2026-11-14T00:00:00Z", "2026-11-14T02:00:00Z")

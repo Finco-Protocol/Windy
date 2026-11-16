@@ -403,6 +403,7 @@ export interface ScenarioRevision {
   constraints_revision: number;
   algorithm_version: string;
   created_at_utc: string;
+  retrieve_at: string;
   summary: { installed_mw?: number; curve_mode?: string; windows?: Record<string, ScenarioWindow> };
 }
 
@@ -575,11 +576,22 @@ export const windyApi = {
     getJson<SiteOperatingStatus>(`/assets/${encodeURIComponent(siteId)}/status`, signal),
   scenario: (siteId: string, runId: number, signal?: AbortSignal) =>
     getJson<ScenarioResponse>(`/assets/${encodeURIComponent(siteId)}/scenario?run_id=${runId}`, signal),
+  scenarioPinned: (siteId: string, runId: number, revisions: { inventory_revision: number; constraints_revision: number } | null, signal?: AbortSignal) => {
+    const q = new URLSearchParams({ run_id: String(runId) });
+    if (revisions) {
+      q.set("inventory_revision", String(revisions.inventory_revision));
+      q.set("constraints_revision", String(revisions.constraints_revision));
+    }
+    return getJson<ScenarioResponse>(`/assets/${encodeURIComponent(siteId)}/scenario?${q.toString()}`, signal);
+  },
   scenarioPublish: (siteId: string, runId: number) =>
-    postJson<{ scenario_revision_id: number; created_at_utc: string; summary: Record<string, unknown> }>(
-      `/assets/${encodeURIComponent(siteId)}/scenario/publish`,
-      { run_id: runId },
-    ),
+    postJson<{
+      scenario_revision_id: number;
+      created_at_utc: string;
+      summary: Record<string, unknown>;
+      points_available_at: string;
+      retrieval: { run_id: number; site_id: string; inventory_revision: number; constraints_revision: number; note: string };
+    }>(`/assets/${encodeURIComponent(siteId)}/scenario/publish`, { run_id: runId }),
   scenarioRevisions: (siteId: string, signal?: AbortSignal) =>
     getJson<{ revisions: ScenarioRevision[] }>(`/assets/${encodeURIComponent(siteId)}/scenario/revisions`, signal),
 };

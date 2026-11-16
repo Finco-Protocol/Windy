@@ -1,6 +1,19 @@
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
+/** Canonical navigation links carrying the active `?site=` query so the
+ *  selection survives tab navigation (shared by the App navbar). */
+export function buildNavLinks(siteId: string): { path: string; query: Record<string, string | undefined>; label: string }[] {
+  const siteQuery = siteId !== "krnovo" ? { site: siteId } : { site: undefined };
+  return [
+    { path: "/", query: siteQuery, label: "Forecast" },
+    { path: "/history", query: siteQuery, label: "Historical runs" },
+    { path: "/actuals", query: siteQuery, label: "Actuals & accuracy" },
+    { path: "/availability", query: siteQuery, label: "Availability" },
+    { path: "/sites", query: {}, label: "Sites" },
+  ];
+}
+
 /** Durable lightweight active-site selection: the `?site=` URL query, so the
  *  choice survives refresh and is shareable. Falls back to the default site. */
 export function useActiveSite() {
