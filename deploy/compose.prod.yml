@@ -1,0 +1,47 @@
+# Windy — production-like private deployment (single container + external
+# TLS reverse proxy with authentication). This file is a TEMPLATE: copy it to
+# the server, adjust the host-only values marked `<...>`, and validate with
+# `docker compose -f compose.prod.yml config` before launch.
+#
+# Security model: the app has NO application login. It must never be exposed
+# publicly without an authentication boundary at the reverse proxy (Basic Auth
+# at minimum; an existing OIDC/access gateway preferred). The container binds
+# to loopback only — the proxy is the single internet-facing component.
+#
+# Deploy from a verified exact source SHA; record the SHA next to this file's
+# server-local copy for provenance and rollback.
+
+services:
+  windy:
+    build:
+      context: .
+      # Pin the deployed source: set build arg or checkout the exact SHA on
+      # the server before building. Record the resulting image digest.
+    container_name: windy-prod
+    ports:
+      # Loopback-only. `<WINDY_PORT>` must be a FREE host port (check with
+      # `ss -ltnp | grep <WINDY_PORT>`); the reverse proxy targets this port.
+      - "127.0.0.1:<WINDY_PORT>:8000"
+    volumes:
+      # Persistent SQLite database OUTSIDE any disposable build directory.
+      - <WINDY_DATA_DIR>:/data
+    environment:
+      WINDY_DB_PATH: /data/windy.db
+      WINDY_SCHEDULER_ENABLED: "1"
+      WINDY_SCHEDULE_CRON: "0 0,12 * * *"   # twice daily, UTC
+      WINDY_COLLECT_SITE_ID: krnovo
+      WINDY_OM_TIMEOUT_S: "40"
+      WINDY_OM_MAX_RETRIES: "3"
+      WINDY_CORS_ORIGINS: ""
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
