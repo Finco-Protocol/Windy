@@ -1,0 +1,516 @@
+// Pure ECharts option builder for the unified hourly series chart. Everything
+// here is a deterministic function of its inputs — no Vue reactivity, no DOM —
+// so it can be unit-tested against the returned option object without mounting
+// the component. The component (HourlySeriesChart.vue) owns interaction state
+// and attaches the tooltip.formatter, which reads live toggle state at hover
+// time (the no-redraw trick) and therefore cannot be pure.
+
+import type { EChartsOption, YAXisComponentOption } from "echarts";
+
+import { convertDelta, convertVar, unitLabel, type UnitPrefs } from "@/composables/useUnits";
+import { MODELS } from "@/domain/models";
+import type { ModelDef } from "@/domain/models";
+import type { DataVarId, HourlySeries } from "@/types/hourlySeries";
+
+import { buildDayRanges, findNowIndex, type ChartViewId } from "./chartHelpers";
+import {
+  AGG_COLOR,
+  BAND_FILL,
+  BAND_SWATCH,
+  CHART_FONT,
+  INK_600,
+  INK_700,
+  INK_800,
+  INK_950,
+  MODEL_OPACITY,
+  MODEL_PALETTE,
+  DAY_FILL,
+  NOW_LINE,
+  PAPER_200,
+  PAPER_300,
+  PAPER_50,
+  PRECIP_BAR_COLOR,
+  PRECIP_SPREAD_FILL,
+  SODIUM_300,
+  TOOLTIP_BG,
+  TRUTH_AREA,
+  TRUTH_COLOR,
+} from "./chartTheme";
+
+// The chart palette + font live in ./chartTheme (ECharts renders to a canvas and
+// can't read the CSS @theme vars). Re-exported so the legend swatches, the
+// scorecards and the model rail can keep taking them from chartOption.
+export { AGG_COLOR, BAND_SWATCH, MODEL_OPACITY, TRUTH_COLOR };
+
+// ECharts reads `null` as "auto-scale this axis", but its TS types only allow
+// number | string | undefined. We need the literal null (not undefined) so a
+// merged setOption actually clears a previously-pinned min/max — hence the cast.
+const AUTO = null as unknown as undefined;
+
+/** The type ECharts accepts for an axis min/max bound. Beyond a static
+ *  `number | string`, it includes a callback evaluated against the data extent
+ *  each layout pass — which is how we grow the precipitation axis past a floor
+ *  without pinning it. Aliased so the call site reads as what it is instead of a
+ *  bare `number`. */
+type AxisBound = YAXisComponentOption["max"];
+
+/** Round a positive axis ceiling up to a "nice" value — a 1/2/5 × 10ⁿ multiple
+ *  — so a data-driven maximum like 11.37 mm/h reads as a clean 12 instead of a
+ *  long float in the axis label. Targets ~5 intervals, mirroring how ECharts
+ *  picks bounds when it auto-scales an axis itself. */
+function niceCeil(v: number): number {
+  if (!(v > 0)) return 0;
+  const mag = 10 ** Math.floor(Math.log10(v / 5));
+  const norm = v / 5 / mag; // the ~5-division interval, normalised to [1, 10)
+  const step = (norm < 1.5 ? 1 : norm < 3 ? 2 : norm < 7 ? 5 : 10) * mag;
+  // toFixed(10) strips binary-float dust (e.g. 0.15000000000000002) that the
+  // step multiply can introduce for sub-unit ceilings like the inch axis.
+  return Number((Math.ceil(v / step) * step).toFixed(10));
+}
+
+/** A precipitation-axis ceiling that tracks the data but never drops below
+ *  `floor`, so a few tenths of a mm/h don't fill the panel and read as heavy
+ *  rain. The ceiling is rounded to a nice value so a data-driven max reads as a
+ *  clean label. Returned as the callback form ECharts evaluates per layout. */
+function precipAxisCeiling(floor: number): AxisBound {
+  return (extent: { max: number }) => niceCeil(Math.max(floor, extent.max));
+}
+
+/** Stable colour for a model, keyed by its index in the registry so the same
+ *  model always reads the same hue across renders. */
+export function paletteFor(id: string): string {
+  const i = MODELS.findIndex((m) => m.id === id);
+  return MODEL_PALETTE[(i < 0 ? 0 : i) % MODEL_PALETTE.length]!;
+}
+
+// Series visibility
+// Visibility is applied as a no-redraw merge-patch (opacity only) rather than by
+// rebuilding the option, so toggling a chip never triggers a full redraw. The
+// builder emits one VisibilityToggle per toggleable series *as it creates it*,
+// so the fact that (e.g.) precipitation truth carries an areaStyle fill is
+// declared exactly once, next to where that series is built — the component
+// never re-derives per-series style structure.
+
+/** ECharts style props that carry a series' opacity. Fills (areaStyle) keep
+ *  their alpha in the fill *colour*, so "shown" is opacity 1, not the alpha. */
+export type TogglePropKey = "lineStyle" | "itemStyle" | "areaStyle";
+
+export interface VisibilityToggle {
+  /** Logical group, keys the show/hide decision against VisibilityState. */
+  group: "aggregate" | "band" | "truth" | "model";
+  id: string;
+  props: TogglePropKey[];
+  /** Opacity when shown (1 for lines/fills, MODEL_OPACITY for overlay lines). */
+  shown: number;
+  /** For `group: "model"` — the model id, checked against enabledModels. */
+  modelId?: string;
+}
+
+export interface VisibilityState {
+  showAggregate: boolean;
+  showBand: boolean;
+  showTruth: boolean;
+  enabledModels: Set<string>;
+}
+
+export interface SeriesPatch {
+  id: string;
+  lineStyle?: { opacity: number };
+  itemStyle?: { opacity: number };
+  areaStyle?: { opacity: number };
+}
+
+function isShown(t: VisibilityToggle, s: VisibilityState): boolean {
+  switch (t.group) {
+    case "aggregate":
+      return s.showAggregate;
+    case "band":
+      return s.showBand;
+    case "truth":
+      return s.showTruth;
+    case "model":
+      return t.modelId != null && s.enabledModels.has(t.modelId);
+  }
+}
+
+/** Pure map from (toggles, state) → the merge-patches to feed setOption. Every
+ *  toggle id is a series the builder actually created, so the patches are always
+ *  in sync with the current option. */
+export function visibilityPatches(toggles: VisibilityToggle[], state: VisibilityState): SeriesPatch[] {
+  return toggles.map((t) => {
+    const opacity = isShown(t, state) ? t.shown : 0;
+    const patch: SeriesPatch = { id: t.id };
+    for (const prop of t.props) patch[prop] = { opacity };
+    return patch;
+  });
+}
+
+export interface HourlyChartBuild {
+  option: EChartsOption;
+  toggles: VisibilityToggle[];
+}
+
+export interface HourlyChartOptionArgs {
+  /** The unified hourly view-model (aggregate / perModel / optional truth). */
+  data: HourlySeries;
+  view: ChartViewId;
+  /** Visible window in hours (clamped to the available time axis). */
+  hoursWindow: number;
+  /** User unit preferences (drives value conversion + axis labels). */
+  units: UnitPrefs;
+  /** Sunrise/sunset for day/night shading. */
+  solar?: { sunrise: string[]; sunset: string[] } | null;
+  /** Current local time — drives the "Now" marker (hidden outside the window). */
+  currentTime?: string;
+  /** Models with data (the per-model overlay universe), in render order. */
+  models: ModelDef[];
+  /** Whether per-model overlay series are built (visibility is patched
+   *  separately by the component, so the series exist at constant opacity). */
+  showModels: boolean;
+}
+
+/** Build the chart's option plus its visibility descriptors. Everything except
+ *  `tooltip.formatter` is produced here; the component attaches the formatter so
+ *  it can read live toggle state at hover. */
+export function buildHourlyChartOption(args: HourlyChartOptionArgs): HourlyChartBuild {
+  const { data, view: v, units, solar, currentTime, models, showModels: overlay } = args;
+  const n = Math.min(args.hoursWindow, data.times.length);
+  const times = data.times.slice(0, n);
+  const nowIdx = currentTime ? findNowIndex(times, currentTime) : -1;
+  const dayRanges = buildDayRanges(times, solar?.sunrise, solar?.sunset);
+  const toggles: VisibilityToggle[] = [];
+
+  const labels = times.map((t) => {
+    const d = new Date(t);
+    return d.getHours() === 0 ? d.toLocaleDateString([], { weekday: "short" }) : `${d.getHours().toString().padStart(2, "0")}:00`;
+  });
+
+  const series: NonNullable<EChartsOption["series"]> = [];
+
+  const isComposite = v === "temp_precip";
+  const leftVar: DataVarId | null = isComposite ? "temperature_2m" : v === "precipitation" ? null : (v as DataVarId);
+  const rightActive = isComposite || v === "precipitation";
+
+  const markArea =
+    dayRanges.length > 0
+      ? { silent: true, itemStyle: { color: DAY_FILL, borderWidth: 0 }, data: dayRanges.map(([a, b]): [{ xAxis: number }, { xAxis: number }] => [{ xAxis: a }, { xAxis: b }]) }
+      : undefined;
+  const markLine =
+    nowIdx >= 0
+      ? {
+          silent: true,
+          animation: false,
+          symbol: ["none", "none"] as [string, string],
+          lineStyle: { color: NOW_LINE, width: 1, type: "solid" as const },
+          label: {
+            formatter: "NOW",
+            color: INK_950,
+            fontSize: 9,
+            fontWeight: 700 as const,
+            fontFamily: CHART_FONT,
+            position: "end" as const,
+            backgroundColor: SODIUM_300,
+            borderRadius: 0,
+            padding: [2, 6, 2, 6],
+            distance: 6,
+          },
+          data: [{ xAxis: nowIdx }],
+        }
+      : undefined;
+
+  // Daylight shading lives on its own zero-z background series so it always
+  // sits *behind* the spread band and lines. Day is the lifted region and night
+  // stays on the dark floor — a lightened night reads backwards on this theme.
+  if (markArea) {
+    series.push({
+      id: "day",
+      type: "line",
+      yAxisIndex: 0,
+      data: Array.from({ length: n }, () => null),
+      symbol: "none",
+      lineStyle: { opacity: 0 },
+      silent: true,
+      z: 0,
+      tooltip: { show: false },
+      markArea,
+    });
+  }
+
+  const pushLineAggregate = (dv: DataVarId, axisIndex: number, attachMarks: boolean): void => {
+    const pts = (data.aggregate[dv] ?? []).slice(0, n);
+    const values = pts.map((p) => convertVar(p.value, dv, units));
+    const smooth = dv === "temperature_2m";
+
+    // Band (±1σ). Always built — even in overlay mode — so the spread can be
+    // toggled independently and stays visible behind the per-model lines.
+    const lower = pts.map((p) => convertVar(p.value === null ? null : p.value - p.stdDev, dv, units));
+    const delta = pts.map((p) => (Number.isFinite(p.stdDev) ? convertDelta(p.stdDev * 2, dv, units) : 0));
+    series.push({
+      id: "band-base",
+      type: "line",
+      stack: `band-${axisIndex}`,
+      yAxisIndex: axisIndex,
+      symbol: "none",
+      lineStyle: { opacity: 0 },
+      areaStyle: { opacity: 0 },
+      itemStyle: { opacity: 0 },
+      tooltip: { show: false },
+      data: lower,
+      z: 1,
+    });
+    series.push({
+      id: "band-delta",
+      type: "line",
+      stack: `band-${axisIndex}`,
+      // The positive width must also stack on a negative lower bound.
+      stackStrategy: "all",
+      yAxisIndex: axisIndex,
+      symbol: "none",
+      lineStyle: { opacity: 0 },
+      areaStyle: { color: BAND_FILL },
+      tooltip: { show: false },
+      data: delta,
+      z: 1,
+    });
+
+    series.push({
+      id: "agg",
+      name: "Aggregate forecast",
+      type: "line",
+      yAxisIndex: axisIndex,
+      data: values,
+      smooth,
+      symbol: "none",
+      lineStyle: { width: overlay ? 4 : 2.5, color: AGG_COLOR },
+      z: 5,
+      ...(attachMarks && markLine ? { markLine } : {}),
+    });
+
+    // ±1σ band toggles via its fill; the line via line+marker opacity.
+    toggles.push({ group: "band", id: "band-delta", props: ["areaStyle"], shown: 1 });
+    toggles.push({ group: "aggregate", id: "agg", props: ["lineStyle", "itemStyle"], shown: 1 });
+  };
+
+  // --- helper: push precipitation (bars + optional truth) --------------------
+  // `id` lets the composite Temp+Precip view give its precip bars a distinct id
+  // ("agg-precip") so they don't collide with the temperature line's "agg".
+  const pushPrecip = (axisIndex: number, attachMarks: boolean, id = "agg"): void => {
+    const pts = (data.aggregate.precipitation ?? []).slice(0, n);
+    const values = pts.map((p) => convertVar(p.value, "precipitation", units));
+    series.push({
+      id,
+      name: "Aggregate forecast",
+      type: "bar",
+      yAxisIndex: axisIndex,
+      data: values,
+      itemStyle: { color: PRECIP_BAR_COLOR },
+      barWidth: "60%",
+      z: 2,
+      ...(attachMarks && markLine ? { markLine } : {}),
+    });
+    // The Aggregate chip hides the bars in both the precip-only and composite
+    // views (the composite's "agg-precip" bars toggle too — alongside the temp
+    // line, which shares the `aggregate` group).
+    toggles.push({ group: "aggregate", id, props: ["lineStyle", "itemStyle"], shown: 1 });
+
+    // ±1σ spread. The line views draw a shaded band; precipitation gets the bar
+    // equivalent — a translucent band stacked from (value−σ) to (value+σ) and
+    // overlaid on the solid average bar (barGap "-100%"). Below the average the
+    // band tints the solid bar; above it floats over the background — so the
+    // average reads as the step between the two shades. A transparent spacer
+    // floats the band off the baseline; the lower bound is clamped at 0 (precip
+    // can't be negative). Governed by the same "Spread ±1σ" chip (`band` group).
+    const spreadBase = pts.map((p) => {
+      const value = convertVar(p.value, "precipitation", units) ?? 0;
+      const sigma = Number.isFinite(p.stdDev) ? convertDelta(p.stdDev, "precipitation", units) : 0;
+      return Math.max(0, value - sigma);
+    });
+    const spreadSpan = pts.map((p, i) => {
+      const value = convertVar(p.value, "precipitation", units) ?? 0;
+      const sigma = Number.isFinite(p.stdDev) ? convertDelta(p.stdDev, "precipitation", units) : 0;
+      return value + sigma - spreadBase[i]!;
+    });
+    series.push({
+      id: `${id}-spread-base`,
+      type: "bar",
+      yAxisIndex: axisIndex,
+      stack: `${id}-spread`,
+      data: spreadBase,
+      itemStyle: { opacity: 0 },
+      barWidth: "60%",
+      barGap: "-100%",
+      silent: true,
+      tooltip: { show: false },
+      z: 3,
+    });
+    series.push({
+      id: `${id}-spread`,
+      name: "Spread ±1σ",
+      type: "bar",
+      yAxisIndex: axisIndex,
+      stack: `${id}-spread`,
+      data: spreadSpan,
+      itemStyle: { color: PRECIP_SPREAD_FILL },
+      barWidth: "60%",
+      silent: true,
+      tooltip: { show: false },
+      z: 3,
+    });
+    toggles.push({ group: "band", id: `${id}-spread`, props: ["itemStyle"], shown: 1 });
+    const truth = data.truth?.precipitation;
+    if (truth) {
+      series.push({
+        id: "tr",
+        name: "Truth",
+        type: "line",
+        yAxisIndex: axisIndex,
+        data: truth.slice(0, n).map((x) => convertVar(x, "precipitation", units)),
+        step: "middle",
+        symbol: "none",
+        lineStyle: { width: 2, color: TRUTH_COLOR },
+        areaStyle: { color: TRUTH_AREA },
+        z: 2,
+      });
+      // Precip truth carries an area fill — declared here, once.
+      toggles.push({ group: "truth", id: "tr", props: ["lineStyle", "itemStyle", "areaStyle"], shown: 1 });
+    }
+  };
+
+  const pushLineTruth = (dv: DataVarId, axisIndex: number): void => {
+    const truth = data.truth?.[dv];
+    if (!truth) return;
+    series.push({
+      id: "tr",
+      name: "Truth",
+      type: "line",
+      yAxisIndex: axisIndex,
+      data: truth.slice(0, n).map((x) => convertVar(x, dv, units)),
+      smooth: false,
+      symbol: "none",
+      lineStyle: { width: 3, color: TRUTH_COLOR },
+      z: 6,
+    });
+    // Line truth has no area fill (unlike precip truth).
+    toggles.push({ group: "truth", id: "tr", props: ["lineStyle", "itemStyle"], shown: 1 });
+  };
+
+  const pushOverlay = (dv: DataVarId, axisIndex: number): void => {
+    const byModel = data.perModel[dv] ?? {};
+    for (const m of models) {
+      const arr = byModel[m.id];
+      if (!arr) continue;
+      // Built at a constant opacity; visibility is applied via merge-patch so
+      // toggling a chip never triggers a full redraw.
+      series.push({
+        id: `s-${m.id}`,
+        name: m.label,
+        type: "line",
+        yAxisIndex: axisIndex,
+        data: arr.slice(0, n).map((x) => convertVar(x, dv, units)),
+        smooth: dv === "temperature_2m",
+        symbol: "none",
+        lineStyle: { width: 1, color: paletteFor(m.id), opacity: MODEL_OPACITY },
+        z: 3,
+      });
+      toggles.push({ group: "model", id: `s-${m.id}`, modelId: m.id, props: ["lineStyle"], shown: MODEL_OPACITY });
+    }
+  };
+
+  if (isComposite) {
+    // Temp (line + band) on the left axis, precip (bars) on the right.
+    // Distinct id so the precip bars don't collide with the temp line's "agg".
+    pushLineAggregate("temperature_2m", 0, true);
+    pushPrecip(1, false, "agg-precip");
+  } else if (v === "precipitation") {
+    pushPrecip(1, true);
+    if (overlay) pushOverlay("precipitation", 1);
+  } else {
+    const dv = v as DataVarId;
+    pushLineAggregate(dv, 0, true);
+    pushLineTruth(dv, 0);
+    if (overlay) pushOverlay(dv, 0);
+  }
+
+  const leftIsPct = leftVar === "precipitation_probability" || leftVar === "cloud_cover";
+  const leftUnit = leftVar ? unitLabel(leftVar, units) : "";
+  // Hourly precip is the sum over the preceding hour — a rate — so the chart
+  // axis reads "mm/h" (vs. the bare "mm" used for daily totals elsewhere).
+  const precipUnit = `${unitLabel("precipitation", units)}/h`;
+  // Show one x-axis label every `labelStep` hours, anchored to the first local
+  // midnight in the window so the daily ticks land on day boundaries — where the
+  // weekday-label branch above fires. The forecast axis already starts at local
+  // midnight (firstMidnight === 0), so this is identical to the old fixed
+  // interval there. The verification axis starts at the 00Z run cycle (e.g.
+  // 19:00 local), so without anchoring the fixed interval lands on "19:00" every
+  // 24th tick and never on the midnight where the weekday shows. (ECharts'
+  // numeric `interval: n` renders every (n+1)-th category, so labelStep = n+1.)
+  const labelStep = args.hoursWindow <= 24 ? 3 : args.hoursWindow <= 72 ? 12 : 24;
+  const firstMidnight = times.findIndex((t) => new Date(t).getHours() === 0);
+  const labelInterval = (i: number): boolean => (firstMidnight < 0 ? i % labelStep === 0 : i >= firstMidnight && (i - firstMidnight) % labelStep === 0);
+
+  // Floor the precipitation axis at 6 mm/h (converted to the active unit) so a
+  // few tenths of a millimetre don't fill the panel and read as heavy rain.
+  // The axis still grows past the floor when the data genuinely exceeds it.
+  const precipFloor = convertVar(6, "precipitation", units) ?? 6;
+  const precipMax = precipAxisCeiling(precipFloor);
+
+  const option: EChartsOption = {
+    backgroundColor: "transparent",
+    textStyle: { color: PAPER_200, fontFamily: CHART_FONT },
+    // 36 clears the 2-digit axis labels and the unit names on top while letting
+    // the plot span most of the card; bottom stays tight so the x-axis labels
+    // sit just under the plot, not above dead canvas.
+    grid: { left: 36, right: 36, top: 32, bottom: 26 },
+    animationDurationUpdate: 0,
+    tooltip: {
+      trigger: "axis",
+      backgroundColor: TOOLTIP_BG,
+      borderColor: INK_700,
+      borderWidth: 1,
+      textStyle: { color: PAPER_50, fontFamily: CHART_FONT, fontSize: 11 },
+      extraCssText: "border-radius: 0; backdrop-filter: blur(6px); box-shadow: 0 8px 32px rgba(0,0,0,0.6);",
+      // formatter is attached by the component (reads live toggle state at hover).
+    },
+    xAxis: {
+      type: "category",
+      data: labels,
+      axisLine: { lineStyle: { color: INK_600 } },
+      axisLabel: { color: PAPER_300, interval: labelInterval, hideOverlap: true, fontSize: 10 },
+      axisTick: { show: false },
+    },
+    yAxis: [
+      {
+        // Left axis (temp / pct / wind). Always present so its splitLine draws
+        // the horizontal grid even when only precipitation is shown.
+        type: "value",
+        name: leftVar ? leftUnit : "",
+        nameTextStyle: { color: PAPER_300, fontSize: 10 },
+        axisLine: { show: false },
+        axisLabel: { color: PAPER_300, show: !!leftVar, fontSize: 10 },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: INK_800, type: "dashed" } },
+        // Percentage views (precip prob / cloud cover) lock to 0..100; every
+        // other view auto-scales. These MUST be set explicitly (AUTO = null =
+        // auto) rather than omitted — vue-echarts merges options, so an omitted
+        // min/max would leave the 0..100 from a prior pct view stuck in place.
+        min: leftIsPct ? 0 : AUTO,
+        max: leftIsPct ? 100 : AUTO,
+      },
+      {
+        type: "value",
+        name: precipUnit,
+        nameTextStyle: { color: PAPER_300, fontSize: 10 },
+        position: "right",
+        min: 0,
+        max: precipMax,
+        axisLine: { show: false },
+        axisLabel: { color: PAPER_300, fontSize: 10 },
+        splitLine: { lineStyle: { color: INK_800, type: "dashed" }, show: rightActive && !leftVar },
+        show: rightActive,
+      },
+    ],
+    series,
+  };
+
+  return { option, toggles };
+}

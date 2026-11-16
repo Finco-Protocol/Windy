@@ -1,0 +1,538 @@
+"""Windy FastAPI application.
+
+Small, single-user, local-first. All forecast data flows through the archive:
+the Forecast screen reads the latest archived runs, so what you see is exactly
+what was collected — never an ad-hoc re-fetch.
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+
+from . import accuracy as accuracy_mod
+from . import db as dbm
+from . import store
+from .actuals import ActualsError, parse_actuals, persist_actuals
+from .collect import collect_site, iso_z, parse_utc
+from .config import Settings
+from .openmeteo import OMError, OpenMeteoClient
+from .registry import SOURCE_PROVIDER, WINDY_MODELS
+from .scheduler import start_scheduler
+
+log = logging.getLogger("windy")
+
+
+def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | None = None) -> FastAPI:
+    settings = settings or Settings()
+    client = om_client or OpenMeteoClient(timeout_s=settings.om_timeout_s, max_retries=settings.om_max_retries)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        store.ensure_db(settings.db_path)
+        app.state.scheduler = start_scheduler(app, settings) if settings.scheduler_enabled else None
+        log.info("Windy backend ready (db=%s, scheduler=%s)", settings.db_path, bool(app.state.scheduler))
+        yield
+        if app.state.scheduler:
+            app.state.scheduler.shutdown(wait=False)
+
+    app = FastAPI(title="Windy", version="1.0.0", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.om_client = client
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ---- error mapping ----------------------------------------------------
+    # Handlers RETURN proper JSON responses (raising HTTPException from inside
+    # an exception handler would escape the handler middleware and surface as
+    # an opaque 500). Expected invalid input never becomes a 500.
+
+    @app.exception_handler(ActualsError)
+    async def _actuals_error(_req: Request, exc: ActualsError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    @app.exception_handler(KeyError)
+    async def _key_error(_req: Request, exc: KeyError):
+        return JSONResponse(status_code=404, content={"detail": str(exc.args[0] if exc.args else exc)})
+
+    @app.exception_handler(OMError)
+    async def _om_error(_req: Request, exc: OMError):
+        return JSONResponse(status_code=502, content={"detail": str(exc)})
+
+    @app.exception_handler(ValueError)
+    async def _value_error(_req: Request, exc: ValueError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # ---- basics ------------------------------------------------------------
+
+    @app.get("/api/health")
+    def health():
+        with dbm.session(settings.db_path) as conn:
+            version = dbm.get_meta(conn, "schema_version")
+        return {
+            "ok": True,
+            "schema_version": version,
+            "now_utc": iso_z(datetime.now(timezone.utc)),
+            "db_path": str(settings.db_path),
+            "scheduler_enabled": settings.scheduler_enabled,
+        }
+
+    @app.get("/api/site")
+    def site():
+        site_row = store.load_site(settings.db_path, "krnovo")
+        curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
+        return {
+            "site": site_row,
+            "power_curve": {
+                "id": curve.id,
+                "label": curve.label,
+                "status": curve.status,
+                "source": curve.source,
+                "provenance": curve.provenance,
+                "rated_power_mw": curve.rated_power_mw,
+                "cut_in_mps": curve.cut_in_mps,
+                "rated_mps": curve.rated_mps,
+                "cut_out_mps": curve.cut_out_mps,
+            },
+            "models": [
+                {
+                    "id": m.id,
+                    "provider": m.provider,
+                    "label": m.label,
+                    "max_lead_hours": m.max_lead_hours,
+                    "request_days": m.request_days,
+                    "height_method": m.height_method,
+                    "speed_heights_m": list(m.speed_heights),
+                    "note": m.note,
+                }
+                for m in WINDY_MODELS
+            ],
+            "source_provider": SOURCE_PROVIDER,
+            "source_note": "All models are fetched via Open-Meteo; ECMWF/NOAA/DWD are the underlying model origins, not separate providers.",
+        }
+
+    # ---- collection ---------------------------------------------------------
+
+    @app.post("/api/collect")
+    def collect(body: dict | None = None):
+        days = int((body or {}).get("days") or settings.collect_days)
+        if not 1 <= days <= 16:
+            raise ValueError("days must be 1..16")
+        return collect_site(settings.db_path, client, "krnovo", days=days)
+
+    @app.post("/api/backfill")
+    def backfill(body: dict):
+        """Bounded, opt-in historical backfill: ONE archived run per call."""
+        from .backfill import ModelRunUnavailable as MRU
+        from .backfill import run_backfill
+
+        try:
+            return run_backfill(
+                settings,
+                body.get("model_id"),
+                str(body.get("run_date") or ""),
+                int(body.get("run_hour", 0)),
+                int(body.get("days") or 10),
+                client=client,
+            )
+        except MRU as exc:
+            raise HTTPException(status_code=404, detail=f"UNAVAILABLE: {exc}") from exc
+
+    # ---- forecast display ----------------------------------------------------
+
+    @app.get("/api/forecast")
+    def forecast(days: int = Query(10, ge=1, le=16)):
+        site_row = store.load_site(settings.db_path, "krnovo")
+        curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
+        tz = ZoneInfo(site_row["timezone"])
+        horizon_end = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        models_out = []
+        with dbm.session(settings.db_path) as conn:
+            for spec in WINDY_MODELS:
+                run = conn.execute(
+                    """
+                    SELECT * FROM forecast_runs
+                    WHERE site_id=? AND model_id=? AND status='ok'
+                    ORDER BY COALESCE(run_issued_utc, dedupe_key) DESC LIMIT 1
+                    """,
+                    (site_row["id"], spec.id),
+                ).fetchone()
+                entry: dict = {
+                    "model_id": spec.id,
+                    "provider": spec.provider,
+                    "label": spec.label,
+                    "height_method": spec.height_method,
+                    "height_sources_m": list(spec.speed_heights),
+                    "requested_height_m": float(site_row["hub_height_m"]),
+                    "height_note": spec.note,
+                    "run": None,
+                    "points": [],
+                    "daily_local": [],
+                    "total_mwh_own_window": None,
+                    "warnings": [],
+                }
+                if run is None:
+                    entry["warnings"].append("No archived run yet — use 'Fetch now'.")
+                    models_out.append(entry)
+                    continue
+                pts = conn.execute(
+                    "SELECT * FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc",
+                    (run["id"],),
+                ).fetchall()
+                visible = [p for p in pts if p["valid_at_utc"] <= horizon_end]
+                rows = [dict(p) for p in visible]
+                entry["run"] = {
+                    "id": run["id"],
+                    "run_issued_utc": run["run_issued_utc"],
+                    "issue_source": run["issue_source"],
+                    "fetched_at_utc": run["fetched_at_utc"],
+                    "forecast_days": run["forecast_days"],
+                    "source_url": run["source_url"],
+                }
+                if run["issue_source"] == "live-forecast-issue-unknown":
+                    entry["warnings"].append("Issue time unknown (live-forecast fallback; archive had no run at collection time).")
+                if run["run_issued_utc"] is None:
+                    entry["warnings"].append("Historical comparison is not possible for this run (issue time unknown).")
+
+                # daily totals in the site's local timezone; coverage-aware
+                daily: dict[str, dict] = {}
+                cum = 0.0
+                counted_any = False
+                for r in rows:
+                    if r["interval_energy_mwh"] is not None:
+                        cum += r["interval_energy_mwh"]
+                        counted_any = True
+                    local_date = parse_utc(r["valid_at_utc"]).astimezone(tz).strftime("%Y-%m-%d")
+                    slot = daily.setdefault(local_date, {"date": local_date, "mwh": 0.0, "hours_counted": 0, "hours_missing": 0})
+                    if r["interval_energy_mwh"] is not None:
+                        slot["mwh"] = round(slot["mwh"] + r["interval_energy_mwh"], 4)
+                        slot["hours_counted"] += 1
+                    else:
+                        slot["hours_missing"] += 1
+                entry["points"] = rows
+                entry["daily_local"] = list(daily.values())
+                entry["total_mwh_own_window"] = round(cum, 3) if counted_any else None
+                entry["coverage"] = {
+                    "n_hours": len(rows),
+                    "first_valid_utc": rows[0]["valid_at_utc"] if rows else None,
+                    "last_valid_utc": rows[-1]["valid_at_utc"] if rows else None,
+                    "max_available_hours": spec.max_lead_hours,
+                }
+                if rows and rows[-1]["valid_at_utc"] < horizon_end:
+                    entry["warnings"].append(
+                        f"Model horizon ends at {rows[-1]['valid_at_utc']} — no data beyond (not extended)."
+                    )
+                models_out.append(entry)
+
+        # Same-valid-time intersection totals (honest cross-model comparison)
+        by_model_hours = {m["model_id"]: {p["valid_at_utc"] for p in m["points"]} for m in models_out}
+        common = set.intersection(*by_model_hours.values()) if by_model_hours and all(by_model_hours.values()) else set()
+        totals: dict[str, float] = {}
+        for m in models_out:
+            totals[m["model_id"]] = round(
+                sum(p["interval_energy_mwh"] for p in m["points"] if p["valid_at_utc"] in common and p["interval_energy_mwh"] is not None),
+                3,
+            )
+        intersection = {
+            "n_common_hours": len(common),
+            "first_common_utc": min(common) if common else None,
+            "last_common_utc": max(common) if common else None,
+            "total_mwh": totals,
+            "note": "Totals over the common valid-time intersection only — models with shorter horizons are not padded.",
+        }
+
+        return {
+            "site": site_row,
+            "power_curve": {
+                "id": curve.id,
+                "label": curve.label,
+                "status": curve.status,
+                "provenance": curve.provenance,
+            },
+            "generated_at_utc": iso_z(datetime.now(timezone.utc)),
+            "days": days,
+            "models": models_out,
+            "intersection": intersection,
+        }
+
+    # ---- runs / history --------------------------------------------------------
+
+    @app.get("/api/runs")
+    def runs(model_id: str | None = None, limit: int = Query(200, ge=1, le=1000)):
+        q = """
+            SELECT fr.id, fr.model_id, fr.run_issued_utc, fr.dedupe_key, fr.issue_source,
+                   fr.fetched_at_utc, fr.forecast_days, fr.status, fr.requested_height_m,
+                   (SELECT COUNT(*) FROM forecast_points p WHERE p.run_id=fr.id) AS n_points,
+                   (SELECT MIN(valid_at_utc) FROM forecast_points p WHERE p.run_id=fr.id) AS first_valid_utc,
+                   (SELECT MAX(valid_at_utc) FROM forecast_points p WHERE p.run_id=fr.id) AS last_valid_utc
+            FROM forecast_runs fr WHERE fr.site_id=?
+        """
+        args: list = ["krnovo"]
+        if model_id:
+            q += " AND fr.model_id=?"
+            args.append(model_id)
+        q += " ORDER BY COALESCE(fr.run_issued_utc, fr.dedupe_key) DESC LIMIT ?"
+        args.append(limit)
+        with dbm.session(settings.db_path) as conn:
+            rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+        return {"runs": rows}
+
+    @app.get("/api/runs/{run_id}")
+    def run_detail(run_id: int):
+        with dbm.session(settings.db_path) as conn:
+            run = conn.execute("SELECT * FROM forecast_runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"no run {run_id}")
+            points = [dict(p) for p in conn.execute(
+                "SELECT * FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc", (run_id,)
+            ).fetchall()]
+        out = dict(run)
+        out.pop("raw_json", None)
+        out["points"] = points
+        return out
+
+    @app.get("/api/compare")
+    def compare(run_id: int, target_date: str):
+        """What did this archived issue predict for a later target date (UTC)."""
+        try:
+            datetime.strptime(target_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("target_date must be YYYY-MM-DD") from exc
+        with dbm.session(settings.db_path) as conn:
+            run = conn.execute("SELECT * FROM forecast_runs WHERE id=?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"no run {run_id}")
+            points = [dict(p) for p in conn.execute(
+                "SELECT * FROM forecast_points WHERE run_id=? AND valid_at_utc LIKE ? ORDER BY valid_at_utc",
+                (run_id, f"{target_date}%"),
+            ).fetchall()]
+        total = round(sum(p["interval_energy_mwh"] or 0.0 for p in points), 3)
+        return {
+            "run_id": run_id,
+            "model_id": run["model_id"],
+            "run_issued_utc": run["run_issued_utc"],
+            "target_date": target_date,
+            "points": points,
+            "total_mwh": total,
+        }
+
+    # ---- actuals -----------------------------------------------------------------
+
+    def _read_upload(file: UploadFile) -> tuple[str, bytes]:
+        data = file.file.read()
+        if not data:
+            raise ActualsError("uploaded file is empty")
+        return file.filename or "upload.csv", data
+
+    @app.post("/api/actuals/preview")
+    async def actuals_preview(file: UploadFile = File(...), mapping: str = Form(...)):
+        filename, data = _read_upload(file)
+        mapping_dict = json.loads(mapping)
+        parsed = parse_actuals(filename, data, mapping_dict)
+        preview = {
+            "fieldnames": parsed.fieldnames,
+            "rows_total": parsed.rows_total,
+            "rows_parsed": len(parsed.rows),
+            "interval_hours": parsed.interval_hours,
+            "errors": parsed.errors[:200],
+            "warnings": parsed.warnings[:200],
+            "rows": [r.__dict__ for r in parsed.rows[:500]],
+            "truncated": len(parsed.rows) > 500,
+        }
+        if parsed.rows:
+            from .actuals import check_conflicts
+
+            existing = check_conflicts(settings.db_path, "krnovo", parsed.rows)
+            preview["n_conflicts_with_db"] = len(existing)
+            preview["conflicts"] = existing[:100]
+        return preview
+
+    @app.post("/api/actuals/import")
+    async def actuals_import(
+        file: UploadFile = File(...),
+        mapping: str = Form(...),
+        on_conflict: str = Form("reject"),
+    ):
+        filename, data = _read_upload(file)
+        mapping_dict = json.loads(mapping)
+        parsed = parse_actuals(filename, data, mapping_dict)
+        if parsed.errors:
+            # A file with invalid rows is blocked, never partially imported:
+            # quiet partial imports would make the archive silently inconsistent.
+            # An explicit partial-import opt-in may come in a future PR.
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": (
+                        f"{len(parsed.errors)} row(s) failed validation — import blocked. "
+                        "Fix the rows listed below (see /api/actuals/preview) and re-import."
+                    ),
+                    "n_errors": len(parsed.errors),
+                    "errors": parsed.errors[:50],
+                },
+            )
+        result = persist_actuals(settings.db_path, "krnovo", filename, mapping_dict, parsed, on_conflict=on_conflict)
+        return result
+
+    @app.get("/api/actuals")
+    def actuals_list(
+        from_utc: str = Query("1970-01-01T00:00:00Z"),
+        to_utc: str = Query("2999-01-01T00:00:00Z"),
+        limit: int = Query(2000, ge=1, le=50000),
+    ):
+        f = accuracy_mod.parse_z(from_utc)
+        t = accuracy_mod.parse_z(to_utc)
+        with dbm.session(settings.db_path) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM actual_points WHERE site_id=? AND interval_start_utc>=? AND interval_start_utc<? ORDER BY interval_start_utc LIMIT ?",
+                ("krnovo", f, t, limit),
+            ).fetchall()]
+        return {"rows": rows}
+
+    @app.get("/api/actuals/imports")
+    def actuals_imports():
+        with dbm.session(settings.db_path) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, filename, imported_at_utc, timezone, rows_total, rows_ok, warnings_json FROM actual_imports ORDER BY id DESC LIMIT 100"
+            ).fetchall()]
+        for r in rows:
+            r["warnings"] = json.loads(r.pop("warnings_json") or "[]")
+            r["mapping"] = None
+        return {"imports": rows}
+
+    # ---- accuracy -----------------------------------------------------------------
+
+    @app.get("/api/accuracy")
+    def accuracy(from_utc: str, to_utc: str):
+        return accuracy_mod.accuracy(settings.db_path, "krnovo", from_utc, to_utc)
+
+    @app.get("/api/accuracy/overlay")
+    def accuracy_overlay(from_utc: str, to_utc: str, lead_bin: str | None = None):
+        return accuracy_mod.overlay(settings.db_path, "krnovo", from_utc, to_utc, lead_bin)
+
+    # ---- export ---------------------------------------------------------------------
+
+    @app.get("/api/export/forecast.csv")
+    def export_forecast(run_id: int | None = None, model_id: str | None = None, from_utc: str | None = None, to_utc: str | None = None):
+        q = """
+            SELECT fr.model_id, fr.run_issued_utc, fr.issue_source, fr.fetched_at_utc,
+                   fr.source_url, fr.requested_height_m, fr.height_method,
+                   fp.valid_at_utc, fp.wind_speed_mps, fp.wind_direction_deg,
+                   fp.modeled_power_mw, fp.interval_energy_mwh, fp.interval_hours, fp.status
+            FROM forecast_points fp JOIN forecast_runs fr ON fr.id = fp.run_id
+            WHERE fr.site_id = 'krnovo'
+        """
+        args: list = []
+        if run_id:
+            q += " AND fr.id=?"
+            args.append(run_id)
+        if model_id:
+            q += " AND fr.model_id=?"
+            args.append(model_id)
+        if from_utc:
+            q += " AND fp.valid_at_utc>=?"
+            args.append(accuracy_mod.parse_z(from_utc))
+        if to_utc:
+            q += " AND fp.valid_at_utc<?"
+            args.append(accuracy_mod.parse_z(to_utc))
+        q += " ORDER BY fr.run_issued_utc, fr.model_id, fp.valid_at_utc"
+        with dbm.session(settings.db_path) as conn:
+            rows = conn.execute(q, args).fetchall()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([
+            "model_id", "run_issued_utc", "issue_source", "fetched_at_utc", "source_url",
+            "requested_height_m", "height_method", "valid_at_utc", "wind_speed_mps",
+            "wind_direction_deg", "modeled_power_mw", "interval_energy_mwh",
+            "interval_hours", "status",
+        ])
+        for r in rows:
+            w.writerow([r[c] for c in (
+                "model_id", "run_issued_utc", "issue_source", "fetched_at_utc", "source_url",
+                "requested_height_m", "height_method", "valid_at_utc", "wind_speed_mps",
+                "wind_direction_deg", "modeled_power_mw", "interval_energy_mwh",
+                "interval_hours", "status",
+            )])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=windy_forecast_archive.csv"},
+        )
+
+    @app.get("/api/export/actuals.csv")
+    def export_actuals():
+        with dbm.session(settings.db_path) as conn:
+            rows = conn.execute(
+                "SELECT interval_start_utc, interval_end_utc, energy_mwh, power_mw, import_id FROM actual_points WHERE site_id='krnovo' ORDER BY interval_start_utc"
+            ).fetchall()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["interval_start_utc", "interval_end_utc", "energy_mwh", "power_mw", "import_id"])
+        for r in rows:
+            w.writerow([r["interval_start_utc"], r["interval_end_utc"], r["energy_mwh"], r["power_mw"], r["import_id"]])
+        buf.seek(0)
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=windy_actuals.csv"},
+        )
+
+    # ---- built frontend (Docker image) ----------------------------------------------
+    #
+    # The Vue app uses history-mode routes (/history, /actuals), so hard
+    # refreshes and direct navigation must serve index.html. Starlette's
+    # StaticFiles(html=True) does NOT do that for unknown deep links, so:
+    #   - /assets/* is served statically (missing chunks stay real 404s),
+    #   - a catch-all GET route serves existing root files (favicon, sw.js, ...)
+    #     and falls back to index.html for application routes only.
+    # API routes are registered before the catch-all, and unmatched /api/*
+    # paths return JSON 404 — never index.html disguised as an API response.
+
+    dist = settings.frontend_dist
+    if dist and dist.exists():
+        if (dist / "assets").is_dir():
+            from fastapi.staticfiles import StaticFiles
+
+            app.mount("/assets", StaticFiles(directory=str(dist / "assets")), name="assets")
+
+        index_html = dist / "index.html"
+
+        @app.get("/{full_path:path}", include_in_schema=False)
+        def spa_fallback(full_path: str):
+            if full_path.startswith("api/"):
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            candidate = (dist / full_path).resolve()
+            try:
+                candidate.relative_to(dist.resolve())  # traversal guard
+            except ValueError:
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            if candidate.is_file():
+                return FileResponse(candidate)
+            if Path(full_path).suffix:  # a missing file with an extension stays a 404
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+            if index_html.is_file():
+                return FileResponse(index_html)
+            return JSONResponse(status_code=404, content={"detail": "frontend build missing index.html"})
+
+    return app
+
+
+app = create_app()

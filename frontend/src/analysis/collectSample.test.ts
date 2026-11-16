@@ -1,0 +1,187 @@
+import { describe, it, expect } from "vitest";
+
+import { ARCHIVED_MODEL_IDS } from "@/api/omSingleRuns";
+
+import { gatherRuns, planRuns, type GatherDeps } from "./collectSample";
+import type { RunEvaluation } from "./runEvaluation";
+
+describe("planRuns", () => {
+  it("enumerates run dates newest-first, one ref per cycle", () => {
+    const refs = planRuns({ endDate: "2026-06-03", durationDays: 3, cycles: [0], floorDate: "2026-01-01" });
+    expect(refs).toEqual([
+      { runDate: "2026-06-03", runHour: 0 },
+      { runDate: "2026-06-02", runHour: 0 },
+      { runDate: "2026-06-01", runHour: 0 },
+    ]);
+  });
+
+  it("stops at the retention floor", () => {
+    const refs = planRuns({ endDate: "2026-06-03", durationDays: 10, cycles: [0], floorDate: "2026-06-02" });
+    expect(refs.map((r) => r.runDate)).toEqual(["2026-06-03", "2026-06-02"]);
+  });
+
+  it("expands cycles within a day", () => {
+    const refs = planRuns({ endDate: "2026-06-03", durationDays: 1, cycles: [0, 6, 12, 18], floorDate: "2026-01-01" });
+    expect(refs.map((r) => r.runHour)).toEqual([0, 6, 12, 18]);
+  });
+});
+
+const okDeps = (): GatherDeps => ({
+  fetchRuns: () => Promise.resolve({} as never),
+  fetchTruth: () => Promise.resolve({} as never),
+  evaluate: ({ runDate, runHour }) => ({ runDate, runHour, scorecard: [] }) as unknown as RunEvaluation,
+});
+
+const refs = [
+  { runDate: "2026-06-03", runHour: 0 },
+  { runDate: "2026-06-02", runHour: 0 },
+  { runDate: "2026-06-01", runHour: 0 },
+];
+
+describe("gatherRuns", () => {
+  it("fetches + evaluates every ref and reports progress", async () => {
+    const progress: number[] = [];
+    const out = await gatherRuns(refs, { location: { latitude: 1, longitude: 2 }, concurrency: 2, onProgress: (d) => progress.push(d) }, okDeps());
+    expect(out.map((r) => r.runDate).toSorted()).toEqual(["2026-06-01", "2026-06-02", "2026-06-03"]);
+    expect(progress.at(-1)).toBe(3);
+  });
+
+  it("requests 10 forecast days and a matching 10-day truth window (ADR 0011)", async () => {
+    let forecastDays: number | undefined;
+    let truthEnd: string | undefined;
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: (req) => {
+        forecastDays = req.forecastDays;
+        return Promise.resolve({} as never);
+      },
+      fetchTruth: (req) => {
+        truthEnd = req.endDate;
+        return Promise.resolve({} as never);
+      },
+    };
+    await gatherRuns([{ runDate: "2026-06-03", runHour: 0 }], { location: { latitude: 1, longitude: 2 } }, deps);
+    expect(forecastDays).toBe(10);
+    expect(truthEnd).toBe("2026-06-13"); // runDate + 10 days, so band 4 (168–240 h) is verifiable
+  });
+
+  it("skips runs whose evaluation is null (e.g. empty archive)", async () => {
+    const deps: GatherDeps = {
+      ...okDeps(),
+      evaluate: ({ runDate, runHour }) => (runDate === "2026-06-02" ? null : ({ runDate, runHour, scorecard: [] } as unknown as RunEvaluation)),
+    };
+    const out = await gatherRuns(refs, { location: { latitude: 1, longitude: 2 } }, deps);
+    expect(out).toHaveLength(2);
+  });
+
+  it("skips a run whose fetch throws, without failing the gather", async () => {
+    const deps: GatherDeps = { ...okDeps(), fetchRuns: (req) => (req.runDate === "2026-06-02" ? Promise.reject(new Error("aged out")) : Promise.resolve({} as never)) };
+    const out = await gatherRuns(refs, { location: { latitude: 1, longitude: 2 } }, deps);
+    expect(out).toHaveLength(2);
+  });
+
+  it("carries a model dropped on a newer run forward to older runs of the same cycle", async () => {
+    const seen = new Map<string, string[]>();
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: (req, opts) => {
+        seen.set(req.runDate, req.models ?? []);
+        // The newest run discovers ecmwf_ifs has aged out of the archive.
+        if (req.runDate === "2026-06-03") opts?.onModelUnavailable?.("ecmwf_ifs");
+        return Promise.resolve({} as never);
+      },
+    };
+    // concurrency 1 → strict newest-first, so the drop is known before older runs start.
+    await gatherRuns(refs, { location: { latitude: 1, longitude: 2 }, concurrency: 1 }, deps);
+
+    expect(seen.get("2026-06-03")).toContain("ecmwf_ifs");
+    expect(seen.get("2026-06-02")).not.toContain("ecmwf_ifs");
+    expect(seen.get("2026-06-01")).not.toContain("ecmwf_ifs");
+  });
+
+  it("re-probes the full model set once past the re-check window", async () => {
+    // 35 days back, one cycle → day 0-29 fall in window 0, day 30-34 in window 1
+    // (RECHECK_WINDOW_DAYS is 30, so a default 30-day gather never crosses a boundary).
+    const spanning = planRuns({ endDate: "2026-06-20", durationDays: 35, cycles: [0], floorDate: "2026-01-01" });
+    const seen = new Map<string, string[]>();
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: (req, opts) => {
+        seen.set(req.runDate, req.models ?? []);
+        opts?.onModelUnavailable?.("ecmwf_ifs"); // every run reports it gone
+        return Promise.resolve({} as never);
+      },
+    };
+    await gatherRuns(spanning, { location: { latitude: 1, longitude: 2 }, concurrency: 1 }, deps);
+
+    expect(seen.get("2026-06-20")).toContain("ecmwf_ifs"); // window 0 opens with the full set
+    expect(seen.get("2026-06-19")).not.toContain("ecmwf_ifs"); // carried forward within window 0
+    expect(seen.get("2026-05-21")).toContain("ecmwf_ifs"); // day 30 → window 1 re-probes from scratch
+  });
+
+  it("warms up a window's memo before fanning out, so concurrent siblings don't re-probe", async () => {
+    // Without the warm-up gate, all 3 runs (concurrency 3, one window) would start
+    // on an empty memo and each re-request the dropped model. The gate lets the
+    // first run seed the memo first, so only it requests the model.
+    const asked: string[][] = [];
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: async (req, opts) => {
+        asked.push(req.models ?? []);
+        await Promise.resolve(); // the miss surfaces only after the request settles
+        if (req.runDate === "2026-06-03") opts?.onModelUnavailable?.("ecmwf_ifs");
+        return {} as never;
+      },
+    };
+    await gatherRuns(refs, { location: { latitude: 1, longitude: 2 }, concurrency: 3 }, deps);
+
+    // Exactly one run (the window's first) still carried ecmwf_ifs.
+    expect(asked.filter((m) => m.includes("ecmwf_ifs"))).toHaveLength(1);
+    expect(asked).toHaveLength(3);
+  });
+
+  it("keeps the unavailability memo independent per run cycle", async () => {
+    const twoCycles = planRuns({ endDate: "2026-06-03", durationDays: 2, cycles: [0, 6], floorDate: "2026-01-01" });
+    const seen: { runDate: string; runHour: number; models: string[] }[] = [];
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: (req, opts) => {
+        seen.push({ runDate: req.runDate, runHour: req.runHour ?? 0, models: req.models ?? [] });
+        // Only the 06Z cycle loses the model; 00Z must be unaffected.
+        if (req.runDate === "2026-06-03" && req.runHour === 6) opts?.onModelUnavailable?.("ecmwf_ifs");
+        return Promise.resolve({} as never);
+      },
+    };
+    await gatherRuns(twoCycles, { location: { latitude: 1, longitude: 2 }, concurrency: 1 }, deps);
+
+    const models = (runDate: string, runHour: number) => seen.find((s) => s.runDate === runDate && s.runHour === runHour)?.models ?? [];
+    expect(models("2026-06-02", 6)).not.toContain("ecmwf_ifs"); // carried forward within 06Z
+    expect(models("2026-06-02", 0)).toContain("ecmwf_ifs"); // 00Z stays untouched
+  });
+
+  it("makes no request for a run once every model is unavailable for its cycle", async () => {
+    let runFetches = 0;
+    let truthFetches = 0;
+    const progress: number[] = [];
+    const deps: GatherDeps = {
+      ...okDeps(),
+      fetchRuns: (req, opts) => {
+        runFetches += 1;
+        // The newest run reports every model gone, exhausting the cycle.
+        if (req.runDate === "2026-06-03") for (const id of ARCHIVED_MODEL_IDS) opts?.onModelUnavailable?.(id);
+        return Promise.resolve({} as never);
+      },
+      fetchTruth: () => {
+        truthFetches += 1;
+        return Promise.resolve({} as never);
+      },
+    };
+    await gatherRuns(refs, { location: { latitude: 1, longitude: 2 }, concurrency: 1, onProgress: (d) => progress.push(d) }, deps);
+
+    // Only the newest run hit the network; the two older runs were skipped outright.
+    expect(runFetches).toBe(1);
+    expect(truthFetches).toBe(1);
+    // Progress still advances for the skipped runs so the bar completes.
+    expect(progress.at(-1)).toBe(3);
+  });
+});

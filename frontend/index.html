@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Lock the viewport: no pinch-, double-tap-, or input-focus auto-zoom, so
+         the app behaves like a fixed instrument panel on mobile. iOS Safari
+         ignores user-scalable=no for manual pinch — see the gesture guard in
+         src/main.ts. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Windy — Krnovo wind-farm forecasts</title>
+    <meta name="description" content="Private wind-farm forecast and forecast-accuracy application. Multi-model forecasts via Open-Meteo, archived per issue, compared with actual generation." />
+
+    <!-- Type system: a humanist sans for body (Instrument Sans) and a mono with
+         slashed-zero for all data (JetBrains Mono). Loaded from src/style.css —
+         see there for why they are bundled rather than fetched. -->
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,107 @@
+import { computed, type Ref } from "vue";
+
+import { loadWeights } from "@/analysis/learnedWeightsStore";
+import { evaluateRun, type RunEvaluation, type VerificationHourly } from "@/analysis/runEvaluation";
+import { SINGLE_FORECAST_DAYS } from "@/analysis/truthWindow";
+import { extractSolar, fetchHistoricalWeather } from "@/api/omHistoricalWeather";
+import { fetchSingleRuns } from "@/api/omSingleRuns";
+import type { ModelDef } from "@/domain/models";
+import type { ScorecardRow } from "@/domain/scorecard";
+import type { DailyVerification } from "@/domain/verification";
+import { addDaysIso } from "@/utils/date";
+
+import { useAbortableResource } from "./useAbortableResource";
+import { useApiKey } from "./useApiKey";
+import type { Location } from "./useLocation";
+import { useSettings } from "./useSettings";
+
+/** Re-exported from the framework-free analysis layer, where the run
+ *  evaluation is computed (see `@/analysis/runEvaluation`). */
+export type { VerificationHourly };
+
+export interface UseVerificationReturn {
+  loading: Ref<boolean>;
+  error: Ref<string | null>;
+  hourly: Ref<VerificationHourly | null>;
+  daily: Ref<DailyVerification[] | null>;
+  /** Per-model (+ aggregate) full-window scores, sorted by Overall composite.
+   *  The per-model lens of the verification page — see CONTEXT.md "Per-model
+   *  scorecard". Distinct from `daily`, which scores only the aggregate per day. */
+  scorecard: Ref<ScorecardRow[] | null>;
+  /** Subset of MODELS that returned non-null data (temp or precip) for this run date. */
+  availableModels: Ref<ModelDef[]>;
+  /** Sunrise/sunset (astronomical, location-local) for the chart's day/night
+   *  shading. Null until the single-runs response lands. */
+  solar: Ref<{ sunrise: string[]; sunset: string[] } | null>;
+  refresh: () => Promise<void>;
+}
+
+export function useVerification(location: Ref<Location>, runDate: Ref<string>, runCycle: Ref<number>): UseVerificationReturn {
+  const { useTrainedWeights } = useSettings();
+  // The commercial API key switches which host both requests hit, so it joins
+  // location + runDate as a fetch dependency (flipping it refetches the run).
+  const { apiKey } = useApiKey();
+  // The runs + truth pair is fetched together (so a superseded date/location
+  // change aborts both); the helper owns the abort + superseded-loading guard.
+  const { data, loading, error, refresh } = useAbortableResource(
+    async (signal) => {
+      // Truth uses UTC dates, like the run cycle. Include the final date so
+      // non-midnight cycles have observations through their full horizon.
+      const truthEndDate = addDaysIso(runDate.value, SINGLE_FORECAST_DAYS);
+      const [runs, truth] = await Promise.all([
+        fetchSingleRuns(
+          { lat: location.value.latitude, lon: location.value.longitude, runDate: runDate.value, runHour: runCycle.value, forecastDays: SINGLE_FORECAST_DAYS },
+          { signal },
+        ),
+        fetchHistoricalWeather({ lat: location.value.latitude, lon: location.value.longitude, startDate: runDate.value, endDate: truthEndDate }, signal),
+      ]);
+      return { runs, truth };
+    },
+    () => [location.value.latitude, location.value.longitude, runDate.value, runCycle.value, apiKey.value],
+  );
+
+  // All scoring lives in the analysis layer; this just feeds it the fetched pair
+  // and slices the result into reactive refs. The evaluation is
+  // toggle-independent — it always builds the default surfaces, plus the tuned
+  // ones when tuned weights exist.
+  const evaluation = computed<RunEvaluation | null>(() => {
+    const runs = data.value?.runs;
+    const truth = data.value?.truth;
+    if (!runs || !truth) return null;
+    // Compute a default-vs-tuned comparison whenever this location has stored
+    // trained weights — independent of the live "use trained weights" toggle.
+    const tunedMultipliers = loadWeights(location.value.latitude, location.value.longitude)?.multipliers;
+    return evaluateRun({
+      runs,
+      truth,
+      lat: location.value.latitude,
+      lon: location.value.longitude,
+      runDate: runDate.value,
+      runHour: runCycle.value,
+      tunedMultipliers,
+    });
+  });
+
+  // The toggle mirrors the live forecast: when it's on and tuned surfaces exist,
+  // the chart + daily cards draw the tuned aggregate; otherwise the default one.
+  // Both are precomputed, so flipping it swaps surfaces rather than
+  // re-evaluating. The scorecard shows both rows regardless and never reads it.
+  const useTuned = computed(() => useTrainedWeights.value && evaluation.value?.tunedHourly != null);
+  const hourly = computed<VerificationHourly | null>(() => {
+    const ev = evaluation.value;
+    if (!ev) return null;
+    return useTuned.value && ev.tunedHourly ? ev.tunedHourly : ev.hourly;
+  });
+  const daily = computed<DailyVerification[] | null>(() => {
+    const ev = evaluation.value;
+    if (!ev) return null;
+    return useTuned.value && ev.tunedDaily ? ev.tunedDaily : ev.daily;
+  });
+  const scorecard = computed<ScorecardRow[] | null>(() => evaluation.value?.scorecard ?? null);
+  const availableModels = computed<ModelDef[]>(() => evaluation.value?.availableModels ?? []);
+  // Sunrise/sunset ride along on the truth (archive) response — single-runs
+  // can't serve daily solar under our run-cycle timezone (see omSingleRuns).
+  const solar = computed(() => (data.value?.truth ? extractSolar(data.value.truth, data.value.runs.utc_offset_seconds ?? 0) : null));
+
+  return { loading, error, hourly, daily, scorecard, availableModels, solar, refresh };
+}
