@@ -252,7 +252,7 @@ const curveUncalibrated = computed(() => fcData.value?.power_curve.status !== "m
           </div>
 
           <CollapsibleSection title="Hub-height wind speed (m/s)">
-            <p class="text-paper-400 font-mono text-[10px]">Gaps are missing source levels — never interpolated from 10 m, never zero-filled. ICON-EU ends at 120 h, ICON Global around 180 h.</p>
+            <p class="text-paper-400 font-mono text-[10px]">Gaps are missing source levels — never interpolated from 10 m, never zero-filled. ICON-EU ends at 120 h, ICON Global at 192 h.</p>
             <VChart style="height: 20rem" :option="windOption" autoresize />
           </CollapsibleSection>
 

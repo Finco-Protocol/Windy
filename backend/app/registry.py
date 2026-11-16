@@ -64,7 +64,7 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         id="icon_global",
         provider="DWD",
         label="DWD ICON Global",
-        max_lead_hours=180,
+        max_lead_hours=192,
         request_days=8,
         speed_heights=(80, 120),
         direction_heights=(120,),
@@ -72,7 +72,7 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         note=(
             "ICON Global publishes 80 m and 120 m wind; the 90 m hub value is "
             "log-height interpolated between 80 and 120 m. Direction taken at 120 m. "
-            "Horizon ends around 180 h (~7.5 days) — later hours do not exist."
+            "Horizon ends at 192 h (8 days) — later hours do not exist."
         ),
     ),
     ModelSpec(

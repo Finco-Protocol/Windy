@@ -20,7 +20,7 @@ const links = [
         <span class="text-sodium-200 font-mono text-sm tracking-[0.2em]">WINDY</span>
         <span class="text-paper-300 font-mono text-[11px] tracking-wide">Krnovo · 71.5 MW</span>
       </RouterLink>
-      <nav class="flex gap-1" aria-label="Main">
+      <nav class="flex flex-wrap gap-1" aria-label="Main">
         <RouterLink
           v-for="l in links"
           :key="l.to"

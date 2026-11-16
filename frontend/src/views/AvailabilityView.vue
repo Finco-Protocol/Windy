@@ -13,6 +13,7 @@ import {
   type OperationalConstraint,
   type RunSummary,
   type ScenarioResponse,
+  type ScenarioRevision,
   type SiteOperatingStatus,
   type SiteResponse,
 } from "@/api/windy";
@@ -44,6 +45,12 @@ const consResource = useAbortableResource<{ revision: number; constraints: Opera
 );
 const { data: constraintsData, refresh: refreshConstraints } = consResource;
 
+const revisionsResource = useAbortableResource<{ revisions: ScenarioRevision[] }>(
+  (signal) => windyApi.scenarioRevisions(siteId.value, signal),
+  () => [siteId.value],
+);
+const { data: revisionsData, refresh: refreshRevisions } = revisionsResource;
+
 const runsResource = useAbortableResource<{ runs: RunSummary[] }>(
   (signal) => windyApi.runs(null, siteId.value, signal),
   () => [siteId.value],
@@ -53,13 +60,24 @@ const latestRuns = computed(() => {
   return (runsResource.data.value?.runs ?? []).filter((r) => !seen.has(r.model_id) && seen.add(r.model_id));
 });
 const selectedRunId = ref<number | null>(null);
+// pinned reopen: when set, the scenario is computed against THESE revisions
+// (audit view of a published snapshot), not the currently active configuration
+const pinned = ref<{ inventory_revision: number; constraints_revision: number } | null>(null);
 const runOptions = computed(() => latestRuns.value.map((r) => ({ value: r.id, label: `${r.model_id} · issued ${r.run_issued_utc ?? "unknown"}` })));
 
 const scenarioResource = useAbortableResource<ScenarioResponse | null>(
-  async (signal) => (selectedRunId.value === null ? null : windyApi.scenario(siteId.value, selectedRunId.value, signal)),
-  () => [selectedRunId.value, siteId.value],
+  async (signal) => {
+    if (selectedRunId.value === null) return null;
+    return windyApi.scenarioPinned(siteId.value, selectedRunId.value, pinned.value, signal);
+  },
+  () => [selectedRunId.value, siteId.value, pinned.value?.inventory_revision ?? null, pinned.value?.constraints_revision ?? null],
 );
 const { data: scenario, loading: scenarioLoading, error: scenarioError } = scenarioResource;
+
+function selectRun(id: number | null): void {
+  selectedRunId.value = id;
+  pinned.value = null; // fresh selection follows the live configuration
+}
 
 // ---- bulk edit form --------------------------------------------------------------
 
@@ -297,11 +315,22 @@ async function publish(): Promise<void> {
   try {
     const res = await windyApi.scenarioPublish(siteId.value, selectedRunId.value);
     publishMessage.value = `published scenario revision #${res.scenario_revision_id} (inputs pinned; idempotent on republish)`;
+    await refreshRevisions();
+    // reopen the just-published revision pinned to ITS inputs
+    pinned.value = { inventory_revision: res.retrieval.inventory_revision, constraints_revision: res.retrieval.constraints_revision };
+    await scenarioResource.refresh();
   } catch (e) {
     publishMessage.value = e instanceof Error ? e.message : String(e);
   } finally {
     publishBusy.value = false;
   }
+}
+
+function reopen(rev: ScenarioRevision): void {
+  // audit view of an older published snapshot pinned to ITS revisions —
+  // current live constraints are NOT used for this display
+  selectedRunId.value = rev.run_id;
+  pinned.value = { inventory_revision: rev.inventory_revision, constraints_revision: rev.constraints_revision };
 }
 
 function capLabel(c: OperationalConstraint): string {
@@ -492,7 +521,11 @@ function capLabel(c: OperationalConstraint): string {
           <div class="mb-2 flex flex-wrap items-center gap-2">
             <label class="font-mono text-[10px]">
               <span class="text-paper-400 block">archived run</span>
-              <select v-model.number="selectedRunId" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 border px-2 py-1 font-mono text-[11px]">
+              <select
+                :value="selectedRunId"
+                class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 border px-2 py-1 font-mono text-[11px]"
+                @change="selectRun(Number(($event.target as HTMLSelectElement).value))"
+              >
                 <option :value="null" disabled>select a run…</option>
                 <option v-for="o in runOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
               </select>
@@ -509,6 +542,11 @@ function capLabel(c: OperationalConstraint): string {
           <StateBlock v-else-if="scenarioLoading" kind="loading" loading-py="py-8" caption="Computing scenario…" />
           <StateBlock v-else-if="!scenario" kind="empty">Select an archived run to compute the adjusted scenario.</StateBlock>
           <template v-else-if="scenario">
+            <p v-if="pinned" class="text-sodium-200 mb-2 font-mono text-[10px]">
+              AUDIT VIEW — pinned to inventory revision {{ pinned.inventory_revision }} and constraints revision
+              {{ pinned.constraints_revision }} (not the live configuration).
+              <button type="button" class="text-paper-100 underline" @click="selectRun(selectedRunId)">back to live</button>
+            </p>
             <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
               {{ scenario.note }} Curve mode: <span class="text-paper-100">{{ scenario.summary.curve_mode }}</span>.
               <span v-if="scenario.summary.curve_mode === 'scaled-reference'" class="text-heat-300">REFERENCE/UNVERIFIED — scaled normalized shape.</span>
@@ -545,7 +583,47 @@ function capLabel(c: OperationalConstraint): string {
               </div>
             </div>
             <VChart style="height: 18rem" :option="scenarioOption" autoresize />
+            <a
+              v-if="selectedRunId !== null"
+              :href="`/api/assets/${encodeURIComponent(siteId)}/scenario/export.csv?run_id=${selectedRunId}${
+                pinned ? `&inventory_revision=${pinned.inventory_revision}&constraints_revision=${pinned.constraints_revision}` : ''
+              }`"
+              class="border-ink-700 text-paper-300 hover:border-sodium-300/60 hover:text-sodium-200 mt-2 inline-block border px-3 py-1 font-mono text-[11px] transition-colors"
+            >Export scenario CSV{{ pinned ? " (pinned revision)" : "" }}</a>
           </template>
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Published scenario revisions" :default-open="false" lazy>
+          <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
+            Each row is a published snapshot pinned to its own inventory/constraint revisions. Opening an older revision
+            shows the AUDIT view of that snapshot — the live configuration is not applied to it.
+          </p>
+          <StateBlock v-if="revisionsData && revisionsData.revisions.length === 0" kind="empty">
+            Nothing published yet — select a run and press “Publish scenario revision”.
+          </StateBlock>
+          <div v-else-if="revisionsData" class="space-y-1">
+            <div
+              v-for="r in revisionsData.revisions"
+              :key="r.id"
+              class="border-ink-700 flex flex-wrap items-center justify-between gap-2 border px-2 py-1 font-mono text-[10px]"
+            >
+              <span class="text-paper-100">
+                #{{ r.id }} · {{ r.model_id }} · {{ r.run_issued_utc ?? "unknown" }}
+                <span class="text-paper-400">inv r{{ r.inventory_revision }} · cons r{{ r.constraints_revision }} · alg v{{ r.algorithm_version }} · {{ r.created_at_utc }}</span>
+              </span>
+              <span class="flex items-center gap-2">
+                <span class="text-paper-300">
+                  24h adj: {{ r.summary?.windows?.["24h"]?.complete ? `${r.summary.windows["24h"].adjusted_mwh} MWh` : `n/a (subtotal ${r.summary?.windows?.["24h"]?.available_hours_subtotal?.adjusted_mwh ?? "—"} MWh / ${r.summary?.windows?.["24h"]?.available_hours_subtotal?.hours ?? 0} h)` }}
+                </span>
+                <button type="button" class="border-ink-600 text-paper-100 hover:border-sodium-300/60 border px-2 py-0.5" @click="reopen(r)">reopen</button>
+                <a
+                  :href="r.retrieve_at"
+                  class="border-ink-700 text-paper-300 border px-2 py-0.5"
+                  title="pinned JSON endpoint"
+                >json</a>
+              </span>
+            </div>
+          </div>
         </CollapsibleSection>
       </template>
     </main>
