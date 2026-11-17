@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -259,6 +259,38 @@ CREATE INDEX IF NOT EXISTS idx_constraints_rev ON operational_constraints(site_i
 """
 
 
+MIGRATION_5_SQL = """
+-- v5 (PR#8 Correction A): append-only site configuration revisions (same-site
+-- versioned edit workflow — never an in-place silent rewrite) and append-only
+-- per-turbine location records (lat/lon/elevation with provenance). Additive
+-- only; existing rows are untouched. No seed data is written by migrations.
+CREATE TABLE IF NOT EXISTS site_config_revisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  revision INTEGER NOT NULL,
+  changes_json TEXT NOT NULL,
+  effective_from_utc TEXT NOT NULL,
+  note TEXT,
+  created_at_utc TEXT NOT NULL,
+  created_by TEXT NOT NULL DEFAULT 'owner',
+  UNIQUE (site_id, revision)
+);
+CREATE TABLE IF NOT EXISTS turbine_locations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  revision INTEGER NOT NULL,
+  unit_id TEXT NOT NULL,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL,
+  elevation_m REAL,
+  source TEXT NOT NULL DEFAULT 'owner',
+  created_at_utc TEXT NOT NULL,
+  UNIQUE (site_id, revision, unit_id)
+);
+CREATE INDEX IF NOT EXISTS idx_config_rev ON site_config_revisions(site_id, revision);
+CREATE INDEX IF NOT EXISTS idx_locations_rev ON turbine_locations(site_id, revision);
+"""
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -287,6 +319,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.executescript(MIGRATION_4_SQL)
             if "allow_scaled_reference" not in _columns(conn, "assets"):
                 conn.execute("ALTER TABLE assets ADD COLUMN allow_scaled_reference INTEGER NOT NULL DEFAULT 0")
+        if current < 5:
+            conn.executescript(MIGRATION_5_SQL)
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

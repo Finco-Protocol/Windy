@@ -107,7 +107,7 @@ def test_v11_database_migrates_to_v3_non_destructively(tmp_path):
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
     version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"]
-    assert version == "4"  # one run carries the DB through every pending migration
+    assert version == "5"  # one run carries the DB through every pending migration
     # new columns exist with backward-compatible defaults
     assert conn.execute("SELECT site_id FROM backfill_jobs WHERE id=1").fetchone()["site_id"] == "krnovo"
     assert conn.execute("SELECT site_id FROM power_curves WHERE id='c1'").fetchone()["site_id"] is None
@@ -130,5 +130,5 @@ def test_v11_database_migrates_to_v3_non_destructively(tmp_path):
     ensure_db(db)
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] == "4"
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] == "5"
     conn.close()

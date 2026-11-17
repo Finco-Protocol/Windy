@@ -77,11 +77,39 @@ def build_points(
     loss_factor: float,
     capacity_mw: float,
 ) -> list[PointRow]:
-    """Turn a raw open-meteo hourly payload into resolved point rows."""
+    """Turn a raw open-meteo hourly payload into resolved point rows.
+
+    MET_ONLY models (surface-only wind, e.g. UKMO) are archived with wind but
+    modeled_power/energy stay None — excluded from MWh, Average and totals by
+    design, never fabricated."""
     hourly = raw.get("hourly") or {}
     times = [parse_utc(t) for t in hourly.get("time") or []]
     if not times:
         return []
+    if spec.met_only:
+        try:
+            met_arr = extract_series(hourly, f"wind_speed_{spec.speed_heights[0]}m", spec.id)
+        except OMError:
+            met_arr = [None] * len(times)
+
+        def _met_speed(i: int) -> float | None:
+            # upstream nulls stay null — round(None) must never crash the archive
+            if i >= len(met_arr) or met_arr[i] is None:
+                return None
+            return round(met_arr[i], 4)
+
+        return [
+            PointRow(
+                valid_at_utc=iso_z(t),
+                wind_speed_mps=_met_speed(i),
+                wind_direction_deg=None,
+                modeled_power_mw=None,
+                interval_energy_mwh=None,
+                interval_hours=1.0,
+                status="met-only" if _met_speed(i) is not None else "missing-height",
+            )
+            for i, t in enumerate(times)
+        ]
 
     def speeds_at(h: int) -> list:
         return extract_series(hourly, f"wind_speed_{h}m", spec.id)

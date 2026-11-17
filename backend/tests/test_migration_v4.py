@@ -53,7 +53,7 @@ def test_v3_to_v4_migration_preserves_everything(tmp_path):
 
     conn = sqlite3.connect(str(db))
     conn.row_factory = sqlite3.Row
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] == "4"
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()["value"] == "5"
 
     # v4 tables exist and are empty (no fabricated data)
     assert conn.execute("SELECT COUNT(*) c FROM turbines").fetchone()["c"] == 0
@@ -85,6 +85,6 @@ def test_v4_migration_is_repeatable(tmp_path):
     ensure_db(db)
     ensure_db(db)  # restart / repeat
     conn = sqlite3.connect(str(db))
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "4"
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "5"
     assert conn.execute("SELECT COUNT(*) c FROM turbines").fetchone()[0] == 0
     conn.close()

@@ -21,6 +21,9 @@ export interface WindySite {
   assumptions: Record<string, string>;
   notes: string;
   power_curve_id?: string;
+  /** present on serialized assets (SELECT a.*) — the edit form must read the
+   *  ACTUAL value, never default the scaled-reference opt-in to true */
+  allow_scaled_reference?: number | boolean;
 }
 
 export interface CurveInfo {
@@ -83,10 +86,78 @@ export interface ForecastModel {
   height_note: string;
   run: ForecastRunInfo | null;
   points: ForecastPoint[];
+  met_only: boolean;
   daily_local: { date: string; mwh: number; hours_counted: number; hours_missing: number }[];
   total_mwh_own_window: number | null;
   coverage: { n_hours: number; first_valid_utc: string | null; last_valid_utc: string | null; max_available_hours: number };
   warnings: string[];
+  /** Present only when the forecast was fetched with `with_availability=1`. */
+  adjusted?: AdjustedBlock;
+}
+
+export interface AdjustedPoint {
+  valid_at_utc: string;
+  adjusted_mw: number | null;
+  adjusted_mwh: number | null;
+  interval_hours: number;
+  status: string;
+}
+
+export interface AdjustedDailySlot {
+  date: string;
+  mwh: number;
+  hours_counted: number;
+  hours_missing: number;
+  hours_expected?: number;
+  partial?: boolean;
+}
+
+export interface AdjustedBlock {
+  available: boolean;
+  reason?: string;
+  inventory_revision?: number;
+  constraints_revision?: number;
+  baseline_comparable?: boolean;
+  baseline_comparable_reason?: string | null;
+  daily: AdjustedDailySlot[];
+  points: AdjustedPoint[];
+}
+
+export interface OperationalStatus {
+  site_id: string;
+  installed_mw: number;
+  available_max_mw: number;
+  offline_count: number;
+  curtailed_count: number;
+  farm_export_cap_mw: number | null;
+  n_turbines: number;
+  inventory_revision: number;
+  constraints_revision: number;
+  inventory_present?: boolean;
+  n_turbines_inventory?: number;
+  error?: string;
+}
+
+export interface WindNowModel {
+  model_id: string;
+  label: string;
+  met_only: boolean;
+  height_method: string;
+  valid_at_utc: string | null;
+  wind_speed_mps: number | null;
+  age_minutes: number | null;
+  stale: boolean;
+  note: string;
+  run_issued_utc?: string | null;
+}
+
+export interface WindNowResponse {
+  site_id: string;
+  modeled: true;
+  disclaimer: string;
+  generated_at_utc: string;
+  models: WindNowModel[];
+  cache?: { cached: boolean; age_s: number };
 }
 
 export interface ForecastResponse {
@@ -95,6 +166,7 @@ export interface ForecastResponse {
   generated_at_utc: string;
   days: number;
   models: ForecastModel[];
+  operational?: OperationalStatus | null;
   intersection: {
     n_common_hours: number;
     first_common_utc: string | null;
@@ -407,6 +479,57 @@ export interface ScenarioRevision {
   summary: { installed_mw?: number; curve_mode?: string; windows?: Record<string, ScenarioWindow> };
 }
 
+export interface ConfigRevision {
+  id: number;
+  revision: number;
+  changes: Record<string, { from: unknown; to: unknown }>;
+  effective_from_utc: string;
+  note: string | null;
+  created_at_utc: string;
+  created_by: string;
+}
+
+export interface ConfigRevisionsResponse {
+  site_id: string;
+  current_revision: number;
+  revisions: ConfigRevision[];
+}
+
+export interface ConfigRevisionApplyResponse {
+  site_id: string;
+  revision: number;
+  changes: Record<string, { from: unknown; to: unknown }>;
+  effective_from_utc: string;
+  note: string | null;
+  inventory_revision: number | null;
+  site: WindySite;
+}
+
+export interface TurbineLocation {
+  unit_id: string;
+  latitude: number;
+  longitude: number;
+  elevation_m: number | null;
+  source: string;
+  created_at_utc: string;
+}
+
+export interface LocationsResponse {
+  site_id: string;
+  revision: number;
+  n_locations: number;
+  locations: TurbineLocation[];
+  revision_history: { revision: number; n_records: number; created_at_utc: string | null }[];
+  note: string | null;
+}
+
+export interface UnitAssignment {
+  unit_id: string;
+  state: "on" | "off" | "cap";
+  cap_mw?: number;
+  cap_percent?: number; // percent OF RATED ALLOWED (backend semantics)
+}
+
 export interface CalibrationEntry {
   model_id: string;
   factor: number;
@@ -506,8 +629,13 @@ export const windyApi = {
   assets: (signal?: AbortSignal) => getJson<{ assets: AssetSummary[] }>("/assets", signal),
   assetCreate: (body: AssetCreate) => postJson<WindySite>("/assets", body),
   powerCurves: (signal?: AbortSignal) => getJson<{ curves: PowerCurveSummary[] }>("/power-curves", signal),
-  forecast: (days: number, siteId: string, signal?: AbortSignal) =>
-    getJson<ForecastResponse>(`/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}`, signal),
+  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false) =>
+    getJson<ForecastResponse>(
+      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}`,
+      signal,
+    ),
+  windNow: (siteId: string, signal?: AbortSignal) =>
+    getJson<WindNowResponse>(`/assets/${encodeURIComponent(siteId)}/wind-now`, signal),
   collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
   runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
     getJson<{ runs: RunSummary[] }>(
@@ -574,6 +702,19 @@ export const windyApi = {
     postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[] }>(`/assets/${encodeURIComponent(siteId)}/constraints/delete`, { ids }),
   operatingStatus: (siteId: string, signal?: AbortSignal) =>
     getJson<SiteOperatingStatus>(`/assets/${encodeURIComponent(siteId)}/status`, signal),
+  constraintsReplaceUnits: (siteId: string, body: { assignments: UnitAssignment[]; start_local: string; end_local?: string | null }) =>
+    postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[]; warnings: string[] }>(
+      `/assets/${encodeURIComponent(siteId)}/constraints/replace-units`,
+      body,
+    ),
+  configRevisionApply: (siteId: string, body: { changes: Record<string, unknown>; note?: string }) =>
+    postJson<ConfigRevisionApplyResponse>(`/assets/${encodeURIComponent(siteId)}/config-revision`, body),
+  configRevisions: (siteId: string, signal?: AbortSignal) =>
+    getJson<ConfigRevisionsResponse>(`/assets/${encodeURIComponent(siteId)}/config-revisions`, signal),
+  locationsSet: (siteId: string, body: { records: { unit_id: string; latitude: number; longitude: number; elevation_m?: number | null; source?: string }[]; note?: string }) =>
+    postJson<LocationsResponse>(`/assets/${encodeURIComponent(siteId)}/locations`, body),
+  locations: (siteId: string, signal?: AbortSignal) =>
+    getJson<LocationsResponse>(`/assets/${encodeURIComponent(siteId)}/locations`, signal),
   scenario: (siteId: string, runId: number, signal?: AbortSignal) =>
     getJson<ScenarioResponse>(`/assets/${encodeURIComponent(siteId)}/scenario?run_id=${runId}`, signal),
   scenarioPinned: (siteId: string, runId: number, revisions: { inventory_revision: number; constraints_revision: number } | null, signal?: AbortSignal) => {

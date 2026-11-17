@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, type DailySlot } from "./forecastTable";
+import { buildDailyMatrix, buildEnsembleDaily, buildHourlyRows, loadAvgPreference, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, saveAvgPreference, sumDisplayedAverages, visibleDailyRows, type DailySlot } from "./forecastTable";
 
 function model(id: string, daily: DailySlot[]): { model_id: string; daily_local: DailySlot[] } {
   return { model_id: id, daily_local: daily };
@@ -88,7 +88,230 @@ describe("buildHourlyRows", () => {
 });
 
 describe("MODEL_LABELS_HR", () => {
-  it("covers all four registered models", () => {
-    expect(Object.keys(MODEL_LABELS_HR).sort()).toEqual(["ecmwf_ifs", "gfs_seamless", "icon_eu", "icon_global"]);
+  it("covers all seven registered models", () => {
+    expect(Object.keys(MODEL_LABELS_HR).sort()).toEqual([
+      "ecmwf_ifs",
+      "gem_seamless",
+      "gfs_seamless",
+      "icon_eu",
+      "icon_global",
+      "meteofrance_arpege_world",
+      "ukmo_seamless",
+    ]);
+  });
+});
+
+describe("modelTotal (Addendum B — UKUPNO red)", () => {
+  const rows = buildDailyMatrix([
+    model("gfs_seamless", [
+      { date: "2026-11-13", mwh: 100.25, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+      { date: "2026-11-14", mwh: 110.5, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+    ]),
+    model("icon_eu", [{ date: "2026-11-13", mwh: 90, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false }]),
+  ]);
+
+  it("sums the shown per-day MWh exactly", () => {
+    expect(modelTotal(rows, "gfs_seamless")).toEqual({ total: 210.75, partial: false, days: 2 });
+  });
+
+  it("a blank (iza horizonta) day contributes nothing — never zero", () => {
+    // icon_eu shows only 11-13; its UKUPNO is 90, not 90 + 0 for 11-14
+    expect(modelTotal(rows, "icon_eu")).toEqual({ total: 90, partial: false, days: 1 });
+  });
+
+  it("a partial day is included and marks the total with ⚠", () => {
+    const partialRows = buildDailyMatrix([
+      model("gfs_seamless", [
+        { date: "2026-11-13", mwh: 60, hours_counted: 11, hours_missing: 0, hours_expected: 24, partial: true },
+        { date: "2026-11-14", mwh: 100, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+      ]),
+    ]);
+    expect(modelTotal(partialRows, "gfs_seamless")).toEqual({ total: 160, partial: true, days: 2 });
+  });
+
+  it("all-blank model → null total, not 0", () => {
+    const none = buildDailyMatrix([model("ecmwf_ifs", [])]);
+    expect(modelTotal(none, "ecmwf_ifs")).toEqual({ total: null, partial: false, days: 0 });
+  });
+});
+
+describe("rowAverage (Average kolona)", () => {
+  it("arithmetic mean over production models with values", () => {
+    expect(rowAverage({ gfs_seamless: 100, icon_eu: 90, ecmwf_ifs: 110 }, ["gfs_seamless", "icon_eu", "ecmwf_ifs"])).toBe(100);
+  });
+
+  it("models without a value in the row are skipped, not zero-filled", () => {
+    expect(rowAverage({ gfs_seamless: 100, icon_eu: null }, ["gfs_seamless", "icon_eu"])).toBe(100);
+  });
+
+  it("no values at all → null", () => {
+    expect(rowAverage({ gfs_seamless: null }, ["gfs_seamless"])).toBeNull();
+  });
+
+  it("productionModelIds drops met_only models and models without a run", () => {
+    const models = [
+      { model_id: "ecmwf_ifs", met_only: false, run: {} },
+      { model_id: "ukmo_seamless", met_only: true, run: {} },
+      { model_id: "gfs_seamless", met_only: false, run: null },
+      { model_id: "icon_eu", met_only: false, run: {} },
+    ];
+    expect(productionModelIds(models)).toEqual(["ecmwf_ifs", "icon_eu"]);
+  });
+});
+
+describe("buildEnsembleDaily (Correction A §5)", () => {
+  const pts = (model: string, hours: [string, number, number][]) => ({
+    model_id: model,
+    points: hours.map(([t, mw, ih]) => ({ valid_at_utc: t, mw, interval_hours: ih })),
+  });
+
+  it("equal coverage: daily ensemble = mean of per-model hourly energy", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1], ["2026-11-16T01:00:00Z", 10, 1]]);
+    const b = pts("ecmwf_ifs", [["2026-11-16T00:00:00Z", 20, 1], ["2026-11-16T01:00:00Z", 20, 1]]);
+    const rows = buildEnsembleDaily([a, b], "Europe/Podgorica");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.date).toBe("2026-11-16"); // 01:00Z is still 01:00 local (CET)
+    expect(rows[0]?.mwh).toBe(30); // avg 15 MW x 2 h
+    expect(rows[0]?.contributors_min).toBe(2);
+  });
+
+  it("3 h intervals conserve energy: 10 MW x 3 h = 30 MWh across a day boundary", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T22:00:00Z", 10, 3]]); // 1 h D0 + 2 h D1 (midnight 23:00Z)
+    const rows = buildEnsembleDaily([a], "Europe/Podgorica");
+    const byDate = Object.fromEntries(rows.map((r) => [r.date, r]));
+    expect(byDate["2026-11-16"]?.mwh).toBe(10);
+    expect(byDate["2026-11-17"]?.mwh).toBe(20);
+  });
+
+  it("missing model hour drops contributor count and is flagged, never zero-filled", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1], ["2026-11-16T01:00:00Z", 10, 1]]);
+    const b = pts("ecmwf_ifs", [["2026-11-16T00:00:00Z", 30, 1]]); // no 01:00 point
+    const rows = buildEnsembleDaily([a, b], "Europe/Podgorica");
+    expect(rows[0]?.mwh).toBe(20 + 10); // 00: avg 20; 01: avg 10 (1 contributor)
+    expect(rows[0]?.contributors_min).toBe(1);
+    expect(rows[0]?.contributors_max).toBe(2);
+  });
+
+  it("DST spring day expected hours = 23", () => {
+    const t0ms = Date.parse("2026-03-28T23:00:00Z");
+    const hours = Array.from({ length: 23 }, (_, i) => [new Date(t0ms + i * 3_600_000).toISOString(), 5, 1] as [string, number, number]);
+    const a = pts("gfs_seamless", hours);
+    const rows = buildEnsembleDaily([a], "Europe/Podgorica");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.date).toBe("2026-03-29");
+    expect(rows[0]?.hours_expected).toBe(23);
+    expect(rows[0]?.hours_counted).toBe(23);
+    expect(rows[0]?.partial).toBe(false);
+  });
+
+  it("met-only and unselected models are excluded by the caller's input set", () => {
+    const b = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1]]);
+    const rows = buildEnsembleDaily([b], "Europe/Podgorica"); // met-only excluded by the caller
+    expect(rows[0]?.mwh).toBe(10);
+  });
+});
+
+describe("visibleDailyRows (Correction A §5)", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ date: `2026-11-${String(i + 1).padStart(2, "0")}`, v: i }));
+  it("anchors at today in site tz and returns exactly N rows", () => {
+    const vis = visibleDailyRows(rows, 7, "Europe/Podgorica", "2026-11-05T10:00:00Z");
+    expect(vis).toHaveLength(7);
+    expect(vis[0]?.date).toBe("2026-11-05");
+    expect(vis[6]?.date).toBe("2026-11-11");
+  });
+  it("no row on/after today -> the LAST N rows (never an N+1-th date)", () => {
+    const vis = visibleDailyRows(rows, 7, "Europe/Podgorica", "2026-12-01T10:00:00Z");
+    expect(vis).toHaveLength(7);
+    expect(vis[0]?.date).toBe("2026-11-06");
+    expect(vis[6]?.date).toBe("2026-11-12");
+  });
+});
+
+describe("avg preference persistence per site (Correction B section 3)", () => {
+  it("round-trips and filters against current production ids", () => {
+    saveAvgPreference("s1", { enabled: false, configured: true, models: ["gfs_seamless", "ukmo_seamless"] });
+    const pref = loadAvgPreference("s1", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.enabled).toBe(false);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual(["gfs_seamless"]); // met-only filtered out
+  });
+
+  it("EXPLICIT empty selection stays empty (never silently re-enables all)", () => {
+    saveAvgPreference("s-none", { enabled: true, configured: true, models: [] });
+    const pref = loadAvgPreference("s-none", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual([]);
+  });
+
+  it("never-configured site defaults to all production models", () => {
+    const pref = loadAvgPreference("s-fresh", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(false);
+    expect(pref.enabled).toBe(true);
+    expect(pref.models).toEqual(["gfs_seamless", "ecmwf_ifs"]);
+  });
+
+  it("Correction C: explicit configured:false + models[] -> default ALL production ids", () => {
+    saveAvgPreference("c-false", { enabled: true, configured: false, models: [] });
+    const pref = loadAvgPreference("c-false", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(false);
+    expect(pref.models).toEqual(["gfs_seamless", "ecmwf_ifs"]); // default all, NOT the empty list
+  });
+
+  it("Correction C: explicit configured:true + models[] stays EMPTY (no silent re-enable)", () => {
+    saveAvgPreference("c-true", { enabled: true, configured: true, models: [] });
+    const pref = loadAvgPreference("c-true", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual([]);
+  });
+
+  it("pre-B stored format (no configured flag) migrates to configured=true", () => {
+    // simulate a pre-B record: models list present, configured field ABSENT
+    // (undefined is dropped by JSON.stringify) — persisted through the same
+    // storage path the app uses
+    saveAvgPreference("s-old", { enabled: true, configured: undefined as unknown as boolean, models: ["ecmwf_ifs"] });
+    const pref = loadAvgPreference("s-old", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual(["ecmwf_ifs"]);
+  });
+
+  it("temporarily empty productionIds keep the stored selection (no wipe while loading)", () => {
+    saveAvgPreference("s-keep", { enabled: true, configured: true, models: ["ecmwf_ifs"] });
+    expect(loadAvgPreference("s-keep", []).models).toEqual(["ecmwf_ifs"]);
+  });
+
+  it("site switching is isolated", () => {
+    saveAvgPreference("sw-a", { enabled: true, configured: true, models: ["gfs_seamless"] });
+    saveAvgPreference("sw-b", { enabled: true, configured: true, models: [] });
+    expect(loadAvgPreference("sw-a", ["gfs_seamless", "icon_eu"]).models).toEqual(["gfs_seamless"]);
+    expect(loadAvgPreference("sw-b", ["gfs_seamless", "icon_eu"]).models).toEqual([]);
+  });
+});
+
+describe("sumDisplayedAverages (Correction D §4)", () => {
+  const rows = [{ date: "2026-11-16" }, { date: "2026-11-17" }, { date: "2026-11-18" }];
+  it("sums ONLY the displayed rows' averages (identical window to the table)", () => {
+    const avgByDate = new Map([
+      ["2026-11-16", { mwh: 10 }],
+      ["2026-11-17", { mwh: 20 }],
+      ["2026-11-19", { mwh: 999 }], // extra ensemble-only day must NOT count
+    ]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(30);
+  });
+
+  it("no contributors -> null (missing is never 0)", () => {
+    expect(sumDisplayedAverages(rows, new Map())).toBeNull();
+  });
+
+  it("genuine below-cut-in 0 stays 0 (rows exist with real coverage)", () => {
+    const avgByDate = new Map([
+      ["2026-11-16", { mwh: 0 }],
+      ["2026-11-17", { mwh: 0 }],
+    ]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(0);
+  });
+
+  it("partial ensemble coverage over the window is fine (only covered dates count)", () => {
+    const avgByDate = new Map([["2026-11-18", { mwh: 5 }]]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(5);
   });
 });

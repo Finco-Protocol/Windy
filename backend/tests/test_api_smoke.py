@@ -18,14 +18,19 @@ def test_site_shows_assumption_provenance(client):
     api, _fake, _settings = client
     site = api.get("/api/site").json()
     assert site["site"]["id"] == "krnovo"
-    assert site["site"]["capacity_mw"] == 71.5
+    assert site["site"]["capacity_mw"] == 74.1
     assert site["site"]["hub_height_m"] == 90.0
     assumptions = site["site"]["assumptions"]
     assert "PROVISIONAL" in assumptions["hub_height_m"]
-    assert "71.5 MW = 26 × 2.75 MW" in assumptions["capacity_mw"]
+    assert "74.10 MW = 26 × 2.85 MW" in assumptions["capacity_mw"]
     assert site["power_curve"]["status"] in ("manufacturer-reference", "demo-illustrative")
     ids = [m["id"] for m in site["models"]]
-    assert ids == ["ecmwf_ifs", "gfs_seamless", "icon_global", "icon_eu"]
+    assert ids == [
+        "ecmwf_ifs", "gfs_seamless", "icon_global", "icon_eu",
+        "meteofrance_arpege_world", "gem_seamless", "ukmo_seamless",
+    ]
+    ukmo = next(m for m in site["models"] if m["id"] == "ukmo_seamless")
+    assert "MET_ONLY" in ukmo["note"]
     assert "open-meteo" in site["source_note"].lower()
 
 
