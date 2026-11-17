@@ -11,6 +11,7 @@ import csv
 import io
 import json
 import logging
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -184,6 +185,107 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     def availability_status(site_id: str):
         store.load_site(settings.db_path, site_id)
         return availability_mod.site_status(settings.db_path, site_id)
+
+    # --- NOW card (Addendum A): MODELED conditions at the site, informational
+    # ONLY. There is no anemometer in the loop — every value is an archived
+    # model point, labelled as such and never presented as "stvarni vjetar".
+    # Cached for WIND_NOW_TTL_S so refresh clicks stay cheap and the archive
+    # (not the live API) remains the single source.
+    WIND_NOW_TTL_S = 600  # 10 min
+    _wind_now_cache: dict[str, tuple[float, dict]] = {}
+    _wind_now_lock = threading.Lock()
+
+    @app.get("/api/assets/{site_id}/wind-now")
+    def wind_now(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        now = datetime.now(timezone.utc)
+        cache_key = site_id
+        with _wind_now_lock:
+            cached = _wind_now_cache.get(cache_key)
+            if cached is not None and (now - cached[0]).total_seconds() < WIND_NOW_TTL_S:
+                out = dict(cached[1])
+                out["cache"] = {"cached": True, "age_s": round((now - cached[0]).total_seconds(), 1)}
+                return out
+
+        per_model = []
+        with dbm.session(settings.db_path) as conn:
+            for spec in WINDY_MODELS:
+                run = conn.execute(
+                    """
+                    SELECT id, run_issued_utc, fetched_at_utc FROM forecast_runs
+                    WHERE site_id=? AND model_id=? AND status='ok'
+                    ORDER BY COALESCE(run_issued_utc, dedupe_key) DESC LIMIT 1
+                    """,
+                    (site_id, spec.id),
+                ).fetchone()
+                item: dict = {
+                    "model_id": spec.id,
+                    "label": spec.label,
+                    "met_only": spec.met_only,
+                    "height_method": spec.height_method,
+                    "valid_at_utc": None,
+                    "wind_speed_mps": None,
+                    "age_minutes": None,
+                    "stale": True,
+                    "note": "nema arhiviranog run-a",
+                }
+                if run is not None:
+                    pts = conn.execute(
+                        "SELECT valid_at_utc, wind_speed_mps, interval_hours, status "
+                        "FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc",
+                        (run["id"],),
+                    ).fetchall()
+                    # the point whose half-open interval [valid, valid+dur)
+                    # covers NOW; else the nearest point within 180 min
+                    chosen = None
+                    for p in pts:
+                        st = parse_utc(p["valid_at_utc"])
+                        dur = float(p["interval_hours"] or 1.0)
+                        if st <= now < st + timedelta(hours=dur):
+                            chosen = p
+                            break
+                    if chosen is None and pts:
+                        before = [p for p in pts if parse_utc(p["valid_at_utc"]) <= now]
+                        after = [p for p in pts if parse_utc(p["valid_at_utc"]) > now]
+                        candidates: list = []
+                        if before:
+                            candidates.append(before[-1])
+                        if after and after[0] is not None:
+                            nxt = after[0]
+                            if (parse_utc(nxt["valid_at_utc"]) - now).total_seconds() <= 180 * 60:
+                                candidates.append(nxt)
+                        if candidates:
+                            chosen = candidates[-1]
+                    if chosen is not None and chosen["wind_speed_mps"] is not None:
+                        st = parse_utc(chosen["valid_at_utc"])
+                        age_min = (now - st).total_seconds() / 60.0
+                        item.update(
+                            {
+                                "valid_at_utc": chosen["valid_at_utc"],
+                                "wind_speed_mps": chosen["wind_speed_mps"],
+                                "age_minutes": round(age_min, 1),
+                                "stale": age_min > 180.0,
+                                "note": "modelirano (arhivirani run)",
+                                "run_issued_utc": run["run_issued_utc"],
+                            }
+                        )
+                    elif chosen is not None:
+                        item["note"] = "najbliži sat bez brzine vjetra (nedostaje visina)"
+                per_model.append(item)
+
+        out = {
+            "site_id": site_id,
+            "modeled": True,
+            "disclaimer": (
+                "INFORMACIJA o modeliranim uvjetima iz arhiviranih prognoza — "
+                "NIJE izmjereni (stvarni) vjetar. Nema mjernih instrumenata u sustavu."
+            ),
+            "generated_at_utc": iso_z(now),
+            "models": per_model,
+        }
+        with _wind_now_lock:
+            _wind_now_cache[cache_key] = (now, out)
+        return out
 
     @app.get("/api/assets/{site_id}/scenario")
     def scenario_get(site_id: str, run_id: int, inventory_revision: int | None = Query(None), constraints_revision: int | None = Query(None)):
@@ -505,13 +607,18 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     # ---- forecast display ----------------------------------------------------
 
     @app.get("/api/forecast")
-    def forecast(days: int = Query(10, ge=1, le=16), site_id: str = Query("krnovo")):
+    def forecast(
+        days: int = Query(10, ge=1, le=16),
+        site_id: str = Query("krnovo"),
+        with_availability: bool = Query(False),
+    ):
         site_row = store.load_site(settings.db_path, site_id)
         curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
         tz = ZoneInfo(site_row["timezone"])
         horizon_end = (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         models_out = []
+        operational = None
         with dbm.session(settings.db_path) as conn:
             for spec in WINDY_MODELS:
                 run = conn.execute(
@@ -526,6 +633,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     "model_id": spec.id,
                     "provider": spec.provider,
                     "label": spec.label,
+                    "met_only": spec.met_only,
                     "height_method": spec.height_method,
                     "height_sources_m": list(spec.speed_heights),
                     "requested_height_m": float(site_row["hub_height_m"]),
@@ -654,9 +762,104 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     )
                 models_out.append(entry)
 
+        # Availability-adjusted scenario per model (reuses the tested
+        # availability.scenario_for_run math — same inventory/constraint
+        # revisions, no new computation core). Attached only when requested.
+        if with_availability:
+
+            def _adjusted_daily_rows(sc_points: list[dict]) -> list[dict]:
+                daily_a: dict[str, dict] = {}
+                for p in sc_points:
+                    st = parse_utc(p["valid_at_utc"])
+                    dur = float(p["interval_hours"] or 1.0)
+                    adjusted = p["adjusted_mw"]
+                    remaining = dur
+                    cursor = st
+                    while remaining > 1e-9:
+                        day_key = cursor.astimezone(tz).strftime("%Y-%m-%d")
+                        d_start, d_end, d_hours = _day_span_utc(day_key)
+                        seg_end = min(cursor + timedelta(hours=remaining), d_end)
+                        seg_start = max(cursor, d_start)
+                        overlap = (seg_end - seg_start).total_seconds() / 3600.0
+                        if overlap <= 0:
+                            cursor = d_end
+                            continue
+                        slot = daily_a.setdefault(
+                            day_key,
+                            {
+                                "date": day_key,
+                                "mwh": 0.0,
+                                "hours_counted": 0.0,
+                                "hours_missing": 0.0,
+                                "hours_expected": round(d_hours, 3),
+                                "partial": False,
+                                "_intervals": [],
+                            },
+                        )
+                        if adjusted is not None:
+                            slot["mwh"] = round(slot["mwh"] + adjusted * (overlap / dur), 4)
+                            slot["hours_counted"] = round(slot["hours_counted"] + overlap, 6)
+                            slot["_intervals"].append((seg_start, seg_end))
+                        else:
+                            slot["hours_missing"] = round(slot["hours_missing"] + overlap, 6)
+                        remaining -= overlap
+                        cursor = seg_end
+                    for slot in daily_a.values():
+                        intervals = slot.pop("_intervals", [])
+                        merged: list = []
+                        for st_i, en_i in sorted(intervals):
+                            if merged and st_i <= merged[-1][1] + timedelta(seconds=1):
+                                merged[-1] = (merged[-1][0], max(merged[-1][1], en_i))
+                            else:
+                                merged.append((st_i, en_i))
+                        union_h = round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3)
+                        slot["hours_counted"] = union_h
+                        slot["hours_missing"] = round(max(slot["hours_expected"] - union_h, 0.0), 3)
+                        slot["partial"] = union_h < slot["hours_expected"] - 1e-6
+                    return [daily_a[k] for k in sorted(daily_a)]
+
+            for entry in models_out:
+                if entry.get("run") is None:
+                    entry["adjusted"] = {"available": False, "reason": "nema arhiviranog run-a za ovaj model"}
+                    continue
+                try:
+                    sc = availability_mod.scenario_for_run(settings.db_path, site_id, entry["run"]["id"])
+                    entry["adjusted"] = {
+                        "available": True,
+                        "inventory_revision": sc["inventory_revision"],
+                        "constraints_revision": sc["constraints_revision"],
+                        "baseline_comparable": sc["baseline_comparable"],
+                        "baseline_comparable_reason": sc["baseline_comparable_reason"],
+                        "daily": _adjusted_daily_rows(sc["points"]),
+                        "points": [
+                            {
+                                "valid_at_utc": p["valid_at_utc"],
+                                "adjusted_mw": p["adjusted_mw"],
+                                "adjusted_mwh": round(p["adjusted_mw"] * p["interval_hours"], 6) if p["adjusted_mw"] is not None else None,
+                                "interval_hours": p["interval_hours"],
+                                "status": p["status"],
+                            }
+                            for p in sc["points"]
+                        ],
+                    }
+                except Exception as exc:  # scenario computation must not break the baseline view
+                    entry["adjusted"] = {"available": False, "reason": str(exc)[:200]}
+
+            try:
+                inv = availability_mod.get_inventory(settings.db_path, site_id)
+            except Exception:
+                inv = None
+            try:
+                operational = availability_mod.site_status(settings.db_path, site_id)
+                operational["inventory_present"] = bool(inv and inv["n_turbines"] > 0)
+                operational["n_turbines_inventory"] = inv["n_turbines"] if inv else 0
+            except Exception as exc:
+                operational = {"error": str(exc)[:200]}
+
         # Same-valid-time intersection totals (honest cross-model comparison)
         by_model_hours = {m["model_id"]: {p["valid_at_utc"] for p in m["points"]} for m in models_out}
-        common = set.intersection(*by_model_hours.values()) if by_model_hours and all(by_model_hours.values()) else set()
+        non_empty = {mid: hours for mid, hours in by_model_hours.items() if hours}
+        common = set.intersection(*non_empty.values()) if non_empty else set()
         totals: dict[str, float] = {}
         for m in models_out:
             totals[m["model_id"]] = round(
@@ -683,6 +886,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
             "days": days,
             "models": models_out,
             "intersection": intersection,
+            "operational": operational,
         }
 
     # ---- runs / history --------------------------------------------------------

@@ -22,6 +22,7 @@ const busy = ref(false);
 const createError = ref<string | null>(null);
 const createdNote = ref<string | null>(null);
 const form = reactive<AssetCreate>({
+  id: undefined,
   label: "",
   country: "",
   latitude: 45.0,
@@ -47,12 +48,37 @@ async function create(): Promise<void> {
     }`;
     form.label = "";
     form.country = "";
+    form.id = undefined;
+    cloneNote.value = null;
     await refresh();
   } catch (e) {
     createError.value = e instanceof Error ? e.message : String(e);
   } finally {
     busy.value = false;
   }
+}
+
+// Addendum A — non-destructive configuration versioning: a new site id is
+// created from the current one's values; the original site and ALL its
+// archives stay untouched (never an in-place rewrite).
+const cloneNote = ref<string | null>(null);
+
+function startClone(a: AssetSummary): void {
+  cloneNote.value = `Obrazac „Add a site" ispod je ispunjen iz „${a.id}" — provjeri vrijednosti, unesi NOVI id i label, pa spremi. Original „${a.id}" i svi njegovi arhivirani podaci ostaju nepromijenjeni (ne-destruktivna nova konfiguracija).`;
+  form.id = `${a.id}-v2`;
+  form.label = `${a.name} (nova konfiguracija)`;
+  form.country = a.country ?? "";
+  form.latitude = a.latitude;
+  form.longitude = a.longitude;
+  form.capacity_mw = a.capacity_mw;
+  form.turbine_count = a.turbine_count;
+  form.turbine_rated_mw = a.turbine_rated_mw;
+  form.hub_height_m = a.hub_height_m;
+  form.loss_factor = a.loss_factor;
+  form.timezone = a.timezone;
+  form.power_curve_id = a.power_curve_id ?? "";
+  form.notes = `Izvedeno iz sitea "${a.id}" (ne-destruktivna revizija konfiguracije; original ostaje arhiviran).`;
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
 }
 </script>
 
@@ -80,6 +106,7 @@ async function create(): Promise<void> {
                 <th class="py-1.5 pr-3">hub</th>
                 <th class="py-1.5 pr-3">tz</th>
                 <th class="py-1.5 pr-3">curve</th>
+                <th class="py-1.5 pr-3">konfiguracija</th>
               </tr>
             </thead>
             <tbody>
@@ -97,6 +124,14 @@ async function create(): Promise<void> {
                     :class="a.curve_site_specific ? 'border-sodium-300/40 text-sodium-200' : 'border-heat-500/40 text-heat-300'"
                   >{{ a.curve_label ?? "—" }}{{ a.curve_reference_only ? " · reference/unverified" : "" }}</span>
                 </td>
+                <td class="py-1.5 pr-3">
+                  <button
+                    type="button"
+                    class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 border px-2 py-0.5 font-mono text-[10px]"
+                    :title="'Nova konfiguracija iz ove elektrane — novi site id, original i arhiva ostaju netaknuti'"
+                    @click="startClone(a)"
+                  >Nova konfiguracija…</button>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -107,10 +142,16 @@ async function create(): Promise<void> {
       <CollapsibleSection title="Add a site" :default-open="false">
         <p class="text-paper-400 mb-2 font-mono text-[10px] leading-relaxed">
           The power curve must be chosen explicitly — a generic curve is prominently labelled reference/unverified and its
-          modelled MWh are never presented as calibrated production. Configuration is fixed after creation in this phase
-          (a future "new configuration revision" path would version snapshots instead of rewriting them).
+          modelled MWh are never presented as calibrated production. Configuration is fixed after creation: to change it,
+          use „Nova konfiguracija…" on a registered site — that creates a NEW site id (ne-destruktivna revizija), never an
+          in-place rewrite of the original and its archives.
         </p>
+        <p v-if="cloneNote" class="text-sodium-200 mb-2 font-mono text-[10px]">{{ cloneNote }}</p>
         <div class="grid gap-2 sm:grid-cols-2">
+          <label class="font-mono text-[10px]">
+            <span class="text-paper-400 block">id (opciono; auto ako prazno)</span>
+            <input v-model="form.id" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />
+          </label>
           <label class="font-mono text-[10px]">
             <span class="text-paper-400 block">label *</span>
             <input v-model="form.label" class="border-ink-700 bg-ink-900 text-paper-100 mt-0.5 w-full border px-2 py-1 font-mono text-[11px]" />

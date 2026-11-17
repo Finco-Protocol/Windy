@@ -23,6 +23,9 @@ export const MODEL_LABELS_HR: Record<string, string> = {
   gfs_seamless: "GFS",
   icon_global: "ICON Global",
   icon_eu: "ICON EU",
+  meteofrance_arpege_world: "ARPEGE",
+  gem_seamless: "GEM",
+  ukmo_seamless: "UKMO (10 m)",
 };
 
 /** Builds one row per CET day across the union of model daily_local arrays.
@@ -71,7 +74,7 @@ export function buildHourlyRows(
   anchorUtc: string,
   hours: 24 | 48,
   tz: string,
-): { label: string; offset: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] {
+): { label: string; offset: string; validAtUtc: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] {
   const anchorMs = new Date(anchorUtc).getTime();
   if (Number.isNaN(anchorMs)) return [];
   const startMs = Math.ceil(anchorMs / 3_600_000) * 3_600_000; // next full hour
@@ -87,7 +90,7 @@ export function buildHourlyRows(
   const byKey = new Map<string, (typeof points)[number]>();
   for (const p of points) byKey.set(p.valid_at_utc.slice(0, 13), p);
 
-  const rows: { label: string; offset: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] = [];
+  const rows: { label: string; offset: string; validAtUtc: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] = [];
   for (let i = 0; i < hours; i++) {
     const t = new Date(startMs + i * 3_600_000);
     const key = t.toISOString().slice(0, 13);
@@ -98,12 +101,13 @@ export function buildHourlyRows(
     const label = `${get("month")}-${get("day")} ${hour24}:${get("minute")}`;
     const offset = (fmtOffset.formatToParts(t).find((x) => x.type === "timeZoneName")?.value ?? "").replace("GMT", "UTC");
     if (!p) {
-      rows.push({ label, offset, wind: null, mw: null, mwh: null, interval_hours: null, missing: true });
+      rows.push({ label, offset, validAtUtc: key + ":00:00Z", wind: null, mw: null, mwh: null, interval_hours: null, missing: true });
       continue;
     }
     rows.push({
       label,
       offset,
+      validAtUtc: p.valid_at_utc,
       wind: p.wind_speed_mps,
       mw: p.modeled_power_mw,
       mwh: p.interval_energy_mwh,
@@ -112,4 +116,43 @@ export function buildHourlyRows(
     });
   }
   return rows;
+}
+
+/** Addendum B — the UKUPNO (MWh) row is the plain SUM of the per-day MWh that
+ *  a model shows above it. Partial days are included (their shown value IS the
+ *  partial total) and the flag says so; days where the model has no value
+ *  contribute nothing (— is never treated as 0). */
+export function modelTotal(rows: DailyRow[], modelId: string): { total: number | null; partial: boolean; days: number } {
+  let total = 0;
+  let partial = false;
+  let days = 0;
+  for (const row of rows) {
+    const v = row.values[modelId];
+    if (v === null || v === undefined) continue;
+    total += v;
+    days += 1;
+    if (row.flags[modelId]) partial = true;
+  }
+  return { total: days > 0 ? Math.round(total * 100) / 100 : null, partial, days };
+}
+
+/** Average column — arithmetic mean of the models' values in one daily row,
+ *  over `ids` (production models only: met_only models must be excluded by the
+ *  caller). Null only when NO listed model has a value in that row. */
+export function rowAverage(values: Record<string, number | null>, ids: string[]): number | null {
+  let sum = 0;
+  let n = 0;
+  for (const id of ids) {
+    const v = values[id];
+    if (v === null || v === undefined) continue;
+    sum += v;
+    n += 1;
+  }
+  return n > 0 ? Math.round((sum / n) * 100) / 100 : null;
+}
+
+/** Production model ids (met_only excluded) in display order — the Average
+ *  column and UKUPNO totals never include surface-only comparisons. */
+export function productionModelIds(models: { model_id: string; met_only: boolean; run: unknown }[]): string[] {
+  return models.filter((m) => m.run !== null && !m.met_only).map((m) => m.model_id);
 }

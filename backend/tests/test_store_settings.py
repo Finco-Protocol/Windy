@@ -11,8 +11,8 @@ def test_first_startup_seeds_asset_and_curve(tmp_path):
     db = tmp_path / "w.db"
     ensure_db(db)
     site = load_site(db, "krnovo")
-    assert site["capacity_mw"] == 71.5
-    assert site["hub_height_m"] == 90.0
+    assert site["capacity_mw"] == 74.1
+    assert site["hub_height_m"] == 90.0  # unchanged
     curve = load_curve(db, site["power_curve_id"])
     assert curve.id == "ge103-2750-oedb"
     assert len(curve.points) == 51

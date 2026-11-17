@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, type DailySlot } from "./forecastTable";
+import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, type DailySlot } from "./forecastTable";
 
 function model(id: string, daily: DailySlot[]): { model_id: string; daily_local: DailySlot[] } {
   return { model_id: id, daily_local: daily };
@@ -88,7 +88,73 @@ describe("buildHourlyRows", () => {
 });
 
 describe("MODEL_LABELS_HR", () => {
-  it("covers all four registered models", () => {
-    expect(Object.keys(MODEL_LABELS_HR).sort()).toEqual(["ecmwf_ifs", "gfs_seamless", "icon_eu", "icon_global"]);
+  it("covers all seven registered models", () => {
+    expect(Object.keys(MODEL_LABELS_HR).sort()).toEqual([
+      "ecmwf_ifs",
+      "gem_seamless",
+      "gfs_seamless",
+      "icon_eu",
+      "icon_global",
+      "meteofrance_arpege_world",
+      "ukmo_seamless",
+    ]);
+  });
+});
+
+describe("modelTotal (Addendum B — UKUPNO red)", () => {
+  const rows = buildDailyMatrix([
+    model("gfs_seamless", [
+      { date: "2026-11-13", mwh: 100.25, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+      { date: "2026-11-14", mwh: 110.5, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+    ]),
+    model("icon_eu", [{ date: "2026-11-13", mwh: 90, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false }]),
+  ]);
+
+  it("sums the shown per-day MWh exactly", () => {
+    expect(modelTotal(rows, "gfs_seamless")).toEqual({ total: 210.75, partial: false, days: 2 });
+  });
+
+  it("a blank (iza horizonta) day contributes nothing — never zero", () => {
+    // icon_eu shows only 11-13; its UKUPNO is 90, not 90 + 0 for 11-14
+    expect(modelTotal(rows, "icon_eu")).toEqual({ total: 90, partial: false, days: 1 });
+  });
+
+  it("a partial day is included and marks the total with ⚠", () => {
+    const partialRows = buildDailyMatrix([
+      model("gfs_seamless", [
+        { date: "2026-11-13", mwh: 60, hours_counted: 11, hours_missing: 0, hours_expected: 24, partial: true },
+        { date: "2026-11-14", mwh: 100, hours_counted: 24, hours_missing: 0, hours_expected: 24, partial: false },
+      ]),
+    ]);
+    expect(modelTotal(partialRows, "gfs_seamless")).toEqual({ total: 160, partial: true, days: 2 });
+  });
+
+  it("all-blank model → null total, not 0", () => {
+    const none = buildDailyMatrix([model("ecmwf_ifs", [])]);
+    expect(modelTotal(none, "ecmwf_ifs")).toEqual({ total: null, partial: false, days: 0 });
+  });
+});
+
+describe("rowAverage (Average kolona)", () => {
+  it("arithmetic mean over production models with values", () => {
+    expect(rowAverage({ gfs_seamless: 100, icon_eu: 90, ecmwf_ifs: 110 }, ["gfs_seamless", "icon_eu", "ecmwf_ifs"])).toBe(100);
+  });
+
+  it("models without a value in the row are skipped, not zero-filled", () => {
+    expect(rowAverage({ gfs_seamless: 100, icon_eu: null }, ["gfs_seamless", "icon_eu"])).toBe(100);
+  });
+
+  it("no values at all → null", () => {
+    expect(rowAverage({ gfs_seamless: null }, ["gfs_seamless"])).toBeNull();
+  });
+
+  it("productionModelIds drops met_only models and models without a run", () => {
+    const models = [
+      { model_id: "ecmwf_ifs", met_only: false, run: {} },
+      { model_id: "ukmo_seamless", met_only: true, run: {} },
+      { model_id: "gfs_seamless", met_only: false, run: null },
+      { model_id: "icon_eu", met_only: false, run: {} },
+    ];
+    expect(productionModelIds(models)).toEqual(["ecmwf_ifs", "icon_eu"]);
   });
 });

@@ -28,6 +28,7 @@ class ModelSpec:
     direction_heights: tuple[int, ...]
     height_method: str
     note: str
+    met_only: bool = False  # surface-only model: comparison, excluded from MWh
 
 
 WINDY_MODELS: tuple[ModelSpec, ...] = (
@@ -40,6 +41,7 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         speed_heights=(100,),
         direction_heights=(100,),
         height_method=HEIGHT_METHOD_PROXY,
+        met_only=False,
         note=(
             "ECMWF IFS publishes 10 m and 100 m wind natively. The 100 m level is used "
             "directly as a PROXY for the 90 m hub (+10 m above hub) — no interpolation "
@@ -90,6 +92,53 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
             "ends at 120 h (5 days) — never extended to 7/10 days."
         ),
     ),
+    ModelSpec(
+        id="meteofrance_arpege_world",
+        provider="Météo-France",
+        label="ARPEGE Europe",
+        max_lead_hours=96,
+        request_days=4,
+        speed_heights=(80, 100),
+        direction_heights=(100,),
+        height_method=HEIGHT_METHOD_LOG_INTERP,
+        note=(
+            "ARPEGE Europe publishes 80 m and 100 m wind (probe 2026-11-17: all "
+            "levels non-null at Krnovo); 90 m hub is log-height interpolated "
+            "between 80 and 100 m. Horizon ~4 days."
+        ),
+    ),
+    ModelSpec(
+        id="gem_seamless",
+        provider="Environment Canada",
+        label="GEM Global",
+        max_lead_hours=240,
+        request_days=10,
+        speed_heights=(100,),
+        direction_heights=(100,),
+        height_method=HEIGHT_METHOD_PROXY,
+        note=(
+            "GEM publishes 10 m, 100 m and 120 m wind (probe 2026-11-17: 80 m is "
+            "null); the native 100 m level is used directly as a PROXY for the "
+            "90 m hub (+10 m above hub). Horizon ~10 days."
+        ),
+    ),
+    ModelSpec(
+        id="ukmo_seamless",
+        provider="UK Met Office",
+        label="UKMO Global (10 m samo)",
+        max_lead_hours=168,
+        request_days=7,
+        speed_heights=(10,),
+        direction_heights=(10,),
+        height_method=HEIGHT_METHOD_PROXY,
+        note=(
+            "MET_ONLY: UKMO Global provides surface 10 m wind; hub-relevant "
+            "levels (80–120 m) are null at Krnovo (probe 2026-11-17). Shown as a "
+            "10 m meteorological comparison ONLY — excluded from MWh, Average "
+            "and production totals. No invented shear extrapolation."
+        ),
+        met_only=True,
+    ),
 )
 
 MODEL_INDEX: dict[str, ModelSpec] = {m.id: m for m in WINDY_MODELS}
@@ -108,14 +157,16 @@ KRNOVO_ASSUMPTIONS: dict[str, str] = {
         "public references. Not survey-grade; one representative point is used for "
         "all model queries."
     ),
-    "capacity_mw": "71.5 MW = 26 × 2.75 MW per public project documentation.",
+    "capacity_mw": "74.10 MW = 26 × 2.85 MW (vlasnička ispravka 2026-11-17; fizički nameplate).",
     "turbine_model": (
-        "GE 2.75-103 (26 units) per public project documentation. 'Provisional' — "
-        "verify against as-built records."
+        "GE 2.85-116 klasa (26 jedinica) prema vlasničkoj ispravci 2026-11-17. "
+        "Krivulja je referentna (NE kalibrirana) i koristi skaliranje — oznaka "
+        "REFERENCE/UNVERIFIED ostaje vidljiva."
     ),
     "hub_height_m": (
         "90 m PROVISIONAL, editable setting. Publicly reported hub height for the "
-        "GE 2.75-103 at Krnovo; not verified against as-built documentation."
+        "90 m prema postojećoj dokumentaciji; referentna krivulja — provjeriti "
+        "protiv as-built zapisa."
     ),
     "loss_factor": (
         "0.0 by default — no calibrated wake/availability/electrical loss value is "
@@ -136,10 +187,10 @@ KRNOVO_ASSET: dict = {
     "country": "Montenegro",
     "latitude": 42.8756,
     "longitude": 19.1106,
-    "capacity_mw": 71.5,
+    "capacity_mw": 74.1,
     "turbine_count": 26,
-    "turbine_model": "GE 2.75-103 (provisional)",
-    "turbine_rated_mw": 2.75,
+    "turbine_model": "GE 2.85-116 klasa (provisional)",
+    "turbine_rated_mw": 2.85,
     "hub_height_m": 90.0,
     "loss_factor": 0.0,
     "timezone": "Europe/Podgorica",

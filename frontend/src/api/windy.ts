@@ -83,10 +83,78 @@ export interface ForecastModel {
   height_note: string;
   run: ForecastRunInfo | null;
   points: ForecastPoint[];
+  met_only: boolean;
   daily_local: { date: string; mwh: number; hours_counted: number; hours_missing: number }[];
   total_mwh_own_window: number | null;
   coverage: { n_hours: number; first_valid_utc: string | null; last_valid_utc: string | null; max_available_hours: number };
   warnings: string[];
+  /** Present only when the forecast was fetched with `with_availability=1`. */
+  adjusted?: AdjustedBlock;
+}
+
+export interface AdjustedPoint {
+  valid_at_utc: string;
+  adjusted_mw: number | null;
+  adjusted_mwh: number | null;
+  interval_hours: number;
+  status: string;
+}
+
+export interface AdjustedDailySlot {
+  date: string;
+  mwh: number;
+  hours_counted: number;
+  hours_missing: number;
+  hours_expected?: number;
+  partial?: boolean;
+}
+
+export interface AdjustedBlock {
+  available: boolean;
+  reason?: string;
+  inventory_revision?: number;
+  constraints_revision?: number;
+  baseline_comparable?: boolean;
+  baseline_comparable_reason?: string | null;
+  daily: AdjustedDailySlot[];
+  points: AdjustedPoint[];
+}
+
+export interface OperationalStatus {
+  site_id: string;
+  installed_mw: number;
+  available_max_mw: number;
+  offline_count: number;
+  curtailed_count: number;
+  farm_export_cap_mw: number | null;
+  n_turbines: number;
+  inventory_revision: number;
+  constraints_revision: number;
+  inventory_present?: boolean;
+  n_turbines_inventory?: number;
+  error?: string;
+}
+
+export interface WindNowModel {
+  model_id: string;
+  label: string;
+  met_only: boolean;
+  height_method: string;
+  valid_at_utc: string | null;
+  wind_speed_mps: number | null;
+  age_minutes: number | null;
+  stale: boolean;
+  note: string;
+  run_issued_utc?: string | null;
+}
+
+export interface WindNowResponse {
+  site_id: string;
+  modeled: true;
+  disclaimer: string;
+  generated_at_utc: string;
+  models: WindNowModel[];
+  cache?: { cached: boolean; age_s: number };
 }
 
 export interface ForecastResponse {
@@ -95,6 +163,7 @@ export interface ForecastResponse {
   generated_at_utc: string;
   days: number;
   models: ForecastModel[];
+  operational?: OperationalStatus | null;
   intersection: {
     n_common_hours: number;
     first_common_utc: string | null;
@@ -506,8 +575,13 @@ export const windyApi = {
   assets: (signal?: AbortSignal) => getJson<{ assets: AssetSummary[] }>("/assets", signal),
   assetCreate: (body: AssetCreate) => postJson<WindySite>("/assets", body),
   powerCurves: (signal?: AbortSignal) => getJson<{ curves: PowerCurveSummary[] }>("/power-curves", signal),
-  forecast: (days: number, siteId: string, signal?: AbortSignal) =>
-    getJson<ForecastResponse>(`/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}`, signal),
+  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false) =>
+    getJson<ForecastResponse>(
+      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}`,
+      signal,
+    ),
+  windNow: (siteId: string, signal?: AbortSignal) =>
+    getJson<WindNowResponse>(`/assets/${encodeURIComponent(siteId)}/wind-now`, signal),
   collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
   runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
     getJson<{ runs: RunSummary[] }>(
