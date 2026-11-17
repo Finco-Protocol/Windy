@@ -157,48 +157,18 @@ def store_run(
     existing coverage when the run was already archived).
     """
     existing = conn.execute(
-        "SELECT id, forecast_days FROM forecast_runs WHERE site_id=? AND model_id=? AND dedupe_key=? AND requested_height_m=?",
+        "SELECT id FROM forecast_runs WHERE site_id=? AND model_id=? AND dedupe_key=? AND requested_height_m=?",
         (site["id"], spec.id, dedupe_key, float(hub_from(site))),
     ).fetchone()
     if existing is not None:
+        # STRICT ARCHIVE IMMUTABILITY: a previously stored (site, model, issue,
+        # height) run is an unconditional no-op on re-collection — regardless of
+        # the requested horizon. Stored points, raw payload, issue/fetch times
+        # and provenance are never rewritten (a provider may revise values on a
+        # later request despite the same nominal issue; the original snapshot is
+        # irrecoverable once overwritten). Full permitted horizons arrive
+        # naturally with NEW issue cycles, which become their own rows.
         run_id = int(existing["id"])
-        # Horizon extension: the SAME archived issue re-collected with a longer
-        # request supersedes the shorter snapshot (more of the same run's own
-        # data — issue time and provenance are unchanged). Shorter or equal
-        # requests remain strict no-ops.
-        if forecast_days is not None and existing["forecast_days"] is not None and int(existing["forecast_days"]) < int(forecast_days):
-            conn.execute(
-                "DELETE FROM forecast_points WHERE run_id=?",
-                (run_id,),
-            )
-            conn.execute(
-                "UPDATE forecast_runs SET forecast_days=?, fetched_at_utc=?, raw_json=? WHERE id=?",
-                (forecast_days, fetched_at_utc, raw_json, run_id),
-            )
-            conn.executemany(
-                """
-                INSERT INTO forecast_points (
-                    run_id, valid_at_utc, wind_speed_mps, wind_direction_deg,
-                    height_method, modeled_power_mw, interval_energy_mwh, interval_hours, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        run_id,
-                        p.valid_at_utc,
-                        p.wind_speed_mps,
-                        p.wind_direction_deg,
-                        spec.height_method,
-                        p.modeled_power_mw,
-                        p.interval_energy_mwh,
-                        p.interval_hours,
-                        p.status,
-                    )
-                    for p in points
-                ],
-            )
-            stored = len(points)
-            return run_id, True, stored
         stored = conn.execute(
             "SELECT COUNT(*) AS n FROM forecast_points WHERE run_id=?",
             (run_id,),

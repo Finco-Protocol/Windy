@@ -2,8 +2,6 @@ import { describe, expect, it } from "vitest";
 
 import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, type DailySlot } from "./forecastTable";
 
-const T = (day: number, h: number) => `2026-11-1${day}T${String(h).padStart(2, "0")}:00:00Z`;
-
 function model(id: string, daily: DailySlot[]): { model_id: string; daily_local: DailySlot[] } {
   return { model_id: id, daily_local: daily };
 }
@@ -37,29 +35,55 @@ describe("buildDailyMatrix", () => {
 });
 
 describe("buildHourlyRows", () => {
-  it("keeps 24/48 h window, null gaps stay null, out-of-window cut", () => {
-    const now = "2026-11-13T12:00:00Z";
+  it("anchors to NEXT full hour from shared as-of; issued 00:00, now 13:20 → future hours only", () => {
     const pts = [
-      { valid_at_utc: T(3, 12), wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, status: "ok" },
-      { valid_at_utc: T(3, 13), wind_speed_mps: null, modeled_power_mw: null, interval_energy_mwh: null, status: "missing-height" },
-      { valid_at_utc: T(3, 14), wind_speed_mps: 9, modeled_power_mw: 22, interval_energy_mwh: 22, status: "ok" },
-      { valid_at_utc: T(3, 20), wind_speed_mps: 7, modeled_power_mw: 15, interval_energy_mwh: 15, status: "ok" }, // beyond 24h? 12+8h → inside
+      { valid_at_utc: "2026-11-13T00:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, interval_hours: 1, status: "ok" },
+      { valid_at_utc: "2026-11-13T14:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, interval_hours: 1, status: "ok" },
+      { valid_at_utc: "2026-11-13T15:00:00Z", wind_speed_mps: null, modeled_power_mw: null, interval_energy_mwh: null, interval_hours: 1, status: "missing-height" },
+      { valid_at_utc: "2026-11-13T16:00:00Z", wind_speed_mps: 9, modeled_power_mw: 22, interval_energy_mwh: 22, interval_hours: 1, status: "ok" },
     ];
-    const rows24 = buildHourlyRows(pts, now, 24);
-    expect(rows24).toHaveLength(4); // all points within +24 h (last is +8 h)
-    expect(rows24[0]?.cetLabel).toBe("11-13 13:00 CET");
-    expect(rows24[1]?.missing).toBe(true);
-    expect(rows24[1]?.mw).toBeNull();
-
-    const rows48 = buildHourlyRows(pts, now, 48);
-    expect(rows48).toHaveLength(4);
-    expect(rows48[3]?.cetLabel).toBe("11-13 21:00 CET");
+    // anchor (generated_at) 13:20Z → first row is the next full hour 14:00Z;
+    // the 00:00Z row is in the past and must never appear
+    const rows = buildHourlyRows(pts, "2026-11-13T13:20:00Z", 24, "Europe/Podgorica");
+    expect(rows).toHaveLength(24);
+    expect(rows[0]?.label).toBe("11-13 15:00");
+    expect(rows[0]?.missing).toBe(false);
+    expect(rows.some((r) => r.label.startsWith("11-13 00:00"))).toBe(false);
+    const missingRow = rows.find((r) => r.label === "11-13 16:00"); // 15:00Z = 16:00 CET
+    expect(missingRow?.missing).toBe(true);
+    expect(missingRow?.mw).toBeNull();
   });
 
-  it("CET label = UTC + 1 h fixed", () => {
-    const pts = [{ valid_at_utc: "2026-11-13T23:00:00Z", wind_speed_mps: 5, modeled_power_mw: 10, interval_energy_mwh: 10, status: "ok" }];
-    const rows = buildHourlyRows(pts, "2026-11-13T23:00:00Z", 24);
-    expect(rows[0]?.cetLabel.startsWith("11-14 00:00")).toBe(true);
+  it("hour grid is complete: absent model hours become explicit missing rows", () => {
+    const pts = [
+      { valid_at_utc: "2026-11-13T14:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, interval_hours: 1, status: "ok" },
+      { valid_at_utc: "2026-11-13T16:00:00Z", wind_speed_mps: 9, modeled_power_mw: 22, interval_energy_mwh: 22, interval_hours: 1, status: "ok" },
+    ]; // 15:00 absent → explicit gap row
+    const rows = buildHourlyRows(pts, "2026-11-13T13:20:00Z", 24, "Europe/Podgorica");
+    expect(rows).toHaveLength(24);
+    const gap = rows.find((r) => r.label === "11-13 16:00");
+    expect(gap?.missing).toBe(true);
+    expect(gap?.wind).toBeNull();
+  });
+
+  it("repeated fall-back 02:00 local hours are distinguishable by UTC offset", () => {
+    // Europe/Podgorica fall-back 2026-10-25: 02:00 occurs at 00:00Z (CEST, UTC+2)
+    // and 01:00Z (CET, UTC+1)
+    const pts = [
+      { valid_at_utc: "2026-10-25T00:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, interval_hours: 1, status: "ok" },
+      { valid_at_utc: "2026-10-25T01:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 20, interval_hours: 1, status: "ok" },
+    ];
+    const rows = buildHourlyRows(pts, "2026-10-25T00:00:00Z", 24, "Europe/Podgorica");
+    const both = rows.filter((r) => r.label === "10-25 02:00");
+    expect(both).toHaveLength(2);
+    expect(both[0]?.offset).toBe("UTC+2"); // first occurrence: CEST
+    expect(both[1]?.offset).toBe("UTC+1"); // second occurrence: CET
+  });
+
+  it("non-1h intervals expose their duration", () => {
+    const pts = [{ valid_at_utc: "2026-11-13T14:00:00Z", wind_speed_mps: 8, modeled_power_mw: 20, interval_energy_mwh: 40, interval_hours: 2, status: "ok" }];
+    const rows = buildHourlyRows(pts, "2026-11-13T13:20:00Z", 24, "Europe/Podgorica");
+    expect(rows[0]?.interval_hours).toBe(2);
   });
 });
 

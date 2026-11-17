@@ -1,6 +1,7 @@
 /** Forecast-first helpers — pure, tested builders for the Croatian daily/hourly
- *  tables. CET (UTC+1) FIXED as reference day boundary (owner decision): the
- *  CET date of a UTC hour t is (t + 1 h).date(). */
+ *  tables. Daily grouping and hourly labels use the SELECTED SITE's IANA
+ *  timezone (real 23/24/25 h DST days); repeated local hours are
+ *  distinguished by their UTC offset. */
 
 export interface DailySlot {
   date: string;
@@ -59,27 +60,54 @@ export function buildDailyMatrix(models: { model_id: string; daily_local: DailyS
   return rows;
 }
 
-/** Hourly rows for ONE model over the next `hours` from `nowUtc`, in CET
- *  labels. Gaps stay null; beyond the model's archived horizon rows are cut
- *  (no invented hours). `anchorUtc` = window start (usually now). */
+/** Hourly rows for the NEXT `hours` hours from the shared as-of anchor
+ *  (rounded up to the next full hour — the current incomplete hour is
+ *  excluded). Rows are a full hour grid in the site's IANA timezone, so a
+ *  model lacking an hour shows an explicit missing row (never 0, never
+ *  shifted). Repeated local hours across DST are distinguished by their UTC
+ *  offset suffix (e.g. CET vs CEST). All models share the same anchor. */
 export function buildHourlyRows(
-  points: { valid_at_utc: string; wind_speed_mps: number | null; modeled_power_mw: number | null; interval_energy_mwh: number | null; status: string }[],
-  nowUtc: string,
+  points: { valid_at_utc: string; wind_speed_mps: number | null; modeled_power_mw: number | null; interval_energy_mwh: number | null; interval_hours: number | null; status: string }[],
+  anchorUtc: string,
   hours: 24 | 48,
-): { cetLabel: string; wind: number | null; mw: number | null; mwh: number | null; missing: boolean }[] {
-  const start = new Date(nowUtc).getTime();
-  const end = start + hours * 3_600_000;
-  const CET = 3_600_000; // UTC+1 in ms
-  const rows: { cetLabel: string; wind: number | null; mw: number | null; mwh: number | null; missing: boolean }[] = [];
-  for (const p of points) {
-    const t = new Date(p.valid_at_utc).getTime();
-    if (t < start || t >= end) continue;
-    const cet = new Date(t + CET);
+  tz: string,
+): { label: string; offset: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] {
+  const anchorMs = new Date(anchorUtc).getTime();
+  if (Number.isNaN(anchorMs)) return [];
+  const startMs = Math.ceil(anchorMs / 3_600_000) * 3_600_000; // next full hour
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const fmtOffset = new Intl.DateTimeFormat("en-GB", { timeZone: tz, timeZoneName: "shortOffset" });
+  const byKey = new Map<string, (typeof points)[number]>();
+  for (const p of points) byKey.set(p.valid_at_utc.slice(0, 13), p);
+
+  const rows: { label: string; offset: string; wind: number | null; mw: number | null; mwh: number | null; interval_hours: number | null; missing: boolean }[] = [];
+  for (let i = 0; i < hours; i++) {
+    const t = new Date(startMs + i * 3_600_000);
+    const key = t.toISOString().slice(0, 13);
+    const p = byKey.get(key);
+    const parts = fmt.formatToParts(t);
+    const get = (type: string) => parts.find((x) => x.type === type)?.value ?? "";
+    const hour24 = get("hour") === "24" ? "00" : get("hour");
+    const label = `${get("month")}-${get("day")} ${hour24}:${get("minute")}`;
+    const offset = (fmtOffset.formatToParts(t).find((x) => x.type === "timeZoneName")?.value ?? "").replace("GMT", "UTC");
+    if (!p) {
+      rows.push({ label, offset, wind: null, mw: null, mwh: null, interval_hours: null, missing: true });
+      continue;
+    }
     rows.push({
-      cetLabel: cet.toISOString().slice(5, 16).replace("T", " ") + " CET",
+      label,
+      offset,
       wind: p.wind_speed_mps,
       mw: p.modeled_power_mw,
       mwh: p.interval_energy_mwh,
+      interval_hours: p.interval_hours,
       missing: p.wind_speed_mps === null || p.modeled_power_mw === null,
     });
   }

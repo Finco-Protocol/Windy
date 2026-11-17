@@ -74,8 +74,10 @@ const hourlyResource = useAbortableResource<ForecastModel | null>(
 const hourlyRows = computed(() => {
   const m = hourlyResource.data.value;
   if (!m) return [];
-  const anchor = m.run?.run_issued_utc ?? m.coverage.first_valid_utc ?? new Date().toISOString();
-  return buildHourlyRows(m.points, anchor, hourlyHours.value);
+  // shared as-of anchor across models: generation time rounded up to the next
+  // full hour — the window is the NEXT 24/48 h, never hours from the past
+  const anchor = fcData.value?.generated_at_utc ?? new Date().toISOString();
+  return buildHourlyRows(m.points, anchor, hourlyHours.value, siteData.value?.site.timezone ?? "Europe/Podgorica");
 });
 
 // ---- charts (secondary, collapsed) -----------------------------------------
@@ -240,26 +242,28 @@ const freshness = computed(() => {
               />
             </div>
             <div class="overflow-x-auto">
-              <table class="w-full max-w-lg font-mono text-[11px]">
+              <table class="w-full max-w-xl font-mono text-[11px]">
                 <thead>
                   <tr class="text-paper-400 border-ink-700 border-b text-left">
-                    <th class="py-1.5 pr-4">Datum i sat</th>
+                    <th class="py-1.5 pr-4">Datum i sat ({{ siteData.site.timezone }})</th>
                     <th class="py-1.5 pr-4 text-right">Vjetar (m/s)</th>
                     <th class="py-1.5 pr-4 text-right">Snaga (MW)</th>
                     <th class="py-1.5 pr-4 text-right">Energija (MWh)</th>
+                    <th class="py-1.5 pr-4 text-right">Interval</th>
                   </tr>
                 </thead>
                 <tbody>
-                  <tr v-for="r in hourlyRows" :key="r.cetLabel" class="border-ink-800 border-b" :class="r.missing ? 'opacity-50' : ''">
-                    <td class="text-paper-100 py-1 pr-4">{{ r.cetLabel }}</td>
-                    <td class="py-1 pr-4 text-right" :class="r.wind === null ? 'text-heat-300' : 'text-paper-100'">{{ r.wind ?? "—" }}</td>
+                  <tr v-for="r in hourlyRows" :key="r.label + r.offset" class="border-ink-800 border-b" :class="r.missing ? 'opacity-50' : ''">
+                    <td class="text-paper-100 py-1 pr-4">{{ r.label }} <span class="text-paper-400">{{ r.offset }}</span></td>
+                    <td class="py-1 pr-4 text-right" :class="r.wind === null ? 'text-heat-300' : 'text-paper-100'">{{ r.wind ?? "nedostaje" }}</td>
                     <td class="py-1 pr-4 text-right" :class="r.mw === null ? 'text-heat-300' : 'text-paper-100'">{{ r.mw ?? "nedostaje" }}</td>
                     <td class="py-1 pr-4 text-right" :class="r.mwh === null ? 'text-heat-300' : 'text-paper-100'">{{ r.mwh ?? "nedostaje" }}</td>
+                    <td class="text-paper-400 py-1 pr-4 text-right">{{ r.interval_hours ? r.interval_hours + " h" : "—" }}</td>
                   </tr>
                 </tbody>
               </table>
             </div>
-            <p class="text-paper-400 mt-2 font-mono text-[10px]">MW = prosječna snaga u satu; MWh = energija intervala. „nedostaje" = podatka nema (nikad 0).</p>
+            <p class="text-paper-400 mt-2 font-mono text-[10px]">MW = prosječna snaga intervala; MWh = energija intervala (trajanje u zadnjem stupcu). „nedostaje" = podatka nema (nikad 0).</p>
           </section>
 
           <!-- ===== sekundarno: grafikoni ===== -->
