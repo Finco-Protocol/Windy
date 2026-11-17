@@ -560,20 +560,42 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     entry["warnings"].append("Historical comparison is not possible for this run (issue time unknown).")
 
                 # daily totals in the site's local timezone; coverage-aware
+                # Per-local-date aggregation with CET (UTC+1) FIXED as the
+                # reference (owner decision): the CET date of a UTC hour t is
+                # (t + 1 h).date(), so every calendar day is exactly 24 UTC
+                # hours [23:00Z prev day, 23:00Z). Partial first/last days and
+                # gaps are flagged; metering (actuals) keeps its DST-aware
+                # handling separately.
                 daily: dict[str, dict] = {}
                 cum = 0.0
                 counted_any = False
+                CET = timedelta(hours=1)
                 for r in rows:
                     if r["interval_energy_mwh"] is not None:
                         cum += r["interval_energy_mwh"]
                         counted_any = True
-                    local_date = parse_utc(r["valid_at_utc"]).astimezone(tz).strftime("%Y-%m-%d")
-                    slot = daily.setdefault(local_date, {"date": local_date, "mwh": 0.0, "hours_counted": 0, "hours_missing": 0})
+                    valid_utc = parse_utc(r["valid_at_utc"])
+                    local_date = (valid_utc + CET).strftime("%Y-%m-%d")
+                    slot = daily.setdefault(
+                        local_date,
+                        {
+                            "date": local_date,
+                            "mwh": 0.0,
+                            "hours_counted": 0,
+                            "hours_missing": 0,
+                            "hours_expected": 24.0,
+                            "partial": False,
+                        },
+                    )
+                    slot["hours_present"] = slot.get("hours_present", 0) + 1
                     if r["interval_energy_mwh"] is not None:
                         slot["mwh"] = round(slot["mwh"] + r["interval_energy_mwh"], 4)
                         slot["hours_counted"] += 1
                     else:
                         slot["hours_missing"] += 1
+                for slot in daily.values():
+                    present = slot.pop("hours_present", 0)
+                    slot["partial"] = present < slot["hours_expected"] or slot["hours_missing"] > 0
                 entry["points"] = rows
                 entry["daily_local"] = list(daily.values())
                 entry["total_mwh_own_window"] = round(cum, 3) if counted_any else None
