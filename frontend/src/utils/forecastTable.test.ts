@@ -227,13 +227,47 @@ describe("visibleDailyRows (Correction A §5)", () => {
   });
 });
 
-describe("avg preference persistence per site", () => {
+describe("avg preference persistence per site (Correction B section 3)", () => {
   it("round-trips and filters against current production ids", () => {
-    saveAvgPreference("s1", { enabled: false, models: ["gfs_seamless", "ukmo_seamless"] });
+    saveAvgPreference("s1", { enabled: false, configured: true, models: ["gfs_seamless", "ukmo_seamless"] });
     const pref = loadAvgPreference("s1", ["gfs_seamless", "ecmwf_ifs"]);
     expect(pref.enabled).toBe(false);
+    expect(pref.configured).toBe(true);
     expect(pref.models).toEqual(["gfs_seamless"]); // met-only filtered out
-    saveAvgPreference("s2", { enabled: true, models: [] });
-    expect(loadAvgPreference("s2", ["gfs_seamless"]).models).toEqual(["gfs_seamless"]); // empty -> all
+  });
+
+  it("EXPLICIT empty selection stays empty (never silently re-enables all)", () => {
+    saveAvgPreference("s-none", { enabled: true, configured: true, models: [] });
+    const pref = loadAvgPreference("s-none", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual([]);
+  });
+
+  it("never-configured site defaults to all production models", () => {
+    const pref = loadAvgPreference("s-fresh", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(false);
+    expect(pref.enabled).toBe(true);
+    expect(pref.models).toEqual(["gfs_seamless", "ecmwf_ifs"]);
+  });
+
+  it("pre-B stored format (no configured flag) migrates to configured=true", () => {
+    // simulate a pre-B record: models list present, flag absent — persisted
+    // through the same storage path the app uses
+    saveAvgPreference("s-old", { enabled: true, configured: false as unknown as boolean, models: ["ecmwf_ifs"] });
+    const pref = loadAvgPreference("s-old", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual(["ecmwf_ifs"]);
+  });
+
+  it("temporarily empty productionIds keep the stored selection (no wipe while loading)", () => {
+    saveAvgPreference("s-keep", { enabled: true, configured: true, models: ["ecmwf_ifs"] });
+    expect(loadAvgPreference("s-keep", []).models).toEqual(["ecmwf_ifs"]);
+  });
+
+  it("site switching is isolated", () => {
+    saveAvgPreference("sw-a", { enabled: true, configured: true, models: ["gfs_seamless"] });
+    saveAvgPreference("sw-b", { enabled: true, configured: true, models: [] });
+    expect(loadAvgPreference("sw-a", ["gfs_seamless", "icon_eu"]).models).toEqual(["gfs_seamless"]);
+    expect(loadAvgPreference("sw-b", ["gfs_seamless", "icon_eu"]).models).toEqual([]);
   });
 });

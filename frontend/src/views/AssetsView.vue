@@ -126,7 +126,8 @@ function startEdit(a: AssetSummary): void {
   editForm.hub_height_m = a.hub_height_m;
   editForm.loss_factor = a.loss_factor;
   editForm.timezone = a.timezone;
-  editForm.allow_scaled_reference = true;
+  // no silent default opt-in: the checkbox reflects the site's ACTUAL value
+  editForm.allow_scaled_reference = !!(a as { allow_scaled_reference?: number | boolean }).allow_scaled_reference;
   editForm.regenerate_inventory = false;
   editForm.note = "";
   editError.value = null;
@@ -267,9 +268,9 @@ async function saveEdit(): Promise<void> {
               <input v-model="editForm.allow_scaled_reference" type="checkbox" class="accent-sodium-300" />
               <span class="text-paper-300">allow scaled reference (REFERENCE/UNVERIFIED opt-in)</span>
             </label>
-            <label class="font-mono text-[10px] flex items-center gap-2">
-              <input v-model="editForm.regenerate_inventory" type="checkbox" class="accent-sodium-300" />
-              <span class="text-paper-300">regeneriraj inventar turbina (nova inventarna revizija)</span>
+            <label class="font-mono text-[10px] flex items-start gap-2">
+              <input v-model="editForm.regenerate_inventory" type="checkbox" class="accent-sodium-300 mt-0.5" />
+              <span class="text-paper-300">regeneriraj inventar turbina — NOVA inventarna revizija WTG-001..count @ novi rating; za fizicku promjenu flote obavezno; installed mora odgovarati capacity_mw; aktivne restrikcije na preživjelim jedinicama ostaju (provjeri % / MW limite protiv nove nazivne)</span>
             </label>
             <label class="font-mono text-[10px] sm:col-span-2">
               <span class="text-paper-400 block">napomena (audit trail)</span>

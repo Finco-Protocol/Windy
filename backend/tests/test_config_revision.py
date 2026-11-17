@@ -171,6 +171,127 @@ def test_locations_append_only_validation_and_persistence(client):
     assert api.get("/api/assets/krnovo/locations").json()["revision"] == 1
 
 
+def test_fleet_change_without_regeneration_is_rejected_with_no_write(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85}},
+    )
+    assert r.status_code == 400
+    assert "regenerate_inventory=true" in r.json()["detail"]
+    # NO write happened anywhere
+    assert api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]["capacity_mw"] == pytest.approx(71.5)
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == 0
+
+
+def test_nameplate_capacity_mismatch_rejected_even_with_regeneration(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 70.0, "turbine_count": 26, "turbine_rated_mw": 2.85, "regenerate_inventory": True}},
+    )
+    assert r.status_code == 400
+    assert "74.10" in r.json()["detail"] or "74.1" in r.json()["detail"]
+    assert api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]["capacity_mw"] == pytest.approx(71.5)
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == 0
+
+
+def test_scaled_optin_is_required_not_silent(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    # 2.85 rating vs 2.78 curve peak WITHOUT allow_scaled_reference -> reject
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "regenerate_inventory": True}},
+    )
+    assert r.status_code == 400
+    assert "allow_scaled_reference" in r.json()["detail"]
+    assert api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]["capacity_mw"] == pytest.approx(71.5)
+
+
+def test_fleet_shrink_with_constraint_on_removed_unit_rejected(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    api.post(
+        "/api/assets/krnovo/constraints",
+        json={"rows": [{"kind": "offline", "unit_ids": ["WTG-025"], "start_local": "2026-11-12T00:00", "end_local": None}]},
+    )
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 57.0, "turbine_count": 20, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+    )
+    assert r.status_code == 400
+    assert "WTG-025" in r.json()["detail"], "affected constraint is listed precisely"
+    assert api.get("/api/assets/krnovo/constraints").json()["revision"] == 1, "constraints untouched"
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == 0
+
+
+def test_mid_transaction_failure_rolls_back_everything(client):
+    api, fake, _s = client
+    old_run_id, old_points = _seed_old_style_krnovo(api, fake)
+    from app import db as dbm
+    from app.availability import current_inventory_revision
+
+    db = str(api.app.state.settings.db_path)
+    # a trigger forces the regeneration INSERT inside apply_config_revision's
+    # transaction to ABORT — a genuine mid-write failure AFTER the assets
+    # UPDATE statement, proving the whole transaction rolls back
+    with dbm.session(db) as conn:
+        conn.execute(
+            "CREATE TRIGGER force_fail_before_turbines BEFORE INSERT ON turbines "
+            "WHEN NEW.rated_mw = 2.85 BEGIN SELECT RAISE(ABORT, 'forced mid-transaction failure'); END;"
+        )
+
+    before_constraints = api.get("/api/assets/krnovo/constraints").json()["revision"]
+    before_inventory_rev = current_inventory_revision(db, "krnovo")
+    with pytest.raises(Exception):
+        api.post(
+            "/api/assets/krnovo/config-revision",
+            json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+        )
+    with dbm.session(db) as conn:
+        conn.execute("DROP TRIGGER force_fail_before_turbines")
+    # assets row UNCHANGED (the UPDATE rolled back with the failed INSERT)
+    assert api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]["capacity_mw"] == pytest.approx(71.5)
+    # no config revision, no inventory revision, constraints unchanged
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == 0
+    assert current_inventory_revision(db, "krnovo") == before_inventory_rev
+    assert api.get("/api/assets/krnovo/constraints").json()["revision"] == before_constraints
+    # historical run bytes unchanged
+    assert api.get(f"/api/runs/{old_run_id}", params={"site_id": "krnovo"}).json()["points"] == old_points
+
+
+def test_upgrade_then_six_owner_caps_gives_72(client):
+    api, fake, _s = client
+    old_run_id, old_points = _seed_old_style_krnovo(api, fake)
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["regenerated_inventory"] is True
+    assert out["inventory_revision"] == 2
+    # owner picks ANY six (here WTG-007..012 - deliberately not 001..006)
+    six = [f"WTG-{i:03d}" for i in range(7, 13)]
+    rr = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": u, "state": "cap", "cap_mw": 2.5} for u in six], "start_local": "2026-11-16T00:00"},
+    )
+    assert rr.status_code == 200, rr.text
+    next_day = "2026-11-17"
+    fake.push_run("gfs_seamless", "2026-11-17T00:00", make_raw_run(_hourly(next_day, 0, 24), {"80": [WS] * 24, "100": [WS] * 24}))
+    rr2 = api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": next_day, "run_hour": 0, "days": 16})
+    assert rr2.status_code == 200
+    fc = api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()
+    m = next(x for x in fc["models"] if x["model_id"] == "gfs_seamless")
+    vals = [p["adjusted_mw"] for p in m["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    assert max(vals) == pytest.approx(20 * 2.85 + 6 * 2.50, abs=1e-3), "74.10 -> 72.00 with owner-selected six"
+    assert api.get(f"/api/runs/{old_run_id}", params={"site_id": "krnovo"}).json()["points"] == old_points
+
+
 def test_replace_units_atomic_split_grouped_constraints(client):
     api, fake, _s = client
     api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})

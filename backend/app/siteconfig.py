@@ -53,16 +53,42 @@ def current_config_revision(db_path, site_id: str) -> int:
 
 
 def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None = None) -> dict:
-    """Apply owner-verified configuration changes to an EXISTING site in ONE
-    auditable revision: the assets row is updated and the old→new diff is
-    appended to site_config_revisions in the same transaction. Optional
-    `regenerate_inventory` rebuilds the turbine inventory at the new
-    turbine_rated_mw as a NEW inventory revision (old one stays queryable).
-    Archived runs are never modified."""
+    """Correction B §2 — same-site fleet reconfiguration that CANNOT leave the
+    assets row and the turbine inventory inconsistent.
+
+    Everything is PREVALIDATED before any write:
+    - whole-number turbine count, finite numbers in range, known curve;
+    - a physical fleet change (turbine_count / turbine_rated_mw) either
+      matches the EXISTING inventory already, or explicitly requires
+      `regenerate_inventory=true` (otherwise rejected with an actionable
+      error — never a silent 74.10-in-assets / 71.50-in-inventory split);
+    - when regenerating, effective installed MW must equal effective
+      capacity_mw (no silent mixed-fleet reconciliation in this step);
+    - a rated-vs-curve mismatch REQUIRES the explicit allow_scaled_reference
+      (REFERENCE/UNVERIFIED) opt-in — never a silent default opt-in;
+    - ACTIVE constraints referencing units that would disappear under a
+      smaller fleet REJECT the revision with their ids listed (constraints
+      are never silently discarded).
+
+    The assets UPDATE, the NEW inventory revision rows and the config
+    revision row are written in ONE SQLite transaction (rolled back entirely
+    on any failure). Archived runs, constraints, actuals and published
+    scenario revisions are untouched.
+    """
+    from .availability import (
+        AvailabilityError,
+        current_constraints_revision,
+        current_inventory_revision,
+        get_constraints,
+        get_inventory,
+    )
+    from .store import load_curve as _store_load_curve
+
     site = load_site(db_path, site_id)
     if not isinstance(changes, dict) or not changes:
         raise AvailabilityError("changes must be a non-empty object")
 
+    changes = dict(changes)
     regenerate = bool(changes.pop("regenerate_inventory", False))
     validated: dict = {}
     old_vals: dict = {}
@@ -76,7 +102,9 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
             if not (lo <= num <= hi):
                 raise AvailabilityError(f"{key}={num} outside allowed range [{lo}, {hi}]")
             if key == "turbine_count":
-                num = int(num)
+                if abs(num - round(num)) > 1e-9:
+                    raise AvailabilityError(f"turbine_count must be a whole number, got {value}")
+                num = int(round(num))
             validated[key] = num
             old_vals[key] = site.get(key)
         elif key in EDITABLE_TEXT:
@@ -95,16 +123,74 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
         else:
             raise AvailabilityError(f"unknown or non-editable field: {key}")
 
-    if "timezone" in validated or "power_curve_id" in validated:
-        # never leave the site pointing at a missing curve
+    # ---- prevalidation of the COMPLETE target configuration -----------------
+    target_count = int(validated.get("turbine_count", site.get("turbine_count") or 0))
+    target_rating = float(validated.get("turbine_rated_mw", site.get("turbine_rated_mw") or 0))
+    target_capacity = float(validated.get("capacity_mw", site.get("capacity_mw") or 0))
+    target_curve_id = validated.get("power_curve_id", site.get("power_curve_id"))
+    target_allow_scaled = int(validated.get("allow_scaled_reference", site.get("allow_scaled_reference") or 0))
+    if target_curve_id is not None:
         with dbm.session(db_path) as conn:
-            target_curve = validated.get("power_curve_id", site.get("power_curve_id"))
-            if target_curve is not None:
-                row = conn.execute("SELECT 1 FROM power_curves WHERE id=?", (target_curve,)).fetchone()
-                if row is None:
-                    raise AvailabilityError(f"unknown power curve: {target_curve}")
+            row = conn.execute("SELECT 1 FROM power_curves WHERE id=?", (target_curve_id,)).fetchone()
+            if row is None:
+                raise AvailabilityError(f"unknown power curve: {target_curve_id}")
 
+    inv = get_inventory(db_path, site_id)
+    fleet_keys = {"turbine_count", "turbine_rated_mw"} & validated.keys()
+    inventory_matches_target = (
+        inv["n_turbines"] == target_count
+        and abs(inv["installed_mw"] - target_count * target_rating) <= 0.05
+    )
+    # Correction B: the flag is the explicit owner consent to rebuild the
+    # fleet — a fleet change WITHOUT it is rejected below, never auto-regenerated
+    regenerating = regenerate
+
+    constraint_impact: list[str] = []
+    if regenerating:
+        installed = target_count * target_rating
+        if abs(installed - target_capacity) > 0.05:
+            raise AvailabilityError(
+                f"physical fleet change rejected: {target_count} x {target_rating} MW = "
+                f"{round(installed, 2)} MW installed, but effective capacity_mw is {target_capacity} MW. "
+                "Set capacity_mw to the matching nameplate (or change it in the same revision)."
+            )
+        curve = _store_load_curve(db_path, target_curve_id) if target_curve_id else None
+        if curve is not None and curve.rated_power_mw:
+            mismatch = abs(float(curve.rated_power_mw) - target_rating) / target_rating
+            if mismatch > 0.02 and not target_allow_scaled:
+                raise AvailabilityError(
+                    f"curve '{target_curve_id}' peaks at {curve.rated_power_mw} MW vs unit rating "
+                    f"{target_rating} MW — set allow_scaled_reference=true to explicitly accept the "
+                    "scaled REFERENCE/UNVERIFIED curve (no silent opt-in)."
+                )
+        if target_count < inv["n_turbines"]:
+            surviving = {f"WTG-{i:03d}" for i in range(1, target_count + 1)}
+            cons = get_constraints(db_path, site_id)
+            affected = [c for c in cons["constraints"] if c.get("unit_ids") and any(u not in surviving for u in c["unit_ids"])]
+            if affected:
+                listed = ", ".join(f"#{c['id']}:{'/'.join(u for u in c['unit_ids'] if u not in surviving)}" for c in affected[:5])
+                raise AvailabilityError(
+                    f"fleet shrink rejected: {len(affected)} active constraint(s) reference units beyond "
+                    f"WTG-{target_count:03d} ({listed}). Remove or re-target those constraints first — "
+                    "they are never silently discarded."
+                )
+        if fleet_keys:
+            constraint_impact.append(
+                f"inventory regenerates as WTG-001..{target_count:03d} @ {target_rating} MW (new inventory revision); "
+                "existing active constraints on surviving units are PRESERVED unchanged "
+                "(cap_percent now refers to the new rated MW; verify cap_mw <= new rating)"
+            )
+    elif fleet_keys:
+        raise AvailabilityError(
+            f"physical fleet change ({', '.join(sorted(fleet_keys))}) requires regenerate_inventory=true: current "
+            f"inventory is {inv['n_turbines']} units / {inv['installed_mw']} MW, target is {target_count} units / "
+            f"{round(target_count * target_rating, 2)} MW. Include regenerate_inventory=true, or align the change "
+            "with the existing inventory."
+        )
+
+    # ---- ONE transaction: assets + (optional) new inventory + revision row ---
     rev = current_config_revision(db_path, site_id) + 1
+    inventory_revision: int | None = None
     now = _now()
     changes_json = dbm.j({k: {"from": old_vals.get(k), "to": v} for k, v in validated.items()})
     with dbm.session(db_path) as conn:
@@ -113,22 +199,20 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
             f"UPDATE assets SET {sets} WHERE id=?",
             (*validated.values(), site_id),
         )
+        if regenerating:
+            inventory_revision = current_inventory_revision(db_path, site_id) + 1
+            for i in range(1, target_count + 1):
+                conn.execute(
+                    "INSERT INTO turbines (site_id, unit_id, name, rated_mw, curve_id, config_revision, created_at_utc) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                    (site_id, f"WTG-{i:03d}", f"WTG {i:03d}", target_rating, inventory_revision, now),
+                )
         conn.execute(
             "INSERT INTO site_config_revisions (site_id, revision, changes_json, effective_from_utc, note, created_at_utc, created_by) "
             "VALUES (?, ?, ?, ?, ?, ?, 'owner')",
             (site_id, rev, changes_json, now, note, now),
         )
-    inventory_revision = None
-    if regenerate:
-        from .availability import current_inventory_revision, generate_inventory
-
-        rating = float(validated.get("turbine_rated_mw", site.get("turbine_rated_mw") or 0))
-        count = int(validated.get("turbine_count", site.get("turbine_count") or 0))
-        if count < 1 or rating <= 0:
-            raise AvailabilityError("regenerate_inventory needs turbine_count and turbine_rated_mw")
-        inv = generate_inventory(db_path, site_id, count, rating)
-        inventory_revision = current_inventory_revision(db_path, site_id)
-        _ = inv
+    _ = current_constraints_revision  # kept for API-surface parity
     out = {
         "site_id": site_id,
         "revision": rev,
@@ -136,6 +220,8 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
         "effective_from_utc": now,
         "note": note,
         "inventory_revision": inventory_revision,
+        "regenerated_inventory": regenerating,
+        "constraint_impact": constraint_impact,
         "site": load_site(db_path, site_id),
     }
     return out

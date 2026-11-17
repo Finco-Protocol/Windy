@@ -87,7 +87,12 @@ const productionIds = computed(() => productionModelIds(modelsWithRun.value));
 const dailyRows = computed<DailyRow[]>(() =>
   buildDailyMatrix(
     modelsWithRun.value.map((m) => {
-      const slots: DailySlot[] = viewMode.value === "adjusted" && m.adjusted?.available ? (m.adjusted.daily as DailySlot[]) : m.daily_local;
+      // Correction B §1: adjusted mode uses ONLY valid adjusted daily rows —
+      // when a model's adjusted block is unavailable (no inventory, curve
+      // mismatch, no run, met-only, backend error) its cells stay EMPTY with
+      // the visible reason. NEVER fall back to baseline daily_local here:
+      // baseline numbers must not be displayed as "prilagođeno".
+      const slots: DailySlot[] = viewMode.value === "adjusted" ? (m.adjusted?.available ? (m.adjusted.daily as DailySlot[]) : []) : m.daily_local;
       return { model_id: m.model_id, daily_local: slots };
     }),
   ),
@@ -96,15 +101,18 @@ const adjustedUnavailable = computed<Record<string, string>>(() => {
   const out: Record<string, string> = {};
   if (viewMode.value !== "adjusted") return out;
   for (const m of modelsWithRun.value) {
-    if (m.adjusted && !m.adjusted.available && m.adjusted.reason) out[m.model_id] = `prilagođeno nedostupno: ${m.adjusted.reason} — bazna vrijednost Nije prikazana`;
+    if (m.adjusted && !m.adjusted.available && m.adjusted.reason) out[m.model_id] = `prilagođeno nedostupno: ${m.adjusted.reason} — bazne vrijednosti NISU prikazane`;
   }
   return out;
 });
+// Correction B §1: when NO model has a valid adjusted block, say so loudly
+// instead of showing a plausible-looking (baseline) MWh table
+const adjustedAllUnavailable = computed(() => viewMode.value === "adjusted" && modelsWithRun.value.length > 0 && modelsWithRun.value.every((m) => !m.adjusted?.available));
 const visibleRows = computed<DailyRow[]>(() => visibleDailyRows(dailyRows.value, days.value, tz.value));
 const modelColumns = computed(() => modelsWithRun.value.map((m) => ({ id: m.model_id, label: MODEL_LABELS_HR[m.model_id] ?? m.model_id, metOnly: m.met_only })));
 
 // ---- Prosjek: hourly ensemble (Correction A §5) ------------------------------
-const avgPref = ref<{ enabled: boolean; models: string[] }>({ enabled: true, models: [] });
+const avgPref = ref<{ enabled: boolean; configured: boolean; models: string[] }>({ enabled: true, configured: false, models: [] });
 watch(
   [siteId, productionIds],
   ([sid, ids]) => {
@@ -119,9 +127,12 @@ watch(
   },
   { deep: true },
 );
+// Correction B §3: distinguish never-configured (default = all production
+// models) from EXPLICITLY selected zero models (Prosjek shows "—" with a
+// hint). An empty selection never silently re-enables every model.
 const avgModels = computed(() => {
-  const chosen = avgPref.value.models.filter((id) => productionIds.value.includes(id));
-  return chosen.length ? chosen : productionIds.value;
+  if (!avgPref.value.configured) return productionIds.value;
+  return avgPref.value.models.filter((id) => productionIds.value.includes(id));
 });
 function hourlyInputs(pointsOf: (m: ForecastModel) => { valid_at_utc: string; mw: number | null; interval_hours: number }[]): EnsembleInput[] {
   return modelsWithRun.value
@@ -158,7 +169,7 @@ function toggleAvgModel(id: string): void {
   const set = new Set(avgPref.value.models);
   if (set.has(id)) set.delete(id);
   else set.add(id);
-  avgPref.value = { ...avgPref.value, models: [...set] };
+  avgPref.value = { ...avgPref.value, configured: true, models: [...set] };
 }
 
 const totalsByModel = computed(() => {
@@ -748,9 +759,12 @@ function utcLabel(iso: string | null): string {
           <!-- ===== P0: dnevna tablica — TABLE FIRST ===== -->
           <section aria-label="Očekivana proizvodnja po danima">
             <h2 class="text-paper-50 mb-2 font-mono text-base tracking-wide">
-              Očekivana proizvodnja po danima (MWh) — {{ viewMode === "adjusted" ? "prilagođeno na raspoloživost" : "bazno (bez ograničenja)" }}
+              Očekivana proizvodnja po danima (MWh) — {{ viewMode === "adjusted" ? (adjustedAllUnavailable ? "prilagođeni prikaz NIJE dostupan (nijedna vrijednost nije prilagođena — bazni MWh NISU prikazani)" : "prilagođeno na raspoloživost") : "bazno (bez ograničenja)" }}
             </h2>
-            <div v-if="Object.keys(adjustedUnavailable).length" class="text-heat-300 mb-2 font-mono text-[10px]">
+            <div v-if="adjustedAllUnavailable" class="text-heat-300 mb-2 font-mono text-[10px]">
+              ⚠ Prilagođeni izračun nije moguć za nijedan model ({{ Object.values(adjustedUnavailable)[0] ?? "nema valjanih adjusted vrijednosti" }}). Tablica je PRAZNA namjerno — bazni MWh se ovdje nikad ne prikazuju kao prilagođeni. Prebacite na „Bazno" za bazne vrijednosti.
+            </div>
+            <div v-else-if="Object.keys(adjustedUnavailable).length" class="text-heat-300 mb-2 font-mono text-[10px]">
               ⚠ {{ Object.values(adjustedUnavailable).join(" · ") }}
             </div>
             <StateBlock v-if="visibleRows.length === 0" kind="empty" :relaxed="true">
@@ -813,7 +827,7 @@ function utcLabel(iso: string | null): string {
                   :class="avgPref.models.includes(pid) ? 'border-sodium-300/60 text-sodium-200' : 'border-ink-600 text-paper-500'"
                   @click="toggleAvgModel(pid)"
                 >{{ modelColumns.find((c) => c.id === pid)?.label ?? pid }}</button>
-                <span class="text-paper-500 font-mono text-[10px]">{{ avgCoverageNote }}</span>
+                <span class="text-paper-500 font-mono text-[10px]">{{ avgModels.length === 0 ? "Prosjek: nijedan model nije odabran — stupac prikazuje — umjesto tihog izbora svih modela." : avgCoverageNote }}</span>
               </div>
               <p class="text-paper-400 mt-2 font-mono text-[10px]">
                 Prikazano točno {{ visibleRows.length }} lokalnih dana od {{ visibleRows[0]?.date }} ({{ tz }}); UKUPNO je zbroj upravo tih redova. ⚠ = djelomičan dan. * = met-only (bez MWh).

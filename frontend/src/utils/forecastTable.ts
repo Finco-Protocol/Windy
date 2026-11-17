@@ -322,6 +322,11 @@ export function visibleDailyRows<T extends { date: string }>(rows: T[], days: nu
  * single-user persistence; the backend remains authoritative for numbers. */
 export interface AvgPreference {
   enabled: boolean;
+  /** true once the user has explicitly chosen a model set (or toggled the
+   *  column) — distinguishes never-configured (default: all production
+   *  models) from an EXPLICIT empty selection (Prosjek shows an em dash,
+   *  never a silent re-enable of every model). Correction B section 3. */
+  configured: boolean;
   models: string[];
 }
 
@@ -341,14 +346,21 @@ export function loadAvgPreference(siteId: string, productionIds: string[]): AvgP
   try {
     const raw = prefStorage().getItem(`windy.avg.${siteId}`);
     if (raw) {
-      const parsed = JSON.parse(raw) as AvgPreference;
-      const models = Array.isArray(parsed.models) ? parsed.models.filter((m) => productionIds.includes(m)) : [];
-      return { enabled: !!parsed.enabled, models: models.length ? models : [...productionIds] };
+      const parsed = JSON.parse(raw) as Partial<AvgPreference>;
+      // a stored list means the user saved at least once — treat it as
+      // configured even under the pre-B format (which lacked the flag)
+      const configured = parsed.configured === true || Array.isArray(parsed.models);
+      let models = Array.isArray(parsed.models) ? [...parsed.models] : [];
+      // filter against CURRENT production ids only when they are loaded;
+      // while temporarily empty (loading/missing runs) the stored selection
+      // is kept untouched, never erased
+      if (productionIds.length > 0) models = models.filter((m) => productionIds.includes(m));
+      return { enabled: !!parsed.enabled, configured, models };
     }
   } catch {
     /* corrupted preference falls through to the default */
   }
-  return { enabled: true, models: [...productionIds] };
+  return { enabled: true, configured: false, models: [...productionIds] };
 }
 
 export function saveAvgPreference(siteId: string, pref: AvgPreference): void {

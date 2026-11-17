@@ -21,6 +21,9 @@ export interface WindySite {
   assumptions: Record<string, string>;
   notes: string;
   power_curve_id?: string;
+  /** present on serialized assets (SELECT a.*) — the edit form must read the
+   *  ACTUAL value, never default the scaled-reference opt-in to true */
+  allow_scaled_reference?: number | boolean;
 }
 
 export interface CurveInfo {
