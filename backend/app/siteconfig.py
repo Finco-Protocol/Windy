@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 from . import db as dbm
 from .availability import AvailabilityError
@@ -252,3 +253,40 @@ def load_site(db_path, site_id: str) -> dict:
     from .store import load_site as _load
 
     return _load(db_path, site_id)
+
+
+OWNER_LOCATIONS_PACKAGE = Path(__file__).parent / "ownerdata" / "krnovo_turbine_locations.json"
+
+
+def load_owner_locations_package() -> dict:
+    """The owner-supplied 26 GPS/altitude records (Correction A §3), converted
+    verbatim from 'Geographical coordinates & altitude.xlsx' (DMS -> decimal,
+    WGS84) into a committed package with provenance. unit_id mapping is
+    PROVISIONAL (WTG-{source_no:03d} by owner row order)."""
+    import json
+
+    return json.loads(OWNER_LOCATIONS_PACKAGE.read_text(encoding="utf-8"))
+
+
+def import_owner_locations(db_path, site_id: str, note: str | None = None) -> dict:
+    """Append ONE location revision with the owner's 26 records. Reversible by
+    design (previous revisions stay queryable); call is idempotent only in the
+    sense that a re-import creates revision N+1 — it never rewrites N."""
+    pkg = load_owner_locations_package()
+    records = [
+        {
+            "unit_id": r["unit_id"],
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
+            "elevation_m": r["elevation_m"],
+            "source": "owner-xlsx 2026-11-17 (DMS->decimal; WTG mapping provisional)",
+        }
+        for r in pkg["records"]
+    ]
+    out = set_locations_revision(db_path, site_id, records, note or note_default(pkg))
+    out["source_file"] = pkg["source"]["file"]
+    return out
+
+
+def note_default(pkg: dict) -> str:
+    return "Vlasnički podaci (26 zapisa) iz 'Geographical coordinates & altitude.xlsx'; WTG mapiranje privremeno"

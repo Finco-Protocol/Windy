@@ -1,0 +1,219 @@
+{
+ "site_id": "krnovo",
+ "source": {
+  "file": "Geographical coordinates & altitude.xlsx (vlasnička datoteka, primljena 2026-11-17)",
+  "format": "DMS (deg min sec) -> decimal degrees, WGS84; Northern hemisphere / East",
+  "conversion": "dec = deg + min/60 + sec/3600; dms_original retained for row-by-row verification",
+  "id_mapping": "PROVISIONAL: unit_id = WTG-{source_no:03d} by owner row order; not independently confirmed against as-built turbine IDs"
+ },
+ "records": [
+  {
+   "source_no": 1,
+   "unit_id": "WTG-001",
+   "latitude": 42.894840681,
+   "longitude": 19.108043582,
+   "elevation_m": 1509.4318,
+   "dms_original": "42 53 41.426450 | 19 06 28.956895"
+  },
+  {
+   "source_no": 2,
+   "unit_id": "WTG-002",
+   "latitude": 42.893406568,
+   "longitude": 19.112033782,
+   "elevation_m": 1511.3138,
+   "dms_original": "42 53 36.263645 | 19 06 43.321614"
+  },
+  {
+   "source_no": 3,
+   "unit_id": "WTG-003",
+   "latitude": 42.892912821,
+   "longitude": 19.115587766,
+   "elevation_m": 1533.2388,
+   "dms_original": "42 53 34.486157 | 19 06 56.115959"
+  },
+  {
+   "source_no": 4,
+   "unit_id": "WTG-004",
+   "latitude": 42.891806532,
+   "longitude": 19.118249079,
+   "elevation_m": 1556.2668,
+   "dms_original": "42 53 30.503515 | 19 07 05.696683"
+  },
+  {
+   "source_no": 5,
+   "unit_id": "WTG-005",
+   "latitude": 42.890388873,
+   "longitude": 19.12052512,
+   "elevation_m": 1552.1198,
+   "dms_original": "42 53 25.399944 | 19 07 13.890433"
+  },
+  {
+   "source_no": 6,
+   "unit_id": "WTG-006",
+   "latitude": 42.889040776,
+   "longitude": 19.123047171,
+   "elevation_m": 1564.8968,
+   "dms_original": "42 53 20.546792 | 19 07 22.969817"
+  },
+  {
+   "source_no": 7,
+   "unit_id": "WTG-007",
+   "latitude": 42.889063238,
+   "longitude": 19.126218981,
+   "elevation_m": 1613.5928,
+   "dms_original": "42 53 20.627656 | 19 07 34.388333"
+  },
+  {
+   "source_no": 8,
+   "unit_id": "WTG-008",
+   "latitude": 42.888052804,
+   "longitude": 19.129211726,
+   "elevation_m": 1667.3268,
+   "dms_original": "42 53 16.990094 | 19 07 45.162215"
+  },
+  {
+   "source_no": 9,
+   "unit_id": "WTG-009",
+   "latitude": 42.8926695,
+   "longitude": 19.091365774,
+   "elevation_m": 1507.0017,
+   "dms_original": "42 53 33.610199 | 19 05 28.916788"
+  },
+  {
+   "source_no": 10,
+   "unit_id": "WTG-010",
+   "latitude": 42.891759441,
+   "longitude": 19.094275845,
+   "elevation_m": 1504.9207,
+   "dms_original": "42 53 30.333987 | 19 05 39.393043"
+  },
+  {
+   "source_no": 11,
+   "unit_id": "WTG-011",
+   "latitude": 42.877482603,
+   "longitude": 19.093092898,
+   "elevation_m": 1473.0707,
+   "dms_original": "42 52 38.937371 | 19 05 35.134431"
+  },
+  {
+   "source_no": 12,
+   "unit_id": "WTG-012",
+   "latitude": 42.877364061,
+   "longitude": 19.096212123,
+   "elevation_m": 1485.7457,
+   "dms_original": "42 52 38.510621 | 19 05 46.363642"
+  },
+  {
+   "source_no": 13,
+   "unit_id": "WTG-013",
+   "latitude": 42.877009595,
+   "longitude": 19.0993761,
+   "elevation_m": 1516.6057,
+   "dms_original": "42 52 37.234542 | 19 05 57.753961"
+  },
+  {
+   "source_no": 14,
+   "unit_id": "WTG-014",
+   "latitude": 42.877068454,
+   "longitude": 19.102669808,
+   "elevation_m": 1519.0247,
+   "dms_original": "42 52 37.446433 | 19 06 09.611310"
+  },
+  {
+   "source_no": 15,
+   "unit_id": "WTG-015",
+   "latitude": 42.876557866,
+   "longitude": 19.106075744,
+   "elevation_m": 1546.4117,
+   "dms_original": "42 52 35.608319 | 19 06 21.872679"
+  },
+  {
+   "source_no": 16,
+   "unit_id": "WTG-016",
+   "latitude": 42.875447731,
+   "longitude": 19.109213833,
+   "elevation_m": 1544.9547,
+   "dms_original": "42 52 31.611831 | 19 06 33.169798"
+  },
+  {
+   "source_no": 17,
+   "unit_id": "WTG-017",
+   "latitude": 42.873836037,
+   "longitude": 19.111963346,
+   "elevation_m": 1563.6467,
+   "dms_original": "42 52 25.809735 | 19 06 43.068044"
+  },
+  {
+   "source_no": 18,
+   "unit_id": "WTG-018",
+   "latitude": 42.872119331,
+   "longitude": 19.114453801,
+   "elevation_m": 1565.9387,
+   "dms_original": "42 52 19.629593 | 19 06 52.033685"
+  },
+  {
+   "source_no": 19,
+   "unit_id": "WTG-019",
+   "latitude": 42.870513698,
+   "longitude": 19.116627914,
+   "elevation_m": 1577.3847,
+   "dms_original": "42 52 13.849311 | 19 06 59.860492"
+  },
+  {
+   "source_no": 20,
+   "unit_id": "WTG-020",
+   "latitude": 42.869062006,
+   "longitude": 19.119624697,
+   "elevation_m": 1597.0947,
+   "dms_original": "42 52 08.623223 | 19 07 10.648908"
+  },
+  {
+   "source_no": 21,
+   "unit_id": "WTG-021",
+   "latitude": 42.867080517,
+   "longitude": 19.121559217,
+   "elevation_m": 1597.4537,
+   "dms_original": "42 52 01.489860 | 19 07 17.613182"
+  },
+  {
+   "source_no": 22,
+   "unit_id": "WTG-022",
+   "latitude": 42.866283593,
+   "longitude": 19.124787907,
+   "elevation_m": 1603.0817,
+   "dms_original": "42 51 58.620933 | 19 07 29.236465"
+  },
+  {
+   "source_no": 23,
+   "unit_id": "WTG-023",
+   "latitude": 42.866074639,
+   "longitude": 19.128117101,
+   "elevation_m": 1627.0127,
+   "dms_original": "42 51 57.868699 | 19 07 41.221563"
+  },
+  {
+   "source_no": 24,
+   "unit_id": "WTG-024",
+   "latitude": 42.864424289,
+   "longitude": 19.130750668,
+   "elevation_m": 1635.7367,
+   "dms_original": "42 51 51.927442 | 19 07 50.702406"
+  },
+  {
+   "source_no": 25,
+   "unit_id": "WTG-025",
+   "latitude": 42.862997665,
+   "longitude": 19.133906362,
+   "elevation_m": 1651.4617,
+   "dms_original": "42 51 46.791593 | 19 08 02.062902"
+  },
+  {
+   "source_no": 26,
+   "unit_id": "WTG-026",
+   "latitude": 42.863249826,
+   "longitude": 19.137521092,
+   "elevation_m": 1669.1897,
+   "dms_original": "42 51 47.699375 | 19 08 15.075930"
+  }
+ ]
+}
