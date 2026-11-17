@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, type DailySlot } from "./forecastTable";
+import { buildDailyMatrix, buildEnsembleDaily, buildHourlyRows, loadAvgPreference, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, saveAvgPreference, visibleDailyRows, type DailySlot } from "./forecastTable";
 
 function model(id: string, daily: DailySlot[]): { model_id: string; daily_local: DailySlot[] } {
   return { model_id: id, daily_local: daily };
@@ -156,5 +156,84 @@ describe("rowAverage (Average kolona)", () => {
       { model_id: "icon_eu", met_only: false, run: {} },
     ];
     expect(productionModelIds(models)).toEqual(["ecmwf_ifs", "icon_eu"]);
+  });
+});
+
+describe("buildEnsembleDaily (Correction A §5)", () => {
+  const pts = (model: string, hours: [string, number, number][]) => ({
+    model_id: model,
+    points: hours.map(([t, mw, ih]) => ({ valid_at_utc: t, mw, interval_hours: ih })),
+  });
+
+  it("equal coverage: daily ensemble = mean of per-model hourly energy", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1], ["2026-11-16T01:00:00Z", 10, 1]]);
+    const b = pts("ecmwf_ifs", [["2026-11-16T00:00:00Z", 20, 1], ["2026-11-16T01:00:00Z", 20, 1]]);
+    const rows = buildEnsembleDaily([a, b], "Europe/Podgorica");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.date).toBe("2026-11-16"); // 01:00Z is still 01:00 local (CET)
+    expect(rows[0]?.mwh).toBe(30); // avg 15 MW x 2 h
+    expect(rows[0]?.contributors_min).toBe(2);
+  });
+
+  it("3 h intervals conserve energy: 10 MW x 3 h = 30 MWh across a day boundary", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T22:00:00Z", 10, 3]]); // 1 h D0 + 2 h D1 (midnight 23:00Z)
+    const rows = buildEnsembleDaily([a], "Europe/Podgorica");
+    const byDate = Object.fromEntries(rows.map((r) => [r.date, r]));
+    expect(byDate["2026-11-16"]?.mwh).toBe(10);
+    expect(byDate["2026-11-17"]?.mwh).toBe(20);
+  });
+
+  it("missing model hour drops contributor count and is flagged, never zero-filled", () => {
+    const a = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1], ["2026-11-16T01:00:00Z", 10, 1]]);
+    const b = pts("ecmwf_ifs", [["2026-11-16T00:00:00Z", 30, 1]]); // no 01:00 point
+    const rows = buildEnsembleDaily([a, b], "Europe/Podgorica");
+    expect(rows[0]?.mwh).toBe(20 + 10); // 00: avg 20; 01: avg 10 (1 contributor)
+    expect(rows[0]?.contributors_min).toBe(1);
+    expect(rows[0]?.contributors_max).toBe(2);
+  });
+
+  it("DST spring day expected hours = 23", () => {
+    const t0ms = Date.parse("2026-03-28T23:00:00Z");
+    const hours = Array.from({ length: 23 }, (_, i) => [new Date(t0ms + i * 3_600_000).toISOString(), 5, 1] as [string, number, number]);
+    const a = pts("gfs_seamless", hours);
+    const rows = buildEnsembleDaily([a], "Europe/Podgorica");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.date).toBe("2026-03-29");
+    expect(rows[0]?.hours_expected).toBe(23);
+    expect(rows[0]?.hours_counted).toBe(23);
+    expect(rows[0]?.partial).toBe(false);
+  });
+
+  it("met-only and unselected models are excluded by the caller's input set", () => {
+    const b = pts("gfs_seamless", [["2026-11-16T00:00:00Z", 10, 1]]);
+    const rows = buildEnsembleDaily([b], "Europe/Podgorica"); // met-only excluded by the caller
+    expect(rows[0]?.mwh).toBe(10);
+  });
+});
+
+describe("visibleDailyRows (Correction A §5)", () => {
+  const rows = Array.from({ length: 12 }, (_, i) => ({ date: `2026-11-${String(i + 1).padStart(2, "0")}`, v: i }));
+  it("anchors at today in site tz and returns exactly N rows", () => {
+    const vis = visibleDailyRows(rows, 7, "Europe/Podgorica", "2026-11-05T10:00:00Z");
+    expect(vis).toHaveLength(7);
+    expect(vis[0]?.date).toBe("2026-11-05");
+    expect(vis[6]?.date).toBe("2026-11-11");
+  });
+  it("no row on/after today -> the LAST N rows (never an N+1-th date)", () => {
+    const vis = visibleDailyRows(rows, 7, "Europe/Podgorica", "2026-12-01T10:00:00Z");
+    expect(vis).toHaveLength(7);
+    expect(vis[0]?.date).toBe("2026-11-06");
+    expect(vis[6]?.date).toBe("2026-11-12");
+  });
+});
+
+describe("avg preference persistence per site", () => {
+  it("round-trips and filters against current production ids", () => {
+    saveAvgPreference("s1", { enabled: false, models: ["gfs_seamless", "ukmo_seamless"] });
+    const pref = loadAvgPreference("s1", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.enabled).toBe(false);
+    expect(pref.models).toEqual(["gfs_seamless"]); // met-only filtered out
+    saveAvgPreference("s2", { enabled: true, models: [] });
+    expect(loadAvgPreference("s2", ["gfs_seamless"]).models).toEqual(["gfs_seamless"]); // empty -> all
   });
 });

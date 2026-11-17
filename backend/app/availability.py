@@ -416,6 +416,120 @@ def delete_constraints(db_path, site_id: str, ids: list[int]) -> dict:
     return get_constraints(db_path, site_id, rev)
 
 
+def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_local: str, end_local: str | None = None) -> dict:
+    """ONE atomic revision that sets the desired per-unit state (Correction A §4):
+
+    - every ACTIVE constraint loses the assigned units' membership; grouped
+      rows are SPLIT (unaffected members keep their row with the remaining
+      unit list), rows left with no members are dropped;
+    - the desired states are appended: one offline row for all OFF units and
+      curtailment rows grouped by identical (cap_mw, cap_percent);
+    - expired/past constraints and units not in the assignment are untouched;
+    - previous revision is preserved (append-only audit history).
+
+    Doing split+add in a single revision removes the half-applied window a
+    `delete` + `add` HTTP pair would create on failure. `cap_percent` keeps
+    the backend semantics: percent OF RATED ALLOWED (100 % = unrestricted).
+    """
+    site = _load_site_tz(db_path, site_id)
+    if not isinstance(assignments, list) or not assignments:
+        raise AvailabilityError("assignments must be a non-empty list")
+    if len(assignments) > 500:
+        raise AvailabilityError("a single request may assign at most 500 units")
+
+    inv = get_inventory(db_path, site_id)
+    known_units = {t["unit_id"] for t in inv["turbines"]}
+    unit_rated = {t["unit_id"]: float(t["rated_mw"]) for t in inv["turbines"]}
+    if not known_units:
+        raise AvailabilityError("no turbine inventory for this site — generate it first")
+
+    start_utc, _warn = local_to_utc(start_local, site["timezone"])
+    end_utc = None
+    if end_local:
+        end_utc, _w2 = local_to_utc(end_local, site["timezone"])
+
+    desired: dict[str, dict] = {}
+    for a in assignments:
+        unit = str(a.get("unit_id") or "").strip()
+        if unit not in known_units:
+            raise AvailabilityError(f"unknown unit_id: {unit}")
+        state = str(a.get("state") or "").strip()
+        if state not in ("on", "off", "cap"):
+            raise AvailabilityError(f"{unit}: state must be 'on' | 'off' | 'cap'")
+        rec: dict = {"state": state, "cap_mw": None, "cap_percent": None}
+        if state == "cap":
+            cap_mw = a.get("cap_mw")
+            cap_pct = a.get("cap_percent")
+            if (cap_mw is None) == (cap_pct is None):
+                raise AvailabilityError(f"{unit}: exactly one of cap_mw / cap_percent is required")
+            if cap_mw is not None:
+                cap = _finite(cap_mw, "cap_mw", 0.01, unit_rated[unit])
+                if cap > unit_rated[unit] + TOLERANCE:
+                    raise AvailabilityError(f"{unit}: cap_mw {cap} exceeds rated {unit_rated[unit]}")
+                rec["cap_mw"] = cap
+            else:
+                pct = _finite(cap_pct, "cap_percent", 0.01, 100.0)
+                rec["cap_percent"] = pct
+        desired[unit] = rec
+
+    now = _now()
+    rev = current_constraints_revision(db_path, site_id) + 1
+    assigned = set(desired)
+    with dbm.session(db_path) as conn:
+        active = conn.execute(
+            "SELECT id, kind, unit_ids_json, cap_mw, cap_percent, start_utc, end_utc, created_by "
+            "FROM operational_constraints WHERE site_id=? AND revision=? AND superseded_by IS NULL",
+            (site_id, rev - 1) if rev > 1 else (site_id, rev),
+        ).fetchall()
+        dropped = 0
+        for r in active:
+            if r["end_utc"] is not None and r["end_utc"] <= now:
+                continue  # expired rows keep history untouched
+            members = json.loads(r["unit_ids_json"]) if r["unit_ids_json"] else []
+            remaining = [u for u in members if u not in assigned]
+            if r["kind"] == "export_cap" or not members:
+                # farm-wide caps and inert markers are not per-unit state
+                conn.execute(
+                    "INSERT INTO operational_constraints (site_id, kind, unit_ids_json, cap_mw, cap_percent, "
+                    "start_utc, end_utc, revision, created_at_utc, created_by, superseded_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (site_id, r["kind"], r["unit_ids_json"], r["cap_mw"], r["cap_percent"], r["start_utc"], r["end_utc"], rev, now, r["created_by"]),
+                )
+                continue
+            if not remaining:
+                dropped += 1
+                continue  # row fully superseded by the new assignment
+            conn.execute(
+                "INSERT INTO operational_constraints (site_id, kind, unit_ids_json, cap_mw, cap_percent, "
+                "start_utc, end_utc, revision, created_at_utc, created_by, superseded_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (site_id, r["kind"], dbm.j(remaining), r["cap_mw"], r["cap_percent"], r["start_utc"], r["end_utc"], rev, now, r["created_by"]),
+            )
+        off_units = sorted(u for u, rec in desired.items() if rec["state"] == "off")
+        if off_units:
+            conn.execute(
+                "INSERT INTO operational_constraints (site_id, kind, unit_ids_json, cap_mw, cap_percent, "
+                "start_utc, end_utc, revision, created_at_utc, created_by, superseded_by) "
+                "VALUES (?, 'offline', ?, NULL, NULL, ?, ?, ?, ?, 'owner', NULL)",
+                (site_id, dbm.j(off_units), start_utc, end_utc, rev, now),
+            )
+        cap_groups: dict[tuple, list[str]] = {}
+        for u, rec in desired.items():
+            if rec["state"] == "cap":
+                cap_groups.setdefault((rec["cap_mw"], rec["cap_percent"]), []).append(u)
+        for (cap_mw, cap_pct), units in sorted(cap_groups.items()):
+            conn.execute(
+                "INSERT INTO operational_constraints (site_id, kind, unit_ids_json, cap_mw, cap_percent, "
+                "start_utc, end_utc, revision, created_at_utc, created_by, superseded_by) "
+                "VALUES (?, 'curtailment', ?, ?, ?, ?, ?, ?, ?, 'owner', NULL)",
+                (site_id, dbm.j(sorted(units)), cap_mw, cap_pct, start_utc, end_utc, rev, now),
+            )
+        _ = dropped  # kept for debuggability in review
+    out = get_constraints(db_path, site_id, rev)
+    out["warnings"] = []
+    return out
+
+
 # --- scenario computation ------------------------------------------------------------
 
 

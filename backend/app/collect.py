@@ -87,15 +87,26 @@ def build_points(
     if not times:
         return []
     if spec.met_only:
+        try:
+            met_arr = extract_series(hourly, f"wind_speed_{spec.speed_heights[0]}m", spec.id)
+        except OMError:
+            met_arr = [None] * len(times)
+
+        def _met_speed(i: int) -> float | None:
+            # upstream nulls stay null — round(None) must never crash the archive
+            if i >= len(met_arr) or met_arr[i] is None:
+                return None
+            return round(met_arr[i], 4)
+
         return [
             PointRow(
                 valid_at_utc=iso_z(t),
-                wind_speed_mps=round(extract_series(hourly, f"wind_speed_{spec.speed_heights[0]}m", spec.id)[i], 4) if i < len(times) else None,
+                wind_speed_mps=_met_speed(i),
                 wind_direction_deg=None,
                 modeled_power_mw=None,
                 interval_energy_mwh=None,
                 interval_hours=1.0,
-                status="met-only",
+                status="met-only" if _met_speed(i) is not None else "missing-height",
             )
             for i, t in enumerate(times)
         ]

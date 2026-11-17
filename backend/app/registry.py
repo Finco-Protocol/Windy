@@ -157,25 +157,27 @@ KRNOVO_ASSUMPTIONS: dict[str, str] = {
         "public references. Not survey-grade; one representative point is used for "
         "all model queries."
     ),
-    "capacity_mw": "74.10 MW = 26 × 2.85 MW (vlasnička ispravka 2026-11-17; fizički nameplate).",
+    "capacity_mw": "74.10 MW = 26 × 2.85 MW (vlasnička ispravka 2026-11-17; fizički nameplate). Za POSTOJEĆU instalaciju vrijedi samo nakon eksplicitne config-revizije — seed ne mijenja već konfigurirane siteove.",
     "turbine_model": (
         "GE 2.85-116 klasa (26 jedinica) prema vlasničkoj ispravci 2026-11-17. "
         "Krivulja je referentna (NE kalibrirana) i koristi skaliranje — oznaka "
         "REFERENCE/UNVERIFIED ostaje vidljiva."
     ),
     "hub_height_m": (
-        "90 m PROVISIONAL, editable setting. Publicly reported hub height for the "
-        "90 m prema postojećoj dokumentaciji; referentna krivulja — provjeriti "
-        "protiv as-built zapisa."
+        "90 m PROVISIONAL (editable setting). Publicly reported reference value; "
+        "no as-built confirmation is available. Verify against project documentation "
+        "before treating MWh as calibrated."
     ),
     "loss_factor": (
         "0.0 by default — no calibrated wake/availability/electrical loss value is "
         "available. Editable per asset."
     ),
     "power_curve": (
-        "GE103/2750 manufacturer-class curve from the windpowerlib bundled turbine "
-        "database (OEDB snapshot). Uncalibrated for the site: modelled MWh are "
-        "REFERENCE values, not verified Krnovo production forecasts."
+        "GE103/2750 manufacturer-class curve (OEDB snapshot, peak 2.78 MW) from the "
+        "windpowerlib bundled turbine database, explicitly SCALED to the 2.85 MW unit "
+        "rating via owner opt-in (scaled-reference). This is NOT a verified as-built "
+        "GE 2.85-116 power curve — no such curve is available free of charge. All "
+        "modelled MWh remain REFERENCE/UNVERIFIED until calibrated against actuals."
     ),
     "timezone": "Europe/Podgorica (CET/CEST) used for local-time display and CSV import defaults.",
 }
@@ -189,7 +191,7 @@ KRNOVO_ASSET: dict = {
     "longitude": 19.1106,
     "capacity_mw": 74.1,
     "turbine_count": 26,
-    "turbine_model": "GE 2.85-116 klasa (provisional)",
+    "turbine_model": "GE-klasa 2,85 MW (provisional) — krivulja je referentna (ge103-2750 scaled), NIJE as-built 2.85-116",
     "turbine_rated_mw": 2.85,
     "hub_height_m": 90.0,
     "loss_factor": 0.0,

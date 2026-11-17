@@ -43,6 +43,12 @@ from .config import Settings
 from .openmeteo import OMError, OpenMeteoClient
 from .registry import SOURCE_PROVIDER, WINDY_MODELS
 from .scheduler import start_scheduler
+from .siteconfig import (
+    apply_config_revision as siteconfig_apply,
+    get_locations,
+    list_config_revisions,
+    set_locations_revision,
+)
 
 log = logging.getLogger("windy")
 
@@ -180,6 +186,49 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     def constraints_delete(site_id: str, body: dict):
         store.load_site(settings.db_path, site_id)
         return availability_mod.delete_constraints(settings.db_path, site_id, (body or {}).get("ids") or [])
+
+    @app.post("/api/assets/{site_id}/constraints/replace-units")
+    def constraints_replace_units(site_id: str, body: dict):
+        """Correction A §4: ONE atomic revision per unit-state change — active
+        grouped constraints are split (unaffected members preserved), desired
+        states appended. No half-applied delete+add window."""
+        store.load_site(settings.db_path, site_id)
+        b = body or {}
+        return availability_mod.replace_unit_states(
+            settings.db_path,
+            site_id,
+            b.get("assignments") or [],
+            b.get("start_local") or availability_mod._now(),
+            b.get("end_local"),
+        )
+
+    @app.post("/api/assets/{site_id}/config-revision")
+    def config_revision_apply(site_id: str, body: dict):
+        """Correction A §2.1/§6: same-site, append-only configuration
+        revision (old values recorded, effective-from stamped). Archived
+        runs are never modified; restart never reseeds."""
+        store.load_site(settings.db_path, site_id)
+        b = body or {}
+        return siteconfig_apply(settings.db_path, site_id, b.get("changes") or {}, b.get("note"))
+
+    @app.get("/api/assets/{site_id}/config-revisions")
+    def config_revision_list(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        return list_config_revisions(settings.db_path, site_id)
+
+    @app.post("/api/assets/{site_id}/locations")
+    def locations_set(site_id: str, body: dict):
+        """Correction A §3: append-only per-turbine location revision. The
+        OWNER-SUPPLIED coordinate file is the only data source — no
+        coordinates are invented or seeded here."""
+        store.load_site(settings.db_path, site_id)
+        b = body or {}
+        return set_locations_revision(settings.db_path, site_id, b.get("records") or [], b.get("note"))
+
+    @app.get("/api/assets/{site_id}/locations")
+    def locations_get(site_id: str):
+        store.load_site(settings.db_path, site_id)
+        return get_locations(settings.db_path, site_id)
 
     @app.get("/api/assets/{site_id}/status")
     def availability_status(site_id: str):
@@ -768,6 +817,20 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         if with_availability:
 
             def _adjusted_daily_rows(sc_points: list[dict]) -> list[dict]:
+                """Site-local daily aggregation of ADJUSTED MW.
+
+                PR#8 Correction A (both P0 bugs fixed):
+                - Energy is dimensionally MW x HOURS: every interval
+                  contributes adjusted_mw * overlap_hours (a 3 h interval at
+                  10 MW = 30 MWh, split across the local days it overlaps) —
+                  never adjusted * (overlap / duration).
+                - The coverage-union merge and the return run ONCE, AFTER the
+                  whole points loop — the previous return sat inside the loop
+                  so only the FIRST forecast point ever reached a "daily" row.
+                Coverage is the UNION of adjusted intervals (duplicate hours
+                never count twice); a day covered only by null points keeps
+                hours_counted 0 (the UI renders it as no value, never 0 MWh).
+                """
                 daily_a: dict[str, dict] = {}
                 for p in sc_points:
                     st = parse_utc(p["valid_at_utc"])
@@ -797,33 +860,63 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                             },
                         )
                         if adjusted is not None:
-                            slot["mwh"] = round(slot["mwh"] + adjusted * (overlap / dur), 4)
-                            slot["hours_counted"] = round(slot["hours_counted"] + overlap, 6)
+                            slot["mwh"] = round(slot["mwh"] + adjusted * overlap, 4)  # MW x h = MWh
                             slot["_intervals"].append((seg_start, seg_end))
                         else:
                             slot["hours_missing"] = round(slot["hours_missing"] + overlap, 6)
                         remaining -= overlap
                         cursor = seg_end
-                    for slot in daily_a.values():
-                        intervals = slot.pop("_intervals", [])
-                        merged: list = []
-                        for st_i, en_i in sorted(intervals):
-                            if merged and st_i <= merged[-1][1] + timedelta(seconds=1):
-                                merged[-1] = (merged[-1][0], max(merged[-1][1], en_i))
-                            else:
-                                merged.append((st_i, en_i))
-                        union_h = round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3)
-                        slot["hours_counted"] = union_h
-                        slot["hours_missing"] = round(max(slot["hours_expected"] - union_h, 0.0), 3)
-                        slot["partial"] = union_h < slot["hours_expected"] - 1e-6
-                    return [daily_a[k] for k in sorted(daily_a)]
+                # AFTER the entire points loop: per-day union of adjusted
+                # intervals -> real covered hours, explicit missing hours
+                for slot in daily_a.values():
+                    intervals = slot.pop("_intervals", [])
+                    merged: list = []
+                    for st_i, en_i in sorted(intervals):
+                        if merged and st_i <= merged[-1][1] + timedelta(seconds=1):
+                            merged[-1] = (merged[-1][0], max(merged[-1][1], en_i))
+                        else:
+                            merged.append((st_i, en_i))
+                    union_h = round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3)
+                    slot["hours_counted"] = union_h
+                    slot["hours_missing"] = round(max(slot["hours_expected"] - union_h, 0.0), 3)
+                    slot["partial"] = union_h < slot["hours_expected"] - 1e-6
+                return [daily_a[k] for k in sorted(daily_a)]
 
             for entry in models_out:
                 if entry.get("run") is None:
                     entry["adjusted"] = {"available": False, "reason": "nema arhiviranog run-a za ovaj model"}
                     continue
+                if entry.get("met_only"):
+                    # Correction A 1.4: NEVER compute MWh from surface-only
+                    # wind (no invented shear) — adjusted stays unavailable
+                    # for met-only models in every UI mode
+                    entry["adjusted"] = {
+                        "available": False,
+                        "reason": "met-only model (samo 10 m vjetar) — bez MWh; usporedba vjetra, ne proizvodnja",
+                        "daily": [],
+                        "points": [],
+                    }
+                    continue
                 try:
                     sc = availability_mod.scenario_for_run(settings.db_path, site_id, entry["run"]["id"])
+                    # Correction A 2.2: a curve that is incompatible with the
+                    # units' nameplate (without explicit scaled-reference
+                    # opt-in) must FAIL CLEARLY — available stays false with
+                    # the dominant status in the reason, never silently null
+                    # points and never a baseline substitution
+                    _statuses = {p["status"] for p in sc["points"]}
+                    if sc["points"] and _statuses <= {"incompatible-curve", "missing-curve"}:
+                        entry["adjusted"] = {
+                            "available": False,
+                            "reason": (
+                                "krivulja nije kompatibilna s nazivnom snagom jedinica "
+                                "(potreban eksplicitni scaled-reference opt-in): "
+                                + ", ".join(sorted(_statuses))
+                            ),
+                            "daily": [],
+                            "points": [],
+                        }
+                        continue
                     entry["adjusted"] = {
                         "available": True,
                         "inventory_revision": sc["inventory_revision"],

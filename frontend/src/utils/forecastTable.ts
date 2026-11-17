@@ -156,3 +156,205 @@ export function rowAverage(values: Record<string, number | null>, ids: string[])
 export function productionModelIds(models: { model_id: string; met_only: boolean; run: unknown }[]): string[] {
   return models.filter((m) => m.run !== null && !m.met_only).map((m) => m.model_id);
 }
+
+/** PR#8 Correction A §5 — hourly-aligned ENSEMBLE average.
+ *
+ * For every elementary time segment (interval boundaries ∩ local-day
+ * boundaries) the average MW across the SELECTED models that cover the whole
+ * segment is computed; energy = avgMW × segment_hours is allocated to the
+ * site-local day containing the segment start (real 23/24/25 h DST days).
+ * This makes the daily Average the genuine mean production estimate at each
+ * instant — never an average of period totals, never averaging wind speeds,
+ * never zero-filling hours no selected model covers. Per-day contributor
+ * min/max make changing model coverage explicit. */
+export interface EnsembleInput {
+  model_id: string;
+  points: { valid_at_utc: string; mw: number | null; interval_hours: number }[];
+}
+
+export interface EnsembleDailyRow {
+  date: string;
+  mwh: number;
+  hours_counted: number;
+  hours_missing: number;
+  hours_expected: number;
+  partial: boolean;
+  contributors_min: number;
+  contributors_max: number;
+}
+
+const DAY_FMT_CACHE = new Map<string, Intl.DateTimeFormat>();
+function dayFmt(tz: string): Intl.DateTimeFormat {
+  let f = DAY_FMT_CACHE.get(tz);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" });
+    DAY_FMT_CACHE.set(tz, f);
+  }
+  return f;
+}
+
+/** [startMs, endMs) of the LOCAL calendar day `date` in tz. Binary-searched
+ * against formatted local dates, so real 23/24/25 h DST days come out exact. */
+function localDayBounds(date: string, fmt: Intl.DateTimeFormat): [number, number] {
+  const probe = Date.parse(`${date}T12:00:00Z`);
+  if (Number.isNaN(probe)) return [NaN, NaN];
+  const start = (() => {
+    let lo = probe - 40 * 3_600_000;
+    let hi = probe + 2 * 3_600_000;
+    while (hi - lo > 1000) {
+      const mid = Math.round((lo + hi) / 2);
+      if (fmt.format(new Date(mid)) >= date) hi = mid;
+      else lo = mid;
+    }
+    return hi;
+  })();
+  const end = (() => {
+    let lo = start + 20 * 3_600_000;
+    let hi = start + 32 * 3_600_000;
+    while (hi - lo > 1000) {
+      const mid = Math.round((lo + hi) / 2);
+      if (fmt.format(new Date(mid)) > date) hi = mid;
+      else lo = mid;
+    }
+    return hi;
+  })();
+  return [start, end];
+}
+
+export function buildEnsembleDaily(inputs: EnsembleInput[], tz: string): EnsembleDailyRow[] {
+  const fmt = dayFmt(tz);
+  const boundaries = new Set<number>();
+  const perModel: { intervals: { s: number; e: number; mw: number }[] }[] = [];
+  for (const inp of inputs) {
+    const intervals: { s: number; e: number; mw: number }[] = [];
+    for (const p of inp.points) {
+      if (p.mw === null || p.mw === undefined) continue;
+      const s = Date.parse(p.valid_at_utc);
+      if (Number.isNaN(s)) continue;
+      const e = s + Math.max(p.interval_hours, 0.001) * 3_600_000;
+      intervals.push({ s, e, mw: p.mw });
+      boundaries.add(s);
+      boundaries.add(e);
+    }
+    if (intervals.length) perModel.push({ intervals });
+  }
+  if (perModel.length === 0) return [];
+
+  const bts = [...boundaries].sort((a, b) => a - b);
+  const daily = new Map<string, EnsembleDailyRow & { _segs: { s: number; e: number }[] }>();
+  for (let i = 0; i < bts.length - 1; i++) {
+    const s = bts[i]!;
+    const e = bts[i + 1]!;
+    const contributors: number[] = [];
+    for (const pm of perModel) {
+      const hit = pm.intervals.find((iv) => iv.s <= s && e <= iv.e);
+      if (hit !== undefined) contributors.push(hit.mw);
+    }
+    if (contributors.length === 0) continue; // an hour no selected model covers stays missing
+    const avgMw = contributors.reduce((a, c) => a + c, 0) / contributors.length;
+    let cur = s;
+    while (cur < e - 1) {
+      const date = fmt.format(new Date(cur));
+      const row = daily.get(date) ?? {
+        date,
+        mwh: 0,
+        hours_counted: 0,
+        hours_missing: 0,
+        hours_expected: 0,
+        partial: false,
+        contributors_min: contributors.length,
+        contributors_max: contributors.length,
+        _segs: [],
+      };
+      const [dStart, dEnd] = localDayBounds(date, fmt);
+      let segEnd = Math.min(e, dEnd);
+      // the day boundary is searched to ~1 s; snap it to the exact interval
+      // edge when they coincide so energy sums stay exact (never 10.05 MWh)
+      if (Math.abs(segEnd - e) <= 120_000) segEnd = e;
+      const hours = (segEnd - cur) / 3_600_000;
+      if (hours > 0) {
+        row.mwh = round2(row.mwh + avgMw * hours);
+        row._segs.push({ s: cur, e: segEnd });
+        row.contributors_min = Math.min(row.contributors_min, contributors.length);
+        row.contributors_max = Math.max(row.contributors_max, contributors.length);
+        row.hours_expected = Math.round(Math.max(row.hours_expected, (dEnd - dStart) / 3_600_000) * 1000) / 1000;
+        daily.set(date, row);
+      }
+      cur = segEnd > cur ? segEnd : e;
+    }
+  }
+  const out: EnsembleDailyRow[] = [];
+  for (const row of [...daily.values()].sort((a, b) => (a.date < b.date ? -1 : 1))) {
+    const merged: { s: number; e: number }[] = [];
+    for (const seg of row._segs.sort((a, b) => a.s - b.s)) {
+      const last = merged[merged.length - 1];
+      if (last && seg.s <= last.e + 1) last.e = Math.max(last.e, seg.e);
+      else merged.push({ ...seg });
+    }
+    const unionH = merged.reduce((acc, m) => acc + (m.e - m.s) / 3_600_000, 0);
+    row.hours_counted = round2(unionH);
+    row.hours_missing = round2(Math.max(row.hours_expected - unionH, 0));
+    row.partial = unionH < row.hours_expected - 1e-6;
+    delete (row as unknown as Record<string, unknown>)._segs;
+    out.push(row);
+  }
+  return out;
+}
+
+function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** PR#8 Correction A §5 — show EXACTLY `days` local calendar dates, anchored
+ * at today in the site timezone (never an accidental N+1-th date from a UTC
+ * horizon cut). If no row is on/after today, the LAST `days` rows are shown.
+ * 7/10/15 totals must equal the sum of the DISPLAYED rows. */
+export function visibleDailyRows<T extends { date: string }>(rows: T[], days: number, tz: string, nowUtc?: string): T[] {
+  if (rows.length <= days) return rows;
+  const today = dayFmt(tz).format(nowUtc ? new Date(nowUtc) : new Date());
+  const idx = rows.findIndex((r) => r.date >= today);
+  const start = idx === -1 ? rows.length - days : idx;
+  return rows.slice(start, start + days);
+}
+
+/** Average display preference, persisted PER SITE (Correction A §5): an
+ * on/off toggle plus the selected contributor model set. localStorage is the
+ * single-user persistence; the backend remains authoritative for numbers. */
+export interface AvgPreference {
+  enabled: boolean;
+  models: string[];
+}
+
+// localStorage when available (browser); in-memory fallback elsewhere
+// (tests, SSR) so the preference always round-trips within a process
+const memStore = new Map<string, string>();
+function prefStorage(): { getItem: (k: string) => string | null; setItem: (k: string, v: string) => void } {
+  try {
+    if (typeof localStorage !== "undefined") return localStorage;
+  } catch {
+    /* unreachable in browsers; node throws on the binding itself */
+  }
+  return { getItem: (k) => memStore.get(k) ?? null, setItem: (k, v) => void memStore.set(k, v) };
+}
+
+export function loadAvgPreference(siteId: string, productionIds: string[]): AvgPreference {
+  try {
+    const raw = prefStorage().getItem(`windy.avg.${siteId}`);
+    if (raw) {
+      const parsed = JSON.parse(raw) as AvgPreference;
+      const models = Array.isArray(parsed.models) ? parsed.models.filter((m) => productionIds.includes(m)) : [];
+      return { enabled: !!parsed.enabled, models: models.length ? models : [...productionIds] };
+    }
+  } catch {
+    /* corrupted preference falls through to the default */
+  }
+  return { enabled: true, models: [...productionIds] };
+}
+
+export function saveAvgPreference(siteId: string, pref: AvgPreference): void {
+  try {
+    prefStorage().setItem(`windy.avg.${siteId}`, JSON.stringify(pref));
+  } catch {
+    /* storage blocked — persistence is best-effort, UI still works */
+  }
+}

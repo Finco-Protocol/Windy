@@ -476,6 +476,57 @@ export interface ScenarioRevision {
   summary: { installed_mw?: number; curve_mode?: string; windows?: Record<string, ScenarioWindow> };
 }
 
+export interface ConfigRevision {
+  id: number;
+  revision: number;
+  changes: Record<string, { from: unknown; to: unknown }>;
+  effective_from_utc: string;
+  note: string | null;
+  created_at_utc: string;
+  created_by: string;
+}
+
+export interface ConfigRevisionsResponse {
+  site_id: string;
+  current_revision: number;
+  revisions: ConfigRevision[];
+}
+
+export interface ConfigRevisionApplyResponse {
+  site_id: string;
+  revision: number;
+  changes: Record<string, { from: unknown; to: unknown }>;
+  effective_from_utc: string;
+  note: string | null;
+  inventory_revision: number | null;
+  site: WindySite;
+}
+
+export interface TurbineLocation {
+  unit_id: string;
+  latitude: number;
+  longitude: number;
+  elevation_m: number | null;
+  source: string;
+  created_at_utc: string;
+}
+
+export interface LocationsResponse {
+  site_id: string;
+  revision: number;
+  n_locations: number;
+  locations: TurbineLocation[];
+  revision_history: { revision: number; n_records: number; created_at_utc: string | null }[];
+  note: string | null;
+}
+
+export interface UnitAssignment {
+  unit_id: string;
+  state: "on" | "off" | "cap";
+  cap_mw?: number;
+  cap_percent?: number; // percent OF RATED ALLOWED (backend semantics)
+}
+
 export interface CalibrationEntry {
   model_id: string;
   factor: number;
@@ -648,6 +699,19 @@ export const windyApi = {
     postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[] }>(`/assets/${encodeURIComponent(siteId)}/constraints/delete`, { ids }),
   operatingStatus: (siteId: string, signal?: AbortSignal) =>
     getJson<SiteOperatingStatus>(`/assets/${encodeURIComponent(siteId)}/status`, signal),
+  constraintsReplaceUnits: (siteId: string, body: { assignments: UnitAssignment[]; start_local: string; end_local?: string | null }) =>
+    postJson<{ site_id: string; revision: number; constraints: OperationalConstraint[]; warnings: string[] }>(
+      `/assets/${encodeURIComponent(siteId)}/constraints/replace-units`,
+      body,
+    ),
+  configRevisionApply: (siteId: string, body: { changes: Record<string, unknown>; note?: string }) =>
+    postJson<ConfigRevisionApplyResponse>(`/assets/${encodeURIComponent(siteId)}/config-revision`, body),
+  configRevisions: (siteId: string, signal?: AbortSignal) =>
+    getJson<ConfigRevisionsResponse>(`/assets/${encodeURIComponent(siteId)}/config-revisions`, signal),
+  locationsSet: (siteId: string, body: { records: { unit_id: string; latitude: number; longitude: number; elevation_m?: number | null; source?: string }[]; note?: string }) =>
+    postJson<LocationsResponse>(`/assets/${encodeURIComponent(siteId)}/locations`, body),
+  locations: (siteId: string, signal?: AbortSignal) =>
+    getJson<LocationsResponse>(`/assets/${encodeURIComponent(siteId)}/locations`, signal),
   scenario: (siteId: string, runId: number, signal?: AbortSignal) =>
     getJson<ScenarioResponse>(`/assets/${encodeURIComponent(siteId)}/scenario?run_id=${runId}`, signal),
   scenarioPinned: (siteId: string, runId: number, revisions: { inventory_revision: number; constraints_revision: number } | null, signal?: AbortSignal) => {
