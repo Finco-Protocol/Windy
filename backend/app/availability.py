@@ -416,7 +416,28 @@ def delete_constraints(db_path, site_id: str, ids: list[int]) -> dict:
     return get_constraints(db_path, site_id, rev)
 
 
-def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_local: str, end_local: str | None = None) -> dict:
+class RevisionConflict(AvailabilityError):
+    """Raised when the caller's expected constraints revision no longer
+    matches the current one (lost-update guard, Correction E §1)."""
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(f"revision conflict: expected {expected}, current {current}")
+        self.expected = expected
+        self.current = current
+
+
+def replace_unit_states(
+    db_path,
+    site_id: str,
+    assignments: list[dict],
+    start_local: str,
+    end_local: str | None = None,
+    expected_revision: int | None = None,
+) -> dict:
+    """... expected_revision: optimistic lost-update guard (Correction E §1).
+    When provided and != current constraints revision, raises RevisionConflict
+    (HTTP 409) so the client refetches and retries instead of silently
+    overwriting another mutation."""
     """ONE atomic revision that sets the desired per-unit state (Correction A §4):
 
     - every ACTIVE constraint loses the assigned units' membership; grouped
@@ -472,6 +493,10 @@ def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_lo
                 rec["cap_percent"] = pct
         desired[unit] = rec
 
+    if expected_revision is not None:
+        current = current_constraints_revision(db_path, site_id)
+        if current != int(expected_revision):
+            raise RevisionConflict(int(expected_revision), current)
     now = _now()
     rev = current_constraints_revision(db_path, site_id) + 1
     assigned = set(desired)

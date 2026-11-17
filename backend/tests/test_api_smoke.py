@@ -27,7 +27,7 @@ def test_site_shows_assumption_provenance(client):
     ids = [m["id"] for m in site["models"]]
     assert ids == [
         "ecmwf_ifs", "gfs_seamless", "icon_global", "icon_eu",
-        "meteofrance_arpege_world", "gem_seamless", "ukmo_seamless",
+        "meteofrance_arpege_world", "meteofrance_arpege_europe", "gem_seamless", "ukmo_seamless",
     ]
     ukmo = next(m for m in site["models"] if m["id"] == "ukmo_seamless")
     assert "MET_ONLY" in ukmo["note"]

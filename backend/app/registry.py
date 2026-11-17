@@ -36,8 +36,8 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         id="ecmwf_ifs",
         provider="ECMWF",
         label="ECMWF IFS HRES",
-        max_lead_hours=240,
-        request_days=10,
+        max_lead_hours=360,
+        request_days=15,
         speed_heights=(100,),
         direction_heights=(100,),
         height_method=HEIGHT_METHOD_PROXY,
@@ -45,7 +45,8 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         note=(
             "ECMWF IFS publishes 10 m and 100 m wind natively. The 100 m level is used "
             "directly as a PROXY for the 90 m hub (+10 m above hub) — no interpolation "
-            "from 10 m surface wind."
+            "from 10 m surface wind. 15-day horizon CONFIRMED live at Krnovo "
+            "2026-11-18: 360/360 non-null 100 m values through day 15."
         ),
     ),
     ModelSpec(
@@ -95,16 +96,35 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         id="meteofrance_arpege_world",
         provider="Météo-France",
-        label="ARPEGE Europe",
+        label="ARPEGE World (0.25°)",
         max_lead_hours=96,
         request_days=4,
         speed_heights=(80, 100),
         direction_heights=(100,),
         height_method=HEIGHT_METHOD_LOG_INTERP,
         note=(
-            "ARPEGE Europe publishes 80 m and 100 m wind (probe 2026-11-17: all "
-            "levels non-null at Krnovo); 90 m hub is log-height interpolated "
+            "ARPEGE WORLD (~25 km global) — the id meteofrance_arpege_world "
+            "returns 80/100 m wind at Krnovo (probe 2026-11-17). Label corrected "
+            "2026-11-18: this is NOT the higher-resolution ARPEGE Europe (~11 km), "
+            "which is registered separately. 90 m hub is log-height interpolated "
             "between 80 and 100 m. Horizon ~4 days."
+        ),
+    ),
+    ModelSpec(
+        id="meteofrance_arpege_europe",
+        provider="Météo-France",
+        label="ARPEGE Europe (0.11°)",
+        max_lead_hours=96,
+        request_days=4,
+        speed_heights=(80, 100),
+        direction_heights=(100,),
+        height_method=HEIGHT_METHOD_LOG_INTERP,
+        note=(
+            "ARPEGE EUROPE (~11 km) — separate id meteofrance_arpege_europe, "
+            "CONFIRMED live at Krnovo 2026-11-18: 80 m and 100 m wind fully "
+            "populated (96/96 h). Registered as its OWN model — never silently "
+            "merged with the World run or double-counted in Average. 90 m hub "
+            "is log-height interpolated between 80 and 100 m. Horizon ~4 days."
         ),
     ),
     ModelSpec(
@@ -113,13 +133,17 @@ WINDY_MODELS: tuple[ModelSpec, ...] = (
         label="GEM Global",
         max_lead_hours=240,
         request_days=10,
-        speed_heights=(100,),
-        direction_heights=(100,),
-        height_method=HEIGHT_METHOD_PROXY,
+        speed_heights=(80, 120),
+        direction_heights=(120,),
+        height_method=HEIGHT_METHOD_LOG_INTERP,
         note=(
-            "GEM publishes 10 m, 100 m and 120 m wind (probe 2026-11-17: 80 m is "
-            "null); the native 100 m level is used directly as a PROXY for the "
-            "90 m hub (+10 m above hub). Horizon ~10 days."
+            "GEM probe 2026-11-18 at Krnovo: 80 m and 120 m wind are fully "
+            "populated (240/240 h across the 10-day horizon), while the 100 m "
+            "level returns ALL NULL on every GEM id variant and the /v1/gem "
+            "endpoint — so the 90 m hub is log-height interpolated between "
+            "80 and 120 m (same policy as ICON). Earlier runs that requested "
+            "the null 100 m level are archived with missing-height statuses "
+            "and are never rewritten. Horizon ~10 days."
         ),
     ),
     ModelSpec(

@@ -151,6 +151,32 @@ export interface WindNowModel {
   run_issued_utc?: string | null;
 }
 
+export type WeatherIcon = "sun" | "moon" | "partly_day" | "partly_night" | "cloud" | "fog" | "drizzle" | "rain" | "sleet" | "snow" | "thunder" | "unknown";
+
+export interface WeatherNowResponse {
+  site_id: string;
+  source_provider: string;
+  source_model: string;
+  weather_code: number | null;
+  condition: string;
+  icon: WeatherIcon;
+  temperature_2m_c: number | null;
+  is_day: boolean | null;
+  valid_at_utc: string | null;
+  fetched_at_utc: string;
+  stale: boolean;
+  status: "ok" | "partial" | "unavailable";
+  reason?: string | null;
+  age_minutes?: number | null;
+  cloud_cover_percent?: number | null;
+  precipitation_mm?: number | null;
+  rain_mm?: number | null;
+  showers_mm?: number | null;
+  snowfall_cm?: number | null;
+  note: string;
+  cache?: { cached: boolean; age_s: number };
+}
+
 export interface WindNowResponse {
   site_id: string;
   modeled: true;
@@ -636,6 +662,10 @@ export const windyApi = {
     ),
   windNow: (siteId: string, signal?: AbortSignal) =>
     getJson<WindNowResponse>(`/assets/${encodeURIComponent(siteId)}/wind-now`, signal),
+  weatherNow: (siteId: string, signal?: AbortSignal) =>
+    getJson<WeatherNowResponse>(`/assets/${encodeURIComponent(siteId)}/weather-now`, signal),
+  forecastExportUrl: (siteId: string, days: number, mode: string, unit: string, avgModels: string[]): string =>
+    `/assets/${encodeURIComponent(siteId)}/forecast-export.xlsx?days=${days}&mode=${encodeURIComponent(mode)}&unit=${encodeURIComponent(unit)}&avg_models=${encodeURIComponent(avgModels.join(","))}`,
   collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
   runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
     getJson<{ runs: RunSummary[] }>(

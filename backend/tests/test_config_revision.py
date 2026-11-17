@@ -578,3 +578,27 @@ def test_replace_units_atomic_split_grouped_constraints(client):
     vals = [p["adjusted_mw"] for p in m["adjusted"]["points"] if p["adjusted_mw"] is not None]
     # 23 x 2.75 (WTG-002 off) + 1.0 (WTG-003) + 2.0 (WTG-004) = 66.75
     assert max(vals) == pytest.approx(23 * 2.75 + 1.0 + 2.0, abs=1e-3)
+
+
+def test_expected_revision_guard_409_on_stale(client):
+    """Correction E §1: optimistic lost-update guard — a stale expected_revision
+    is rejected with 409 + current revision, and NO mutation happens."""
+    api, fake, _s = client
+    api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})
+    r0 = api.get("/api/assets/krnovo/constraints").json()
+    stale = r0["revision"]
+    # create a newer revision so 'stale' is behind
+    api.post("/api/assets/krnovo/constraints", json={"rows": [{"kind": "offline", "unit_ids": ["WTG-002"], "start_local": "2026-11-12T00:00", "end_local": None}]})
+    r = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "off"}], "start_local": "2026-11-18T00:00", "expected_revision": stale},
+    )
+    assert r.status_code == 409, r.text
+    d = r.json()["detail"]
+    assert d["expected"] == stale and d["current_revision"] == stale + 1
+    # correct expected_revision succeeds
+    r2 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "off"}], "start_local": "2026-11-18T00:00", "expected_revision": stale + 1},
+    )
+    assert r2.status_code == 200

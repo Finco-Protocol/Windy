@@ -47,6 +47,18 @@ class FakeOMClient:
         self.om_error_runs: set[tuple[str, str]] = set()
         self.gates: dict[tuple[str, str], "threading.Event"] = {}
         self.requests: list[tuple[str, str]] = []
+        # Correction E Addendum C: scripted /v1/forecast  weather
+        self.current_payload: dict = {
+            "current": {"time": "2026-11-18T05:30", "temperature_2m": 6.7, "weather_code": 61, "is_day": 1, "cloud_cover": 100, "precipitation": 0.5, "rain": 0.5, "showers": 0.0, "snowfall": 0.0}
+        }
+        self.current_error: Exception | None = None
+        self.current_calls: list[tuple[float, float]] = []
+
+    def fetch_current(self, lat: float, lon: float) -> dict:
+        self.current_calls.append((lat, lon))
+        if self.current_error is not None:
+            raise self.current_error
+        return self.current_payload
 
     def push_run(self, model_id: str, run_iso: str, raw: dict) -> None:
         self.runs.setdefault(model_id, []).append((run_iso, raw))
