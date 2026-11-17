@@ -198,7 +198,7 @@ def test_backfill_stores_archived_run(client):
     assert "UNAVAILABLE" in resp3.json()["detail"]
 
     # invalid run hour
-    assert api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-13", "run_hour": 5}).status_code == 400
+    assert api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-13", "run_hour": 99}).status_code == 400
 
 
 def test_compare_uses_issue_not_fetch_time(client):

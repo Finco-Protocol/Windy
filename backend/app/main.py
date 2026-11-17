@@ -560,20 +560,85 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     entry["warnings"].append("Historical comparison is not possible for this run (issue time unknown).")
 
                 # daily totals in the site's local timezone; coverage-aware
+                # Per-local-date aggregation in the SITE's IANA timezone with
+                # real day spans (23/24/25 h across DST). Each archived point
+                # owns the half-open UTC interval [valid_at, valid_at +
+                # interval_hours); its energy is allocated proportionately to
+                # every local day the interval overlaps (an interval crossing
+                # local midnight contributes to both days). Coverage per day is
+                # the merged union of valid intervals — duplicates never count
+                # twice; missing energy hours reduce coverage and flag the day
+                # partial. Metering (actuals) keeps its DST-aware handling.
                 daily: dict[str, dict] = {}
                 cum = 0.0
                 counted_any = False
+
+                def _day_span_utc(local_date: str) -> tuple[datetime, datetime, float]:
+                    d = datetime.strptime(local_date, "%Y-%m-%d")
+
+                    def midnight(day: datetime) -> datetime:
+                        return day.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz, fold=0)
+
+                    # subtract in UTC: aware datetimes sharing the same tzinfo
+                    # object do WALL-CLOCK arithmetic, which would report 24 h
+                    # for a 23 h spring day
+                    start_utc = midnight(d).astimezone(timezone.utc)
+                    end_utc = midnight(d + timedelta(days=1)).astimezone(timezone.utc)
+                    return start_utc, end_utc, (end_utc - start_utc).total_seconds() / 3600.0
+
                 for r in rows:
                     if r["interval_energy_mwh"] is not None:
                         cum += r["interval_energy_mwh"]
                         counted_any = True
-                    local_date = parse_utc(r["valid_at_utc"]).astimezone(tz).strftime("%Y-%m-%d")
-                    slot = daily.setdefault(local_date, {"date": local_date, "mwh": 0.0, "hours_counted": 0, "hours_missing": 0})
-                    if r["interval_energy_mwh"] is not None:
-                        slot["mwh"] = round(slot["mwh"] + r["interval_energy_mwh"], 4)
-                        slot["hours_counted"] += 1
-                    else:
-                        slot["hours_missing"] += 1
+                    st = parse_utc(r["valid_at_utc"])
+                    dur = float(r["interval_hours"] or 1.0)
+                    en = st + timedelta(hours=dur)
+                    energy = r["interval_energy_mwh"]
+                    remaining = dur
+                    cursor = st
+                    # allocate the interval across local day(s) it overlaps
+                    while remaining > 1e-9:
+                        day_key = cursor.astimezone(tz).strftime("%Y-%m-%d")
+                        d_start, d_end, d_hours = _day_span_utc(day_key)
+                        seg_end = min(cursor + timedelta(hours=remaining), d_end)
+                        seg_start = max(cursor, d_start)
+                        overlap = (seg_end - seg_start).total_seconds() / 3600.0
+                        if overlap <= 0:
+                            cursor = d_end
+                            continue
+                        slot = daily.setdefault(
+                            day_key,
+                            {
+                                "date": day_key,
+                                "mwh": 0.0,
+                                "hours_counted": 0.0,
+                                "hours_missing": 0.0,
+                                "hours_expected": round(d_hours, 3),
+                                "partial": False,
+                                "_intervals": [],
+                            },
+                        )
+                        if energy is not None:
+                            slot["mwh"] = round(slot["mwh"] + energy * (overlap / dur), 4)
+                            slot["hours_counted"] = round(slot["hours_counted"] + overlap, 6)
+                            slot["_intervals"].append((seg_start, seg_end))
+                        else:
+                            slot["hours_missing"] = round(slot["hours_missing"] + overlap, 6)
+                        remaining -= overlap
+                        cursor = seg_end
+
+                for slot in daily.values():
+                    intervals = slot.pop("_intervals", [])
+                    merged: list = []
+                    for st_i, en_i in sorted(intervals):
+                        if merged and st_i <= merged[-1][1] + timedelta(seconds=1):
+                            merged[-1] = (merged[-1][0], max(merged[-1][1], en_i))
+                        else:
+                            merged.append((st_i, en_i))
+                    union_h = round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3)
+                    slot["hours_counted"] = union_h
+                    slot["hours_missing"] = round(max(slot["hours_expected"] - union_h, 0.0), 3)
+                    slot["partial"] = union_h < slot["hours_expected"] - 1e-6
                 entry["points"] = rows
                 entry["daily_local"] = list(daily.values())
                 entry["total_mwh_own_window"] = round(cum, 3) if counted_any else None

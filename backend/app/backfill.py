@@ -33,8 +33,8 @@ def run_backfill_one(
     except ValueError as exc:
         raise ValueError(f"invalid run stamp: {run_iso!r}") from exc
     spec = get_model(model_id)
-    if run_hour not in (0, 6, 12, 18):
-        raise ValueError("run_hour must be 0, 6, 12 or 18 (UTC run cycles)")
+    if not 0 <= run_hour <= 23:
+        raise ValueError("run_hour must be 0..23 (UTC)")
     try:
         datetime.strptime(date_part, "%Y-%m-%d")
     except ValueError as exc:
@@ -117,8 +117,8 @@ def run_backfill(
 ) -> dict:
     if not model_id or not run_date:
         raise ValueError("model_id and run_date (YYYY-MM-DD) are required")
-    if run_hour not in (0, 6, 12, 18):
-        raise ValueError("run_hour must be 0, 6, 12 or 18 (UTC run cycles)")
+    if not 0 <= run_hour <= 23:
+        raise ValueError("run_hour must be 0..23 (UTC)")
     return run_backfill_one(settings, model_id, f"{run_date}T{run_hour:02d}:00", days, client=client, site_id=site_id)
 
 

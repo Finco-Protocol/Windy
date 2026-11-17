@@ -7,30 +7,34 @@ import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SegmentedToggle from "@/components/SegmentedToggle.vue";
 import SiteSelector from "@/components/SiteSelector.vue";
 import StateBlock from "@/components/StateBlock.vue";
+import { buildDailyMatrix, buildHourlyRows, MODEL_LABELS_HR, type DailyRow } from "@/utils/forecastTable";
 import { modelColor, windyApi, type ForecastResponse, type ForecastModel, type SiteResponse } from "@/api/windy";
 import { useAbortableResource } from "@/composables/useAbortableResource";
 import { useActiveSite } from "@/composables/useActiveSite";
 
-// Screen A — Forecast. Everything shown here comes from the backend archive:
-// the same data Historical Runs stores, so the UI can never display something
-// that was not persisted with its provenance.
+// SCREEN 1 (P0): "Očekivana proizvodnja po danima" — dnevna tablica MWh po
+// modelu, CET fiksan dan (24 h), djelomični dani označeni. Zatim "Satni
+// detalji" 24/48 h. Grafikoni i metodologija su sekundarni (collapsed).
 
 const { siteId } = useActiveSite();
 const siteResource = useAbortableResource<SiteResponse>((signal) => windyApi.site(siteId.value, signal), () => [siteId.value]);
 const { data: siteData, loading: siteLoading, error: siteError } = siteResource;
 
-const DAYS_OPTIONS = [
-  { value: 7, label: "7 days" },
-  { value: 10, label: "10 days" },
+const HORIZON_OPTIONS = [
+  { value: 7, label: "7 dana" },
+  { value: 10, label: "10 dana" },
+  { value: 15, label: "15 dana" },
 ] as const;
-const days = ref<7 | 10>(7);
+const days = ref<7 | 10 | 15>(7);
 const fcResource = useAbortableResource<ForecastResponse>(
   (signal) => windyApi.forecast(days.value, siteId.value, signal),
   () => [days.value, siteId.value],
 );
 const { data: fcData, loading: fcLoading, error: fcError } = fcResource;
 
-// ---- collection -----------------------------------------------------------
+const modelsWithRun = computed<ForecastModel[]>(() => (fcData.value?.models ?? []).filter((m) => m.run !== null));
+const dailyRows = computed<DailyRow[]>(() => buildDailyMatrix(modelsWithRun.value));
+const modelColumns = computed(() => modelsWithRun.value.map((m) => ({ id: m.model_id, label: MODEL_LABELS_HR[m.model_id] ?? m.model_id })));
 
 const collecting = ref(false);
 const collectMessage = ref<string | null>(null);
@@ -42,8 +46,7 @@ async function fetchNow(): Promise<void> {
   collectMessage.value = null;
   try {
     const res = await windyApi.collect(days.value, siteId.value);
-    const parts = res.models.map((m) => `${m.model_id}: ${m.status}${m.run_issued_utc ? ` (${m.run_issued_utc})` : ""}`);
-    collectMessage.value = `Collected ${res.collected_at_utc} — ${parts.join(" · ")}`;
+    collectMessage.value = `Ažurirano ${res.collected_at_utc}`;
     await fcResource.refresh();
   } catch (e) {
     collectError.value = e instanceof Error ? e.message : String(e);
@@ -52,38 +55,38 @@ async function fetchNow(): Promise<void> {
   }
 }
 
-// ---- chart data -----------------------------------------------------------
+// ---- satni detalji (24/48) -------------------------------------------------
 
-const withRun = computed<ForecastModel[]>(() => (fcData.value?.models ?? []).filter((m) => m.run !== null));
+const HOURS_OPTIONS = [
+  { value: 24, label: "24 h" },
+  { value: 48, label: "48 h" },
+] as const;
+const hourlyHours = ref<24 | 48>(24);
+const hourlyModel = ref<string>("ecmwf_ifs");
 
-function seriesOf(model: ForecastModel, key: "wind_speed_mps" | "modeled_power_mw"): [string, number | null][] {
-  return model.points.map((p) => [p.valid_at_utc, p[key]]);
-}
-
-const unionDates = computed<string[]>(() => {
-  const set = new Set<string>();
-  for (const m of withRun.value) for (const d of m.daily_local) set.add(d.date);
-  return [...set].sort();
+const hourlyResource = useAbortableResource<ForecastModel | null>(
+  async () => {
+    if (!fcData.value) return null;
+    return fcData.value.models.find((m) => m.model_id === hourlyModel.value && m.run !== null) ?? null;
+  },
+  () => [hourlyModel.value, hourlyHours.value, fcData.value],
+);
+const hourlyRows = computed(() => {
+  const m = hourlyResource.data.value;
+  if (!m) return [];
+  // shared as-of anchor across models: generation time rounded up to the next
+  // full hour — the window is the NEXT 24/48 h, never hours from the past
+  const anchor = fcData.value?.generated_at_utc ?? new Date().toISOString();
+  return buildHourlyRows(m.points, anchor, hourlyHours.value, siteData.value?.site.timezone ?? "Europe/Podgorica");
 });
 
-function cumulative(model: ForecastModel): [string, number | null][] {
-  // Cumulative over COMPUTED hours only. After a missing-energy point the
-  // trajectory becomes null (line breaks) — a flat carried-forward line would
-  // silently present a continuous full forecast across missing data.
-  let acc = 0;
-  let broken = false;
-  return model.points.map((p) => {
-    if (p.interval_energy_mwh === null) broken = true;
-    else acc += p.interval_energy_mwh;
-    return [p.valid_at_utc, broken ? null : Math.round(acc * 1000) / 1000] as [string, number | null];
-  });
-}
+// ---- charts (secondary, collapsed) -----------------------------------------
 
 const axisLabel = { color: "#93896f", fontSize: 10, fontFamily: "JetBrains Mono, monospace" };
 const splitLine = { lineStyle: { color: "#1a2638" } };
 
 interface BaseOption {
-  [key: string]: unknown; // EChartsOption wants an index signature
+  [key: string]: unknown;
   backgroundColor: string;
   grid: Record<string, unknown>;
   tooltip: Record<string, unknown>;
@@ -116,13 +119,19 @@ function baseOption(yName: string, minInterval = 3600_000): BaseOption {
   };
 }
 
+const withRun = computed<ForecastModel[]>(() => (fcData.value?.models ?? []).filter((m) => m.run !== null));
+
+function seriesOf(model: ForecastModel, key: "wind_speed_mps" | "modeled_power_mw"): [string, number | null][] {
+  return model.points.map((p) => [p.valid_at_utc, p[key]]);
+}
+
 const windOption = computed<BaseOption>(() => ({
   ...baseOption("m/s"),
   series: withRun.value.map((m) => ({
     name: m.label,
     type: "line",
     showSymbol: false,
-    connectNulls: false, // missing levels stay gaps — never bridged or zero-filled
+    connectNulls: false,
     data: seriesOf(m, "wind_speed_mps"),
     lineStyle: { width: 1.4, color: modelColor(m.model_id) },
     itemStyle: { color: modelColor(m.model_id) },
@@ -139,57 +148,20 @@ const powerOption = computed<BaseOption>(() => ({
     data: seriesOf(m, "modeled_power_mw"),
     lineStyle: { width: 1.4, color: modelColor(m.model_id) },
     itemStyle: { color: modelColor(m.model_id) },
-    areaStyle: { opacity: 0.08, color: modelColor(m.model_id) },
   })),
 }));
 
-const dailyOption = computed<BaseOption>(() => {
-  const base = baseOption("MWh/day", undefined);
-  return {
-    ...base,
-    xAxis: {
-      ...base.xAxis,
-      type: "category",
-      data: unionDates.value,
-      axisLabel: { ...axisLabel, formatter: (v: string) => v.slice(5) },
-    },
-    series: withRun.value.map((m) => {
-      const byDate = new Map(m.daily_local.map((d) => [d.date, d.mwh]));
-      return {
-        name: m.label,
-        type: "bar",
-        barMaxWidth: 14,
-        data: unionDates.value.map((d) => byDate.get(d) ?? null), // shorter horizons get no bar, not zero
-        itemStyle: { color: modelColor(m.model_id) },
-      };
-    }),
-  };
+const freshness = computed(() => {
+  const runs = modelsWithRun.value.map((m) => m.run?.fetched_at_utc ?? "").filter(Boolean);
+  return runs.length ? runs.sort().at(-1) : null;
 });
-
-const cumulativeOption = computed<BaseOption>(() => ({
-  ...baseOption("MWh (cumulative, own window)"),
-  series: withRun.value.map((m) => ({
-    name: m.label,
-    type: "line",
-    showSymbol: false,
-    connectNulls: false,
-    data: cumulative(m),
-    lineStyle: { width: 1.4, color: modelColor(m.model_id) },
-    itemStyle: { color: modelColor(m.model_id) },
-  })),
-}));
-
-const curveUncalibrated = computed(() => fcData.value?.power_curve.status !== "manufacturer-reference");
 </script>
 
 <template>
   <div class="flex min-h-screen flex-col">
-    <main class="mx-auto w-full max-w-5xl flex-1 space-y-3 px-4 py-3 sm:space-y-6 sm:px-6 sm:py-6">
-      <StateBlock v-if="siteError" kind="error">
-        Backend unreachable — start it with <code>uvicorn app.main:app</code> (see README). {{ siteError }}
-      </StateBlock>
-
-      <StateBlock v-else-if="siteLoading" kind="loading" caption="Connecting to Windy backend…" />
+    <main class="mx-auto w-full max-w-5xl flex-1 space-y-3 px-4 py-3 sm:space-y-5 sm:px-6 sm:py-6">
+      <StateBlock v-if="siteError" kind="error">Backend nedostupan — pokrenite ga s <code>uvicorn app.main:app</code>. {{ siteError }}</StateBlock>
+      <StateBlock v-else-if="siteLoading" kind="loading" caption="Spajanje na Windy backend…" />
 
       <template v-else-if="siteData">
         <div class="flex flex-wrap items-center justify-between gap-3">
@@ -197,110 +169,129 @@ const curveUncalibrated = computed(() => fcData.value?.power_curve.status !== "m
             <SiteSelector />
             <div>
               <h1 class="text-paper-50 font-mono text-lg tracking-wide">{{ siteData.site.name }}</h1>
-              <p class="text-paper-300 font-mono text-[11px]">
-                {{ siteData.site.capacity_mw }} MW · {{ siteData.site.turbine_count }} × {{ siteData.site.turbine_rated_mw }} MW · hub {{ siteData.site.hub_height_m }} m (provisional)
-              </p>
+              <p class="text-paper-300 font-mono text-[11px]">{{ siteData.site.capacity_mw }} MW · {{ siteData.site.turbine_count }} × {{ siteData.site.turbine_rated_mw }} MW</p>
             </div>
           </div>
           <div class="flex items-center gap-3">
-            <SegmentedToggle v-model="days" :options="DAYS_OPTIONS" inline divided />
+            <SegmentedToggle v-model="days" :options="[...HORIZON_OPTIONS]" inline divided />
             <button
               type="button"
-              class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 disabled:opacity-50 border px-3 py-1 font-mono text-[11px] tracking-wide transition-colors"
+              class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 disabled:opacity-50 border px-3 py-1 font-mono text-[11px]"
               :disabled="collecting"
               @click="fetchNow"
-            >
-              {{ collecting ? "Fetching…" : "Fetch now" }}
-            </button>
+            >{{ collecting ? "Dohvaćam…" : "Osvježi" }}</button>
           </div>
         </div>
 
-        <p class="text-paper-400 font-mono text-[10px] leading-relaxed">{{ siteData.source_note }}</p>
+        <p v-if="freshness" class="text-paper-400 font-mono text-[10px]">
+          Podaci zadnje preuzeti: <span class="text-paper-100">{{ freshness }}</span> (UTC) · vremena po satima prikazana u CET
+        </p>
 
-        <StateBlock v-if="collectError" kind="error">Fetch failed: {{ collectError }}</StateBlock>
-        <p v-if="collectMessage" class="text-sodium-200 font-mono text-[10px] leading-relaxed">{{ collectMessage }}</p>
-
+        <StateBlock v-if="collectError" kind="error">Dohvat nije uspio: {{ collectError }}</StateBlock>
         <StateBlock v-if="fcError" kind="error">{{ fcError }}</StateBlock>
-        <StateBlock v-else-if="fcLoading && !fcData" kind="loading" caption="Loading archived forecasts…" />
+        <StateBlock v-else-if="fcLoading && !fcData" kind="loading" caption="Učitavam arhivirane prognoze…" />
 
         <template v-if="fcData">
-          <!-- per-model status chips: source, issue time, height policy, coverage -->
-          <div class="grid gap-2 sm:grid-cols-2">
-            <div
-              v-for="m in fcData.models"
-              :key="m.model_id"
-              class="border-ink-700 bg-ink-900/40 space-y-1 border p-3 font-mono text-[10px] leading-relaxed"
-            >
-              <div class="flex items-center justify-between gap-2">
-                <span class="flex items-center gap-1.5">
-                  <span class="inline-block size-2" :style="{ background: modelColor(m.model_id) }" />
-                  <span class="text-paper-50">{{ m.label }}</span>
-                  <span class="text-paper-400">· {{ m.provider }} via Open-Meteo</span>
-                </span>
-                <span class="border-ink-700 text-paper-300 border px-1.5 py-0.5">{{ m.height_method }}</span>
-              </div>
-              <template v-if="m.run">
-                <p class="text-paper-300">
-                  issued <span class="text-paper-50">{{ m.run.run_issued_utc ?? "UNKNOWN" }}</span>
-                  <template v-if="m.run.run_issued_utc"> UTC</template>
-                  · {{ m.coverage.n_hours }} h to {{ m.coverage.last_valid_utc ? m.coverage.last_valid_utc.slice(5, 16).replace("T", " ") : "—" }} UTC
-                </p>
-                <p class="text-paper-400">
-                  hub {{ m.requested_height_m }} m from {{ m.height_sources_m.join("+") }} m ·
-                  <template v-if="m.height_method === 'proxy'">nearest native level (proxy)</template>
-                  <template v-else>log-height interpolation</template>
-                </p>
-              </template>
-              <p v-else class="text-heat-300">No archived run yet — press “Fetch now”.</p>
-              <p v-for="w in m.warnings" :key="w" class="text-heat-300">{{ w }}</p>
+          <!-- ===== P0: dnevna tablica — TABLE FIRST ===== -->
+          <section aria-label="Očekivana proizvodnja po danima">
+            <h2 class="text-paper-50 mb-2 font-mono text-base tracking-wide">Očekivana proizvodnja po danima (MWh)</h2>
+            <StateBlock v-if="dailyRows.length === 0" kind="empty" :relaxed="true">
+              Nema arhiviranih prognoza — pritisnite „Osvježi".
+            </StateBlock>
+            <div v-else class="overflow-x-auto">
+              <table class="w-full font-mono text-[11px]">
+                <thead>
+                  <tr class="text-paper-400 border-ink-700 border-b text-left">
+                    <th class="py-1.5 pr-4 sticky left-0 bg-ink-950">Datum</th>
+                    <th v-for="c in modelColumns" :key="c.id" class="py-1.5 pr-4 text-right">
+                      <span class="inline-flex items-center gap-1.5">
+                        <span class="inline-block size-2" :style="{ background: modelColor(c.id) }" />
+                        {{ c.label }}
+                      </span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in dailyRows" :key="row.date" class="border-ink-800 border-b">
+                    <td class="text-paper-100 py-1.5 pr-4 sticky left-0 bg-ink-950">{{ row.date }}</td>
+                    <td v-for="c in modelColumns" :key="c.id" class="py-1.5 pr-4 text-right" :class="row.values[c.id] !== null ? 'text-sodium-200' : 'text-paper-500'">
+                      <template v-if="row.values[c.id] !== null">
+                        {{ row.values[c.id] }}<span v-if="row.flags[c.id]" class="text-paper-400" :title="row.flags[c.id]"> ⚠</span>
+                      </template>
+                      <template v-else :title="row.flags[c.id] || 'nema podataka'">—</template>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="text-paper-400 mt-2 font-mono text-[10px]">
+                Vrijedi za CET dane (24 h). ⚠ = djelomičan dan (prvi/zadnji dan ili nedostajući sat) — kliknite „Detalji o podacima" za pojašnjenje. Procjena na temelju vjetra i krivulje snage; nije jamstvo proizvodnje.
+              </p>
             </div>
-          </div>
+          </section>
 
-          <CollapsibleSection title="Hub-height wind speed (m/s)">
-            <p class="text-paper-400 font-mono text-[10px]">Gaps are missing source levels — never interpolated from 10 m, never zero-filled. ICON-EU ends at 120 h, ICON Global at 192 h.</p>
-            <VChart style="height: 20rem" :option="windOption" autoresize />
+          <!-- ===== P0: satni detalji 24/48 ===== -->
+          <section aria-label="Satni detalji" class="mt-4">
+            <div class="mb-2 flex flex-wrap items-center gap-3">
+              <h2 class="text-paper-50 font-mono text-base tracking-wide">Satni detalji</h2>
+              <SegmentedToggle v-model="hourlyHours" :options="[...HOURS_OPTIONS]" inline divided />
+              <SegmentedToggle
+                v-model="hourlyModel"
+                :options="modelColumns.map((c) => ({ value: c.id, label: c.label }))"
+                inline
+                divided
+              />
+            </div>
+            <div class="overflow-x-auto">
+              <table class="w-full max-w-xl font-mono text-[11px]">
+                <thead>
+                  <tr class="text-paper-400 border-ink-700 border-b text-left">
+                    <th class="py-1.5 pr-4">Datum i sat ({{ siteData.site.timezone }})</th>
+                    <th class="py-1.5 pr-4 text-right">Vjetar (m/s)</th>
+                    <th class="py-1.5 pr-4 text-right">Snaga (MW)</th>
+                    <th class="py-1.5 pr-4 text-right">Energija (MWh)</th>
+                    <th class="py-1.5 pr-4 text-right">Interval</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="r in hourlyRows" :key="r.label + r.offset" class="border-ink-800 border-b" :class="r.missing ? 'opacity-50' : ''">
+                    <td class="text-paper-100 py-1 pr-4">{{ r.label }} <span class="text-paper-400">{{ r.offset }}</span></td>
+                    <td class="py-1 pr-4 text-right" :class="r.wind === null ? 'text-heat-300' : 'text-paper-100'">{{ r.wind ?? "nedostaje" }}</td>
+                    <td class="py-1 pr-4 text-right" :class="r.mw === null ? 'text-heat-300' : 'text-paper-100'">{{ r.mw ?? "nedostaje" }}</td>
+                    <td class="py-1 pr-4 text-right" :class="r.mwh === null ? 'text-heat-300' : 'text-paper-100'">{{ r.mwh ?? "nedostaje" }}</td>
+                    <td class="text-paper-400 py-1 pr-4 text-right">{{ r.interval_hours ? r.interval_hours + " h" : "—" }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="text-paper-400 mt-2 font-mono text-[10px]">MW = prosječna snaga intervala; MWh = energija intervala (trajanje u zadnjem stupcu). „nedostaje" = podatka nema (nikad 0).</p>
+          </section>
+
+          <!-- ===== sekundarno: grafikoni ===== -->
+          <CollapsibleSection title="Grafikoni (vjetar i snaga po satima)" :default-open="false" lazy>
+            <p class="text-paper-400 font-mono text-[10px]">Praznine ostaju praznine — nikad se ne popunjavaju nulama. ICON-EU završava na 120 h, ICON Global na 192 h.</p>
+            <VChart style="height: 18rem" :option="windOption" autoresize />
+            <VChart style="height: 16rem" :option="powerOption" autoresize />
           </CollapsibleSection>
 
-          <CollapsibleSection title="Modeled site power (MW)">
-            <p class="text-paper-400 font-mono text-[10px]">
-              {{ fcData.power_curve.label }} · {{ fcData.power_curve.provenance }}
-              <span v-if="curveUncalibrated" class="text-sodium-200">Uncalibrated for the site — reference values only.</span>
-            </p>
-            <VChart style="height: 18rem" :option="powerOption" autoresize />
-          </CollapsibleSection>
-
-          <CollapsibleSection :title="`Estimated energy (MWh/day, local ${siteData.site.timezone})`">
-            <p class="text-paper-400 font-mono text-[10px]">Bars only where the model has data — a 5-day model shows 5 bars, not 10 zero-padded ones.</p>
-            <VChart style="height: 16rem" :option="dailyOption" autoresize />
-          </CollapsibleSection>
-
-          <CollapsibleSection title="Cumulative MWh (each model's own window)">
-            <p class="text-paper-400 font-mono text-[10px]">
-              Cross-model totals over the common intersection ({{ fcData.intersection.n_common_hours }} h):
-              <span
-                v-for="(v, k) in fcData.intersection.total_mwh"
-                :key="k"
-                class="mr-2"
-                :style="{ color: modelColor(String(k)) }"
-              >{{ String(k) }} {{ v }} MWh</span>
-              — never compare a 5-day total against a 10-day total.
-            </p>
-            <VChart style="height: 16rem" :option="cumulativeOption" autoresize />
-          </CollapsibleSection>
-
-          <CollapsibleSection title="Site assumptions & provenance" :default-open="false">
+          <!-- ===== metodologija (collapsed) ===== -->
+          <CollapsibleSection title="Detalji o podacima i metodologiji" :default-open="false">
             <dl class="space-y-2 font-mono text-[10px] leading-relaxed">
-              <div v-for="(note, field) in siteData.site.assumptions" :key="field" class="border-ink-700 border-b pb-2">
-                <dt class="text-sodium-200">{{ field }}</dt>
-                <dd class="text-paper-300">{{ note }}</dd>
+              <div v-for="m in fcData.models" :key="m.model_id" class="border-ink-700 border-b pb-2">
+                <dt class="text-sodium-200">{{ m.label }} — {{ m.provider }} (preko Open-Meteo)</dt>
+                <dd class="text-paper-300">
+                  {{ m.height_note }}
+                  <template v-if="m.run">Izdano: {{ m.run.run_issued_utc ?? "nepoznato" }} · preuzeto: {{ m.run.fetched_at_utc }} · sati: {{ m.coverage.n_hours }}.</template>
+                  <template v-else>Još nije arhivirano.</template>
+                  <span v-for="w in m.warnings" :key="w" class="text-heat-300 block">{{ w }}</span>
+                </dd>
               </div>
               <div class="border-ink-700 border-b pb-2">
-                <dt class="text-sodium-200">data origin</dt>
-                <dd class="text-paper-300">
-                  ECMWF / NOAA / DWD model outputs fetched through Open-Meteo ({{ siteData.source_provider }}). They are
-                  <strong class="text-paper-50">not</strong> three independent provider APIs. Issue times come from the Open-Meteo
-                  Single Runs archive; when that has no run yet, the live forecast is marked “issue time unknown”.
-                </dd>
+                <dt class="text-sodium-200">Krivulja snage</dt>
+                <dd class="text-paper-300">{{ fcData.power_curve.label }} — {{ fcData.power_curve.provenance }}</dd>
+              </div>
+              <div class="pb-2">
+                <dt class="text-sodium-200">Izvor podataka</dt>
+                <dd class="text-paper-300">{{ siteData.source_note }} Vremenske oznake u UTC; dnevni redovi po CET (+1 h fiksno).</dd>
               </div>
             </dl>
           </CollapsibleSection>

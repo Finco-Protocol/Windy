@@ -43,7 +43,8 @@ class Settings:
         dist_default = REPO_DIR / "frontend" / "dist"
         self.frontend_dist = _env_path("WINDY_FRONTEND_DIST", dist_default)
         # Default forecast collection depth (days); clamped per-model in registry.
-        self.collect_days = int(os.environ.get("WINDY_COLLECT_DAYS", "10"))
+        # 16 covers GFS's full horizon; shorter models are clamped to their own.
+        self.collect_days = int(os.environ.get("WINDY_COLLECT_DAYS", "16"))
         # Site the scheduled (twice-daily) collection runs for. Deliberately a
         # single explicit site so newly created sites can never flood the
         # provider from the background scheduler; collect others manually.

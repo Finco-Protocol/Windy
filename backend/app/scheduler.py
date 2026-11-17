@@ -20,7 +20,7 @@ def scheduled_collect(app) -> None:
     settings = app.state.settings
     client = app.state.om_client or OpenMeteoClient(timeout_s=settings.om_timeout_s, max_retries=settings.om_max_retries)
     try:
-        result = collect_site(settings.db_path, client, settings.collect_site_id)
+        result = collect_site(settings.db_path, client, settings.collect_site_id, days=settings.collect_days)
         for m in result["models"]:
             log.info(
                 "scheduled collect %s: %s (run=%s, points=%s) %s",

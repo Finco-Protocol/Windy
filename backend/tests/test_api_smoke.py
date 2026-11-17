@@ -95,7 +95,7 @@ def test_error_handlers_return_clean_status_codes(client):
     assert r.status_code == 404
 
     # invalid run hour / date → 400 (ValueError)
-    assert api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-14", "run_hour": 5}).status_code == 400
+    assert api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-14", "run_hour": 99}).status_code == 400
     assert api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "not-a-date", "run_hour": 0}).status_code == 400
 
     # nonexistent run → 404 (KeyError), via detail and compare

@@ -161,6 +161,13 @@ def store_run(
         (site["id"], spec.id, dedupe_key, float(hub_from(site))),
     ).fetchone()
     if existing is not None:
+        # STRICT ARCHIVE IMMUTABILITY: a previously stored (site, model, issue,
+        # height) run is an unconditional no-op on re-collection — regardless of
+        # the requested horizon. Stored points, raw payload, issue/fetch times
+        # and provenance are never rewritten (a provider may revise values on a
+        # later request despite the same nominal issue; the original snapshot is
+        # irrecoverable once overwritten). Full permitted horizons arrive
+        # naturally with NEW issue cycles, which become their own rows.
         run_id = int(existing["id"])
         stored = conn.execute(
             "SELECT COUNT(*) AS n FROM forecast_points WHERE run_id=?",
