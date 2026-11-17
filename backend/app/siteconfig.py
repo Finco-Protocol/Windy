@@ -123,6 +123,28 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
         else:
             raise AvailabilityError(f"unknown or non-editable field: {key}")
 
+    # Correction C §1: judge REAL change by VALUES, not by key presence — a
+    # client may send unchanged count/rating alongside a hub-height tweak.
+    def _same_value(new, old) -> bool:
+        if isinstance(new, (int, float)) and isinstance(old, (int, float)):
+            return abs(float(new) - float(old)) <= 1e-9
+        return new == old
+
+    changed = {k: v for k, v in validated.items() if not _same_value(v, old_vals.get(k))}
+    if not changed:
+        return {
+            "site_id": site_id,
+            "no_op": True,
+            "revision": current_config_revision(db_path, site_id),
+            "changes": {},
+            "effective_from_utc": None,
+            "note": "nema stvarne promjene vrijednosti — revizija nije kreirana",
+            "inventory_revision": None,
+            "regenerated_inventory": False,
+            "constraint_impact": [],
+            "site": site,
+        }
+
     # ---- prevalidation of the COMPLETE target configuration -----------------
     target_count = int(validated.get("turbine_count", site.get("turbine_count") or 0))
     target_rating = float(validated.get("turbine_rated_mw", site.get("turbine_rated_mw") or 0))
@@ -136,7 +158,13 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
                 raise AvailabilityError(f"unknown power curve: {target_curve_id}")
 
     inv = get_inventory(db_path, site_id)
-    fleet_keys = {"turbine_count", "turbine_rated_mw"} & validated.keys()
+    # Correction C §1: fleet change is decided by VALUES vs the stored asset —
+    # unchanged count/rating keys (e.g. a hub-height-only edit that echoes the
+    # whole form) must NOT demand regeneration
+    fleet_changed = (
+        abs(float(target_count) - float(site.get("turbine_count") or 0)) > 1e-9
+        or abs(float(target_rating) - float(site.get("turbine_rated_mw") or 0)) > 1e-9
+    )
     inventory_matches_target = (
         inv["n_turbines"] == target_count
         and abs(inv["installed_mw"] - target_count * target_rating) <= 0.05
@@ -174,30 +202,44 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
                     f"WTG-{target_count:03d} ({listed}). Remove or re-target those constraints first — "
                     "they are never silently discarded."
                 )
-        if fleet_keys:
+        if fleet_changed:
             constraint_impact.append(
                 f"inventory regenerates as WTG-001..{target_count:03d} @ {target_rating} MW (new inventory revision); "
                 "existing active constraints on surviving units are PRESERVED unchanged "
                 "(cap_percent now refers to the new rated MW; verify cap_mw <= new rating)"
             )
-    elif fleet_keys:
+    elif fleet_changed:
         raise AvailabilityError(
-            f"physical fleet change ({', '.join(sorted(fleet_keys))}) requires regenerate_inventory=true: current "
+            f"physical fleet change (turbine count/rating) requires regenerate_inventory=true: current "
             f"inventory is {inv['n_turbines']} units / {inv['installed_mw']} MW, target is {target_count} units / "
             f"{round(target_count * target_rating, 2)} MW. Include regenerate_inventory=true, or align the change "
             "with the existing inventory."
         )
-
+    if "capacity_mw" in changed and not regenerating:
+        # Correction C §2: a bare capacity edit (no fleet regeneration) must
+        # not desynchronise the asset from the physical inventory, and an
+        # OPERATIONAL limit (six turbines at 2.50 MW => 72.00 MW available)
+        # never belongs in capacity_mw — it lives in per-unit constraints /
+        # an optional export cap. No hardcoded 72 MW anywhere.
+        effective_installed = inv["installed_mw"] if inv["n_turbines"] > 0 else target_count * target_rating
+        if abs(target_capacity - effective_installed) > 0.05:
+            raise AvailabilityError(
+                f"capacity_mw je INSTALIRANI nazivni kapacitet: fizička flota je "
+                f"{round(effective_installed, 2)} MW, pa je capacity_mw={target_capacity} MW odbijeno. "
+                "Operativni limit (npr. šest turbina na 2,50 MW => 72,00 MW raspoloživo) "
+                "NE ide u capacity_mw — koristite per-turbine limite u 'Rad elektrane' "
+                "ili eksplicitni farm export cap."
+            )
     # ---- ONE transaction: assets + (optional) new inventory + revision row ---
     rev = current_config_revision(db_path, site_id) + 1
     inventory_revision: int | None = None
     now = _now()
-    changes_json = dbm.j({k: {"from": old_vals.get(k), "to": v} for k, v in validated.items()})
+    changes_json = dbm.j({k: {"from": old_vals.get(k), "to": v} for k, v in changed.items()})
     with dbm.session(db_path) as conn:
-        sets = ", ".join(f"{k}=?" for k in validated)
+        sets = ", ".join(f"{k}=?" for k in changed)
         conn.execute(
             f"UPDATE assets SET {sets} WHERE id=?",
-            (*validated.values(), site_id),
+            (*changed.values(), site_id),
         )
         if regenerating:
             inventory_revision = current_inventory_revision(db_path, site_id) + 1
@@ -216,7 +258,7 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
     out = {
         "site_id": site_id,
         "revision": rev,
-        "changes": {k: {"from": old_vals.get(k), "to": v} for k, v in validated.items()},
+        "changes": {k: {"from": old_vals.get(k), "to": v} for k, v in changed.items()},
         "effective_from_utc": now,
         "note": note,
         "inventory_revision": inventory_revision,

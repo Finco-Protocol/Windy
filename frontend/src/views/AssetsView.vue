@@ -142,7 +142,11 @@ async function saveEdit(): Promise<void> {
   editError.value = null;
   editMessage.value = null;
   try {
-    const changes: Record<string, unknown> = {
+    // Correction C §1: send ONLY actually-changed fields (compared against
+    // the current asset) — an unchanged form must not trip the backend's
+    // fleet-change guard or create an empty revision
+    const current = assets.value.find((a) => a.id === target);
+    const candidates: Record<string, unknown> = {
       capacity_mw: editForm.capacity_mw,
       turbine_count: editForm.turbine_count,
       turbine_rated_mw: editForm.turbine_rated_mw,
@@ -151,7 +155,18 @@ async function saveEdit(): Promise<void> {
       timezone: editForm.timezone,
       allow_scaled_reference: editForm.allow_scaled_reference,
     };
+    const changes: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(candidates)) {
+      const cur = (current as unknown as Record<string, unknown>)?.[key];
+      const bothNum = typeof value === "number" && typeof cur === "number";
+      const differs = bothNum ? Math.abs(value - (cur as number)) > 1e-9 : value !== cur;
+      if (differs) changes[key] = value;
+    }
     if (editForm.regenerate_inventory) changes.regenerate_inventory = true;
+    if (Object.keys(changes).length === 0) {
+      editMessage.value = "Nema stvarne promjene vrijednosti — revizija nije kreirana.";
+      return;
+    }
     const res = await windyApi.configRevisionApply(target, { changes, note: editForm.note || undefined });
     editMessage.value =
       `Revizija ${res.revision} spremljena (na snazi od ${res.effective_from_utc}). Arhivirani run-ovi nisu mijenjani.` +

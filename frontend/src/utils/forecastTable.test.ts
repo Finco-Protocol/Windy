@@ -250,10 +250,25 @@ describe("avg preference persistence per site (Correction B section 3)", () => {
     expect(pref.models).toEqual(["gfs_seamless", "ecmwf_ifs"]);
   });
 
+  it("Correction C: explicit configured:false + models[] -> default ALL production ids", () => {
+    saveAvgPreference("c-false", { enabled: true, configured: false, models: [] });
+    const pref = loadAvgPreference("c-false", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(false);
+    expect(pref.models).toEqual(["gfs_seamless", "ecmwf_ifs"]); // default all, NOT the empty list
+  });
+
+  it("Correction C: explicit configured:true + models[] stays EMPTY (no silent re-enable)", () => {
+    saveAvgPreference("c-true", { enabled: true, configured: true, models: [] });
+    const pref = loadAvgPreference("c-true", ["gfs_seamless", "ecmwf_ifs"]);
+    expect(pref.configured).toBe(true);
+    expect(pref.models).toEqual([]);
+  });
+
   it("pre-B stored format (no configured flag) migrates to configured=true", () => {
-    // simulate a pre-B record: models list present, flag absent — persisted
-    // through the same storage path the app uses
-    saveAvgPreference("s-old", { enabled: true, configured: false as unknown as boolean, models: ["ecmwf_ifs"] });
+    // simulate a pre-B record: models list present, configured field ABSENT
+    // (undefined is dropped by JSON.stringify) — persisted through the same
+    // storage path the app uses
+    saveAvgPreference("s-old", { enabled: true, configured: undefined as unknown as boolean, models: ["ecmwf_ifs"] });
     const pref = loadAvgPreference("s-old", ["gfs_seamless", "ecmwf_ifs"]);
     expect(pref.configured).toBe(true);
     expect(pref.models).toEqual(["ecmwf_ifs"]);

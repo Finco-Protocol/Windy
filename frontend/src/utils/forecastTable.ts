@@ -347,9 +347,14 @@ export function loadAvgPreference(siteId: string, productionIds: string[]): AvgP
     const raw = prefStorage().getItem(`windy.avg.${siteId}`);
     if (raw) {
       const parsed = JSON.parse(raw) as Partial<AvgPreference>;
-      // a stored list means the user saved at least once — treat it as
-      // configured even under the pre-B format (which lacked the flag)
-      const configured = parsed.configured === true || Array.isArray(parsed.models);
+      // Correction C §3: an EXPLICIT boolean wins; only the LEGACY format
+      // (no configured field at all) infers it from the presence of a saved
+      // models list. configured:false always means default/all current
+      // production models — even when a models array accompanies it.
+      if (typeof parsed.configured === "boolean" && !parsed.configured) {
+        return { enabled: !!parsed.enabled, configured: false, models: [...productionIds] };
+      }
+      const configured = typeof parsed.configured === "boolean" ? parsed.configured : Array.isArray(parsed.models);
       let models = Array.isArray(parsed.models) ? [...parsed.models] : [];
       // filter against CURRENT production ids only when they are loaded;
       // while temporarily empty (loading/missing runs) the stored selection

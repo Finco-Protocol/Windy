@@ -292,6 +292,97 @@ def test_upgrade_then_six_owner_caps_gives_72(client):
     assert api.get(f"/api/runs/{old_run_id}", params={"site_id": "krnovo"}).json()["points"] == old_points
 
 
+def _upgrade_krnovo(api):
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_cc_nonfleet_edit_without_regeneration_succeeds(client):
+    api, fake, _s = client
+    old_run_id, old_points = _seed_old_style_krnovo(api, fake)
+    up = _upgrade_krnovo(api)
+    inv_rev = api.get("/api/assets/krnovo/turbines").json()["revision"]
+
+    # hub-height-only edit, regenerate OFF, fleet keys absent -> must succeed
+    r = api.post("/api/assets/krnovo/config-revision", json={"changes": {"hub_height_m": 95}})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["revision"] == up["revision"] + 1
+    assert out["inventory_revision"] is None
+    assert out["regenerated_inventory"] is False
+    assert out["site"]["hub_height_m"] == pytest.approx(95)
+    # inventory untouched: same revision, same installed MW
+    inv = api.get("/api/assets/krnovo/turbines").json()
+    assert inv["revision"] == inv_rev
+    assert inv["installed_mw"] == pytest.approx(26 * 2.85, abs=1e-6)
+    # archived runs byte-exact
+    assert api.get(f"/api/runs/{old_run_id}", params={"site_id": "krnovo"}).json()["points"] == old_points
+
+
+def test_cc_unchanged_fleet_values_do_not_demand_regeneration(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    _upgrade_krnovo(api)
+    inv_rev = api.get("/api/assets/krnovo/turbines").json()["revision"]
+    n_before = api.get("/api/assets/krnovo/turbines").json()["n_turbines"]
+
+    # client echoes unchanged count/rating but only changes tz + losses
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"turbine_count": 26, "turbine_rated_mw": 2.85, "timezone": "Europe/Sarajevo", "loss_factor": 0.05}},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["regenerated_inventory"] is False
+    inv = api.get("/api/assets/krnovo/turbines").json()
+    assert inv["revision"] == inv_rev, "no new inventory revision"
+    assert inv["n_turbines"] == n_before, "no regenerated WTG rows"
+    assert api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]["timezone"] == "Europe/Sarajevo"
+
+
+def test_cc_capacity_only_operational_limit_rejected(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    _upgrade_krnovo(api)
+    revs_before = api.get("/api/assets/krnovo/config-revisions").json()["current_revision"]
+    # 72.00 MW is the OPERATIONAL limit of six 2.50 caps — NOT a nameplate;
+    # a bare capacity edit to 72.0 against the 74.10 MW fleet must be rejected
+    r = api.post("/api/assets/krnovo/config-revision", json={"changes": {"capacity_mw": 72.0}})
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert "INSTALIRANI" in detail and "72.0" in detail
+    assert "operational limit" in detail or "operativni" in detail.lower()
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == revs_before, "atomic no-write"
+
+
+def test_cc_real_rating_change_without_regeneration_rejected(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    r = api.post("/api/assets/krnovo/config-revision", json={"changes": {"turbine_rated_mw": 2.85}})
+    assert r.status_code == 400
+    assert "regenerate_inventory=true" in r.json()["detail"]
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == 0
+
+
+def test_cc_noop_returns_clear_response_without_revision(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    _upgrade_krnovo(api)
+    revs_before = api.get("/api/assets/krnovo/config-revisions").json()["current_revision"]
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "hub_height_m": 90, "loss_factor": 0, "timezone": "Europe/Podgorica", "allow_scaled_reference": True}},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["no_op"] is True
+    assert out["revision"] == revs_before, "no new revision created"
+    assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == revs_before
+
+
 def test_replace_units_atomic_split_grouped_constraints(client):
     api, fake, _s = client
     api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})
