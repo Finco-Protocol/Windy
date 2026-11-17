@@ -383,6 +383,144 @@ def test_cc_noop_returns_clear_response_without_revision(client):
     assert api.get("/api/assets/krnovo/config-revisions").json()["current_revision"] == revs_before
 
 
+def test_future_scheduled_constraint_survives_current_action(client):
+    api, fake, _s = client
+    api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})
+    # FUTURE scheduled restriction on WTG-001 (starts next week) — an owner
+    # obligation that must NOT be cancelled by a current ON action
+    r = api.post(
+        "/api/assets/krnovo/constraints",
+        json={"rows": [{"kind": "offline", "unit_ids": ["WTG-001"], "start_local": "2026-12-01T00:00", "end_local": "2026-12-05T00:00"}]},
+    )
+    assert r.status_code == 200, r.text
+    # current action: WTG-002 OFF (does not touch WTG-001) AND WTG-001 ON
+    r2 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "on"}, {"unit_id": "WTG-002", "state": "off"}], "start_local": "2026-11-18T00:00"},
+    )
+    assert r2.status_code == 200, r2.text
+    cons = r2.json()["constraints"]
+    # local midnight 2026-12-01 = 2026-11-30T23:00Z; the scheduled row survives
+    future = [c for c in cons if c["kind"] == "offline" and (c["end_utc"] or "") >= "2026-12-01"]
+    assert any(c["unit_ids"] == ["WTG-001"] for c in future), "future scheduled restriction survives with its unit intact"
+    # the future obligation still ACTIVATES later: scenario engine at that
+    # window sees WTG-001 offline
+    fake.push_run("gfs_seamless", "2026-12-01T00:00", make_raw_run(_hourly("2026-12-01", 0, 24), {"80": [WS] * 24, "100": [WS] * 24}))
+    rr = api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-12-01", "run_hour": 0, "days": 16})
+    assert rr.status_code == 200
+    fc = api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()
+    m = next(x for x in fc["models"] if x["model_id"] == "gfs_seamless")
+    vals = [p["adjusted_mw"] for p in m["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    # 25 producing units at 2.75 (WTG-001 OFF by the scheduled rule, WTG-002
+    # not affected by this run's window start unless its own constraint is
+    # open-ended from 11-18 — it is, so 24 units + WTG-001 off):
+    assert max(vals) == pytest.approx(24 * 2.75, abs=1e-3), "scheduled future restriction activates later"
+
+
+def test_config_revision_writes_current_provenance_preserving_history(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    r = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={
+            "changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True},
+            "note": "owner correction",
+        },
+    )
+    assert r.status_code == 200, r.text
+    site = api.get("/api/site", params={"site_id": "krnovo"}).json()["site"]
+    assumptions = site["assumptions"]
+    # historical assumptions preserved (old capacity/curve text untouched)
+    assert any("71.5" in str(v) or "74.10" in str(v) for v in assumptions.values()), "old provenance keys remain"
+    # CURRENT owner-revised label added, honestly scoped
+    cur = assumptions.get("owner_revision_1")
+    assert cur is not None
+    assert "2.85" in cur
+    assert "REFERENCE/UNVERIFIED" in cur
+    assert "NIJE" in cur, "explicit non-claim of a certified GE 2.85-116 curve"
+    assert "NIJE potvrdena" in cur or "NIJE potvrđena" in cur, "rotor/model variant not invented"
+
+
+def test_replace_units_mw_mode_exact_payload_and_numbers(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    _upgrade = api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+    )
+    assert _upgrade.status_code == 200
+    # owner's canonical path: SIX units via Max MW mode -> EXACT cap_mw 2.5
+    six = [f"WTG-{i:03d}" for i in range(1, 7)]
+    r = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": u, "state": "cap", "cap_mw": 2.5} for u in six], "start_local": "2026-11-16T00:00"},
+    )
+    assert r.status_code == 200, r.text
+    cons = r.json()["constraints"]
+    caps = [c for c in cons if c["kind"] == "curtailment" and c["cap_mw"] is not None]
+    assert caps and all(c["cap_mw"] == pytest.approx(2.5) for c in caps), "stored as cap_mw exactly 2.5"
+    assert sum(len(c["unit_ids"] or []) for c in caps) == 6
+    assert all(c["cap_percent"] is None for c in caps), "no pct mixed in for MW mode"
+    # 74.10 -> 72.00
+    fake.push_run("gfs_seamless", "2026-11-17T00:00", make_raw_run(_hourly("2026-11-17", 0, 24), {"80": [WS] * 24, "100": [WS] * 24}))
+    rr = api.post("/api/backfill", json={"model_id": "gfs_seamless", "run_date": "2026-11-17", "run_hour": 0, "days": 16})
+    assert rr.status_code == 200
+    fc = api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()
+    m = next(x for x in fc["models"] if x["model_id"] == "gfs_seamless")
+    vals = [p["adjusted_mw"] for p in m["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    assert max(vals) == pytest.approx(72.0, abs=1e-3)
+    # preview == status.available_max_mw
+    st = api.get("/api/assets/krnovo/status").json()
+    assert st["available_max_mw"] == pytest.approx(72.0, abs=1e-3)
+    # one capped OFF -> 69.50
+    r2 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "off"}], "start_local": "2026-11-16T00:00"},
+    )
+    assert r2.status_code == 200
+    vals2 = [p["adjusted_mw"] for p in api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()["models"][1]["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    _ = vals2  # gfs is index-found below
+    m2 = next(x for x in api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()["models"] if x["model_id"] == "gfs_seamless")
+    vals2 = [p["adjusted_mw"] for p in m2["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    assert max(vals2) == pytest.approx(69.5, abs=1e-3)
+    # WTG-001 back to its 2.50 cap (plain 'on' = unrestricted), an UNLIMITED
+    # unit OFF -> 69.15 with SIX caps retained
+    r3 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "cap", "cap_mw": 2.5}, {"unit_id": "WTG-010", "state": "off"}], "start_local": "2026-11-16T00:00"},
+    )
+    assert r3.status_code == 200
+    m3 = next(x for x in api.get("/api/forecast", params={"days": 2, "site_id": "krnovo", "with_availability": "true"}).json()["models"] if x["model_id"] == "gfs_seamless")
+    vals3 = [p["adjusted_mw"] for p in m3["adjusted"]["points"] if p["adjusted_mw"] is not None]
+    assert max(vals3) == pytest.approx(69.15, abs=1e-3)
+    # 2.4 MW example: Max MW below 2.5 is stored exactly
+    r4 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "cap", "cap_mw": 2.4}], "start_local": "2026-11-16T00:00"},
+    )
+    assert r4.status_code == 200
+    caps4 = [c for c in r4.json()["constraints"] if c["kind"] == "curtailment" and c["cap_mw"] is not None]
+    assert any(c["cap_mw"] == pytest.approx(2.4) for c in caps4)
+
+
+def test_replace_units_percent_mode_sends_allowed_percent(client):
+    api, fake, _s = client
+    _seed_old_style_krnovo(api, fake)
+    api.post(
+        "/api/assets/krnovo/config-revision",
+        json={"changes": {"capacity_mw": 74.1, "turbine_count": 26, "turbine_rated_mw": 2.85, "allow_scaled_reference": True, "regenerate_inventory": True}},
+    )
+    # pct mode: 12.28% REDUCTION on 2.85 = 87.72% allowed = 2.4998... MW
+    r = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": "WTG-001", "state": "cap", "cap_percent": 87.72}], "start_local": "2026-11-16T00:00"},
+    )
+    assert r.status_code == 200, r.text
+    caps = [c for c in r.json()["constraints"] if c["kind"] == "curtailment" and c["cap_percent"] is not None]
+    assert caps and caps[0]["cap_percent"] == pytest.approx(87.72)
+    assert caps[0]["cap_mw"] is None, "pct mode sends cap_percent, never cap_mw"
+
+
 def test_replace_units_atomic_split_grouped_constraints(client):
     api, fake, _s = client
     api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})

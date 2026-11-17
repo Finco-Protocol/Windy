@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDailyMatrix, buildEnsembleDaily, buildHourlyRows, loadAvgPreference, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, saveAvgPreference, visibleDailyRows, type DailySlot } from "./forecastTable";
+import { buildDailyMatrix, buildEnsembleDaily, buildHourlyRows, loadAvgPreference, MODEL_LABELS_HR, modelTotal, productionModelIds, rowAverage, saveAvgPreference, sumDisplayedAverages, visibleDailyRows, type DailySlot } from "./forecastTable";
 
 function model(id: string, daily: DailySlot[]): { model_id: string; daily_local: DailySlot[] } {
   return { model_id: id, daily_local: daily };
@@ -284,5 +284,34 @@ describe("avg preference persistence per site (Correction B section 3)", () => {
     saveAvgPreference("sw-b", { enabled: true, configured: true, models: [] });
     expect(loadAvgPreference("sw-a", ["gfs_seamless", "icon_eu"]).models).toEqual(["gfs_seamless"]);
     expect(loadAvgPreference("sw-b", ["gfs_seamless", "icon_eu"]).models).toEqual([]);
+  });
+});
+
+describe("sumDisplayedAverages (Correction D §4)", () => {
+  const rows = [{ date: "2026-11-16" }, { date: "2026-11-17" }, { date: "2026-11-18" }];
+  it("sums ONLY the displayed rows' averages (identical window to the table)", () => {
+    const avgByDate = new Map([
+      ["2026-11-16", { mwh: 10 }],
+      ["2026-11-17", { mwh: 20 }],
+      ["2026-11-19", { mwh: 999 }], // extra ensemble-only day must NOT count
+    ]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(30);
+  });
+
+  it("no contributors -> null (missing is never 0)", () => {
+    expect(sumDisplayedAverages(rows, new Map())).toBeNull();
+  });
+
+  it("genuine below-cut-in 0 stays 0 (rows exist with real coverage)", () => {
+    const avgByDate = new Map([
+      ["2026-11-16", { mwh: 0 }],
+      ["2026-11-17", { mwh: 0 }],
+    ]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(0);
+  });
+
+  it("partial ensemble coverage over the window is fine (only covered dates count)", () => {
+    const avgByDate = new Map([["2026-11-18", { mwh: 5 }]]);
+    expect(sumDisplayedAverages(rows, avgByDate)).toBe(5);
   });
 });

@@ -21,8 +21,10 @@ import {
   type DailyRow,
   type DailySlot,
   type EnsembleInput,
+  sumDisplayedAverages,
 } from "@/utils/forecastTable";
-import { modelColor, windyApi, type AdjustedPoint, type ForecastModel, type ForecastResponse, type Inventory, type OperationalConstraint, type OperationalStatus, type SiteResponse, type UnitAssignment, type WindNowResponse } from "@/api/windy";
+import { buildAssignments, editAllowedMw, effectiveCapMw, type CapMode, type UnitAssignment, type UnitEdit } from "@/utils/unitAssignments";
+import { modelColor, windyApi, type AdjustedPoint, type ForecastModel, type ForecastResponse, type Inventory, type OperationalConstraint, type OperationalStatus, type SiteResponse, type WindNowResponse } from "@/api/windy";
 import { useAbortableResource } from "@/composables/useAbortableResource";
 import { useActiveSite } from "@/composables/useActiveSite";
 
@@ -145,19 +147,21 @@ const ensembleRows = computed(() => {
     viewMode.value === "adjusted"
       ? hourlyInputs((m) => (m.adjusted?.available ? m.adjusted.points.map((p) => ({ valid_at_utc: p.valid_at_utc, mw: p.adjusted_mw, interval_hours: p.interval_hours })) : []))
       : hourlyInputs((m) => m.points.map((p) => ({ valid_at_utc: p.valid_at_utc, mw: p.modeled_power_mw, interval_hours: p.interval_hours })));
-  return visibleDailyRows(buildEnsembleDaily(inputs, tz.value), days.value, tz.value);
+  return buildEnsembleDaily(inputs, tz.value);
 });
 const avgByDate = computed(() => new Map(ensembleRows.value.map((r) => [r.date, r] as const)));
 const totalsAverage = computed(() => {
-  // UKUPNO Average = ZBROJ prikazanih dnevnih Average vrijednosti (identity
-  // requirement) — nikad prosjek period-totala po modelu
+  // Correction D §4: UKUPNO Average = zbroj Average vrijednosti UPRAVO
+  // PRIKAZANIH redova (isti kalendar kao dnevna tablica — nikad dodatni dan
+  // koji postoji samo u ensemble-u). Bez ijednog contributor reda -> null
+  // (em dash), NIKAD 0: nedostajuca prognoza nije nula. Stvarna 0 (ispod
+  // cut-in, s pokrivenim satima) ostaje 0.
   if (!avgPref.value.enabled) return null;
-  const total = ensembleRows.value.reduce((acc, r) => acc + r.mwh, 0);
-  return Math.round(total * 100) / 100;
+  return sumDisplayedAverages(visibleRows.value, avgByDate.value);
 });
 const avgCoverageNote = computed(() => {
-  const rows = ensembleRows.value;
-  if (rows.length === 0) return null;
+  const rows = visibleRows.value.map((r) => avgByDate.value.get(r.date)).filter((r): r is NonNullable<typeof r> => !!r);
+  if (rows.length === 0) return avgPref.value.enabled ? "Prosjek: nema ensemble vrijednosti za prikazane dane" : null;
   const mins = new Set(rows.map((r) => r.contributors_min));
   const maxs = new Set(rows.map((r) => r.contributors_max));
   if (mins.size === 1 && maxs.size === 1 && rows[0] && rows[0].contributors_min === rows[0].contributors_max) {
@@ -241,41 +245,38 @@ const WTG_ACTION_OPTIONS = [
   { value: "cap", label: "Ograniči" },
 ] as const;
 type UnitAction = "on" | "off" | "cap";
-interface UnitEdit {
-  action: UnitAction;
-  reductionPct: number | null; // % SMANJENJE (0 = bez ograničenja, 100 = nula) → backend cap_percent = 100 − reduction
-  capMw: number | null;
-}
+const CAP_MODE_OPTIONS = [
+  { value: "mw", label: "Max MW" },
+  { value: "pct", label: "% smanjenja" },
+] as const;
 const bulkAction = ref<UnitAction>("cap");
-const bulkReductionPct = ref<number>(12.28); // 2,50 MW dopušteno na 2,85 MW nazivnog
+const bulkMode = ref<CapMode>("mw"); // vlasnicka kanonska vrijednost je 2,50 MW
+const bulkReductionPct = ref<number>(12.28); // ≡ 2,50 MW dopusteno na 2,85 MW nazivnog
 const bulkCapMw = ref<number>(2.5);
 const perUnitState = ref<Record<string, UnitEdit>>({});
 
 function unitEdit(unit: string): UnitEdit {
   const o = perUnitState.value[unit];
   if (o) return o;
-  return { action: bulkAction.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value };
+  return { action: bulkAction.value, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value };
 }
 function setUnitEdit(unit: string, edit: UnitEdit): void {
   perUnitState.value = { ...perUnitState.value, [unit]: edit };
 }
 function applyBulkToSelection(): void {
   const next: Record<string, UnitEdit> = {};
-  for (const u of wtgSelected.value) next[u] = { action: bulkAction.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value };
-  perUnitState.value = next;
+  for (const u of wtgSelected.value) next[u] = { action: bulkAction.value, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value };
+  perUnitState.value = next; // bulk izbor ZAMJENJUJE zastarjele per-unit override (Correction D §1)
 }
+// autoritativni mod: prikaz sinhroniziran, mod se nikad tiho ne prebacuje
 function allowedMw(unit: string, edit: UnitEdit): number | null {
   const rated = ratedById.value.get(unit);
   if (!rated) return null;
-  if (edit.action === "off") return 0;
-  if (edit.action === "on") return rated;
-  if (edit.capMw !== null && edit.capMw !== undefined) return Math.min(edit.capMw, rated);
-  if (edit.reductionPct !== null && edit.reductionPct !== undefined) return Math.round(((100 - edit.reductionPct) / 100) * rated * 1000) / 1000;
-  return rated;
+  return editAllowedMw(edit, rated);
 }
 function mwFromReduction(unit: string, edit: UnitEdit): number | null {
   const rated = ratedById.value.get(unit);
-  if (!rated || edit.reductionPct === null) return null;
+  if (!rated || edit.mode !== "pct" || edit.reductionPct === null) return null;
   return Math.round(((100 - edit.reductionPct) / 100) * rated * 1000) / 1000;
 }
 
@@ -293,32 +294,26 @@ watch(
   { immediate: true },
 );
 
-// assignments differ from the CURRENT active state (Correction A §4)
+// assignments se razlikuju od trenutnog stanja (Correction A §4 / D §1):
+// payload gradi tocisti cisti helper (unit-testiran) s JEDNIM autoritativnim
+// modom po jedinici — Max MW salje cap_mw, % smanjenja salje
+// cap_percent = 100 - reduction. 0% smanjenja uklanja aktivni cap (state
+// 'on'); ~100% postaje OFF; nevalidne vrijednosti bacaju poruku (vidljiva u
+// requestApply).
+const assignmentError = ref<string | null>(null);
 const pendingAssignments = computed<UnitAssignment[]>(() => {
-  const out: UnitAssignment[] = [];
-  for (const unit of [...wtgSelected.value].sort()) {
-    const edit = unitEdit(unit);
-    const cur = unitState(unit);
-    if (edit.action === "on") {
-      if (!cur.off && cur.capMw === null && cur.capPercent === null) continue;
-      out.push({ unit_id: unit, state: "on" });
-      continue;
-    }
-    if (edit.action === "off") {
-      if (cur.off) continue;
-      out.push({ unit_id: unit, state: "off" });
-      continue;
-    }
-    // cap: percent SMANJENJE → backend cap_percent = 100 − reduction (ALLOWED)
-    const reduction = edit.reductionPct ?? 0;
-    const allowedPct = Math.round((100 - reduction) * 10000) / 10000;
-    const allowedMwNow = mwFromReduction(unit, edit);
-    if (cur.capPercent !== null && Math.abs(cur.capPercent - allowedPct) < 1e-6) continue;
-    if (cur.capMw !== null && allowedMwNow !== null && Math.abs(cur.capMw - allowedMwNow) < 1e-6 && cur.capPercent === null) continue;
-    if (allowedMwNow !== null && allowedMwNow >= ratedById.value.get(unit)!) continue; // no-op limit
-    out.push({ unit_id: unit, state: "cap", cap_percent: allowedPct });
+  assignmentError.value = null;
+  try {
+    return buildAssignments({
+      units: [...wtgSelected.value],
+      getEdit: unitEdit,
+      getCurrent: unitState,
+      getRated: (u) => ratedById.value.get(u) ?? 0,
+    });
+  } catch (e) {
+    assignmentError.value = e instanceof Error ? e.message : String(e);
+    return [];
   }
-  return out;
 });
 
 const pendingPreviewMw = computed(() => {
@@ -336,8 +331,11 @@ const pendingPreviewMw = computed(() => {
       continue;
     }
     const cur = unitState(t.unit_id);
-    if (cur.off) continue;
-    sum += Math.min(cur.capMw ?? t.rated_mw, t.rated_mw);
+    // Correction D §2: preview postuje OBA cap tipa (cap_mw I cap_percent)
+    // kroz najrestriktivniji efektivni limit — sacuvani %-based cap se nikad
+    // ne tretira kao nazivna snaga
+    const eff = effectiveCapMw(cur, t.rated_mw);
+    sum += eff ?? t.rated_mw;
   }
   return Math.round(sum * 100) / 100;
 });
@@ -345,6 +343,10 @@ const pendingPreviewMw = computed(() => {
 function requestApply(): void {
   applyError.value = null;
   applyMessage.value = null;
+  if (assignmentError.value) {
+    applyError.value = assignmentError.value;
+    return;
+  }
   if (pendingAssignments.value.length === 0) {
     applyError.value = "Nema stvarne promjene stanja za odabrane jedinice.";
     return;
@@ -678,23 +680,32 @@ function utcLabel(iso: string | null): string {
                 </button>
               </div>
 
-              <!-- bulk preset za odabrane -->
+              <!-- bulk preset za odabrane — Correction D §1: JEDAN autoritativni mod -->
               <div class="mt-3 flex flex-wrap items-center gap-2">
                 <span class="text-paper-400 font-mono text-[10px]">Bulk na odabrane:</span>
                 <SegmentedToggle v-model="bulkAction" :options="[...WTG_ACTION_OPTIONS]" inline divided />
                 <template v-if="bulkAction === 'cap'">
-                  <label class="text-paper-400 font-mono text-[10px]">
-                    % smanjenja
-                    <input v-model.number="bulkReductionPct" type="number" step="0.01" min="0" max="100" class="border-ink-700 bg-ink-900 text-paper-100 w-20 mx-1 border px-2 py-0.5 font-mono text-[11px]" />
-                  </label>
-                  <span class="text-paper-500 font-mono text-[10px]">≈ {{ Math.round(((100 - (bulkReductionPct || 0)) / 100) * (siteData.site.turbine_rated_mw || 0) * 1000) / 1000 }} MW dopušteno</span>
-                  <span class="text-paper-500 font-mono text-[10px]">ili Max MW:</span>
-                  <input v-model.number="bulkCapMw" type="number" step="0.05" min="0" class="border-ink-700 bg-ink-900 text-paper-100 w-20 border px-2 py-0.5 font-mono text-[11px]" />
+                  <span class="text-paper-400 font-mono text-[10px]">mod:</span>
+                  <SegmentedToggle v-model="bulkMode" :options="[...CAP_MODE_OPTIONS]" inline divided />
+                  <template v-if="bulkMode === 'mw'">
+                    <label class="text-paper-400 font-mono text-[10px]">
+                      Max MW (dopušteno)
+                      <input v-model.number="bulkCapMw" type="number" step="0.05" min="0" class="border-sodium-300/60 text-paper-100 bg-ink-900 w-20 mx-1 border px-2 py-0.5 font-mono text-[11px]" />
+                    </label>
+                    <span class="text-paper-500 font-mono text-[10px]">≈ {{ Math.round(((bulkCapMw || 0) / (siteData.site.turbine_rated_mw || 1)) * 10000) / 100 }}% nazivnog</span>
+                  </template>
+                  <template v-else>
+                    <label class="text-paper-400 font-mono text-[10px]">
+                      % smanjenja
+                      <input v-model.number="bulkReductionPct" type="number" step="0.01" min="0" max="100" class="border-sodium-300/60 text-paper-100 bg-ink-900 w-20 mx-1 border px-2 py-0.5 font-mono text-[11px]" />
+                    </label>
+                    <span class="text-paper-500 font-mono text-[10px]">≈ {{ Math.round(((100 - (bulkReductionPct || 0)) / 100) * (siteData.site.turbine_rated_mw || 0) * 1000) / 1000 }} MW dopušteno</span>
+                  </template>
                 </template>
                 <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-2 py-0.5 font-mono text-[10px]" @click="applyBulkToSelection">Primijeni bulk na odabrane</button>
               </div>
               <p class="text-paper-500 mt-1 font-mono text-[10px]">
-                % smanjenja ≠ % dopušteno: 12,28% smanjenje na 2,85 MW nazivnog = 2,50 MW dopušteno (backend sprema puni MW/„% dopušteno" limit).
+                % smanjenja ≠ % dopušteno: 12,28% smanjenje na 2,85 MW nazivnog = 2,50 MW dopušteno (backend sprema puni MW / „% dopušteno" limit). Sprema se ISKLJUČIVO vrijednost aktivnog moda — Max MW se nikad ne zamjenjuje pohranjenim % vrijednostima ni obrnuto.
               </p>
 
               <!-- per-jedinica uređivanje -->
@@ -711,15 +722,17 @@ function utcLabel(iso: string | null): string {
                     @update:model-value="(v) => setUnitEdit(u, { ...unitEdit(u), action: v as UnitAction })"
                   />
                   <template v-if="unitEdit(u).action === 'cap'">
-                    <label class="text-paper-400 font-mono text-[10px]">
-                      %smanj.
-                      <input :value="unitEdit(u).reductionPct ?? 0" type="number" step="0.01" min="0" max="100" class="border-ink-700 bg-ink-900 text-paper-100 w-16 mx-1 border px-1 py-0.5 font-mono text-[11px]" @input="(e) => setUnitEdit(u, { ...unitEdit(u), reductionPct: Number((e.target as HTMLInputElement).value) })" />
+                    <label class="font-mono text-[10px]" :class="unitEdit(u).mode === 'mw' ? 'text-sodium-300' : 'text-paper-500'" title="autoritativni mod">
+                      MW
+                      <input :value="unitEdit(u).capMw ?? ''" type="number" step="0.05" min="0" :class="unitEdit(u).mode === 'mw' ? 'border-sodium-300/60' : 'border-ink-700'" class="bg-ink-900 text-paper-100 w-16 mx-1 border px-1 py-0.5 font-mono text-[11px]" @input="(e) => { const v = (e.target as HTMLInputElement).value; setUnitEdit(u, { ...unitEdit(u), mode: 'mw', capMw: v === '' ? null : Number(v) }) }" />
                     </label>
-                    <span class="text-sodium-200 font-mono text-[10px]">= {{ mwFromReduction(u, unitEdit(u)) ?? "—" }} MW dopušteno</span>
-                    <span class="text-paper-500 font-mono text-[10px]">ili MW:</span>
-                    <input :value="unitEdit(u).capMw ?? ''" type="number" step="0.05" min="0" class="border-ink-700 bg-ink-900 text-paper-100 w-16 border px-1 py-0.5 font-mono text-[11px]" @input="(e) => setUnitEdit(u, { ...unitEdit(u), capMw: (e.target as HTMLInputElement).value === '' ? null : Number((e.target as HTMLInputElement).value) })" />
+                    <label class="font-mono text-[10px]" :class="unitEdit(u).mode === 'pct' ? 'text-sodium-300' : 'text-paper-500'" title="autoritativni mod">
+                      %smanj.
+                      <input :value="unitEdit(u).reductionPct ?? 0" type="number" step="0.01" min="0" max="100" :class="unitEdit(u).mode === 'pct' ? 'border-sodium-300/60' : 'border-ink-700'" class="bg-ink-900 text-paper-100 w-16 mx-1 border px-1 py-0.5 font-mono text-[11px]" @input="(e) => { const v = (e.target as HTMLInputElement).value; setUnitEdit(u, { ...unitEdit(u), mode: 'pct', reductionPct: v === '' ? null : Number(v) }) }" />
+                    </label>
+                    <span class="text-paper-500 font-mono text-[10px]" v-if="unitEdit(u).mode === 'pct'">= {{ mwFromReduction(u, unitEdit(u)) ?? "—" }} MW dopušteno</span>
                   </template>
-                  <span class="text-paper-400 font-mono text-[10px]">→ {{ allowedMw(u, unitEdit(u)) }} MW dopušteno</span>
+                  <span class="text-sodium-200 font-mono text-[10px]">→ {{ allowedMw(u, unitEdit(u)) }} MW dopušteno ({{ unitEdit(u).mode === 'mw' ? 'Max MW mod' : '% smanjenja mod' }})</span>
                 </div>
               </div>
 
@@ -732,11 +745,12 @@ function utcLabel(iso: string | null): string {
               <p v-if="pendingAssignments.length > 0" class="text-paper-300 mt-1 font-mono text-[10px]">
                 Promjena za {{ pendingAssignments.length }} jedinica:
                 <template v-for="(a, i) in pendingAssignments.slice(0, 8)" :key="a.unit_id">
-                  <span class="text-sodium-200">{{ a.unit_id }}</span> → {{ a.state === "on" ? "ON" : a.state === "off" ? "OFF" : `max ${a.cap_percent}% dopušteno` }}{{ i < Math.min(pendingAssignments.length, 8) - 1 ? ", " : "" }}
+                  <span class="text-sodium-200">{{ a.unit_id }}</span> → {{ a.state === "on" ? "ON" : a.state === "off" ? "OFF" : a.cap_mw !== undefined ? `max ${a.cap_mw} MW dopušteno` : `max ${a.cap_percent}% dopušteno` }}{{ i < Math.min(pendingAssignments.length, 8) - 1 ? ", " : "" }}
                 </template>
                 <span v-if="pendingAssignments.length > 8"> … ({{ pendingAssignments.length - 8 }} više)</span>
                 <span v-if="pendingPreviewMw !== null" class="text-paper-400"> · očekivani RASP. MAKS. ≈ {{ pendingPreviewMw }} MW (pregled; konačno izračunava engine)</span>
               </p>
+              <StateBlock v-if="assignmentError" kind="error">{{ assignmentError }}</StateBlock>
               <StateBlock v-if="applyError" kind="error">{{ applyError }}</StateBlock>
               <p v-if="applyMessage" class="text-sodium-200 mt-1 font-mono text-[10px]">{{ applyMessage }}</p>
               <p class="text-paper-400 mt-1 font-mono text-[10px]">

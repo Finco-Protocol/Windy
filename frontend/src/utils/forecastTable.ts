@@ -375,3 +375,24 @@ export function saveAvgPreference(siteId: string, pref: AvgPreference): void {
     /* storage blocked — persistence is best-effort, UI still works */
   }
 }
+
+/** PR#8 Correction D §4 — UKUPNO (Prosjek) sums ONLY the Average values of
+ *  rows actually displayed in the daily table (same calendar window), never
+ *  an extra ensemble-only day. Missing data stays missing: with no
+ *  contributor rows the result is null (rendered as an em dash) — NEVER 0.
+ *  A genuine below-cut-in forecast keeps its real 0 (rows exist with
+ *  hours_counted > 0 and mwh 0). */
+export function sumDisplayedAverages(
+  rows: { date: string }[],
+  avgByDate: Map<string, { mwh: number }>,
+): number | null {
+  let total = 0;
+  let n = 0;
+  for (const row of rows) {
+    const avg = avgByDate.get(row.date);
+    if (!avg) continue;
+    total += avg.mwh;
+    n += 1;
+  }
+  return n > 0 ? Math.round(total * 100) / 100 : null;
+}

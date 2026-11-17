@@ -17,6 +17,7 @@ runs keep their stored values, so provenance is retained:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -254,6 +255,26 @@ def apply_config_revision(db_path, site_id: str, changes: dict, note: str | None
             "VALUES (?, ?, ?, ?, ?, ?, 'owner')",
             (site_id, rev, changes_json, now, note, now),
         )
+        # Correction D §5: CURRENT owner-revised provenance label. The old
+        # assumptions keys stay untouched (historical source preserved); the
+        # new key states only what the owner actually confirmed (2.85 MW
+        # rating) and keeps the curve REFERENCE/UNVERIFIED — never a claim
+        # of a manufacturer-certified GE 2.85-116 curve or an invented rotor.
+        fleet_fields = {"capacity_mw", "turbine_count", "turbine_rated_mw"} & changed.keys()
+        if fleet_fields:
+            row2 = conn.execute("SELECT assumptions_json FROM assets WHERE id=?", (site_id,)).fetchone()
+            try:
+                assumptions = json.loads(row2["assumptions_json"] or "{}")
+            except Exception:
+                assumptions = {}
+            assumptions[f"owner_revision_{rev}"] = (
+                f"Vlasnicka revizija {rev} ({now}): "
+                + ", ".join(f"{k}={changed[k]}" for k in sorted(fleet_fields))
+                + ". Potvrdio vlasnik samo rating 2,85 MW po turbini; krivulja ostaje REFERENCE/UNVERIFIED "
+                "(skalirana ge103-2750) i NIJE proizvodjacki certificirana GE 2.85-116 krivulja; rotor/model "
+                "varijanta NIJE potvrdena."
+            )
+            conn.execute("UPDATE assets SET assumptions_json=? WHERE id=?", (dbm.j(assumptions), site_id))
     _ = current_constraints_revision  # kept for API-surface parity
     out = {
         "site_id": site_id,

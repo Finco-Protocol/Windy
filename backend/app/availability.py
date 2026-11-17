@@ -485,6 +485,18 @@ def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_lo
         for r in active:
             if r["end_utc"] is not None and r["end_utc"] <= now:
                 continue  # expired rows keep history untouched
+            # Correction D §5: FUTURE SCHEDULED restrictions (start_utc in the
+            # future) must SURVIVE a current ON/OFF/cap action on their unit —
+            # the owner's scheduled obligation activates later unchanged;
+            # only the owner explicitly cancels them (delete)
+            if r["start_utc"] > now:
+                conn.execute(
+                    "INSERT INTO operational_constraints (site_id, kind, unit_ids_json, cap_mw, cap_percent, "
+                    "start_utc, end_utc, revision, created_at_utc, created_by, superseded_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                    (site_id, r["kind"], r["unit_ids_json"], r["cap_mw"], r["cap_percent"], r["start_utc"], r["end_utc"], rev, now, r["created_by"]),
+                )
+                continue
             members = json.loads(r["unit_ids_json"]) if r["unit_ids_json"] else []
             remaining = [u for u in members if u not in assigned]
             if r["kind"] == "export_cap" or not members:
