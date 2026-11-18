@@ -644,6 +644,42 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
 
     # ---- collection ---------------------------------------------------------
 
+    # V1.8: independent per-coordinate projection. Explicit POST is bounded
+    # (one multi-location request per model) and never rewrites spot forecasts.
+    @app.get("/api/turbine-forecast")
+    def turbine_forecast(site_id: str = Query("krnovo"), days: int = Query(7, ge=1, le=15)):
+        from .turbine_spatial import read_per_turbine
+        return read_per_turbine(settings.db_path, site_id, days)
+
+    @app.post("/api/collect/turbines")
+    def collect_turbines(body: dict | None = None):
+        from .turbine_spatial import collect_per_turbine
+        b = body or {}
+        site_id = str(b.get("site_id") or "krnovo")
+        days = int(b.get("days") or 16)
+        if not 1 <= days <= 16:
+            raise ValueError("days must be 1..16")
+        store.load_site(settings.db_path, site_id)
+        # Keep the original single-spot collector independent and intact.
+        central = collect_site(settings.db_path, client, site_id, days=16)
+        spatial = collect_per_turbine(settings.db_path, client, site_id, days=16)
+        return {"spot": central, "per_turbine": spatial}
+
+    @app.get("/api/assets/{site_id}/turbine-forecast-export.xlsx")
+    def turbine_export_xlsx(
+        site_id: str, days: int = Query(7, ge=1, le=15),
+        unit: str = Query("mwh"), mode: str = Query("baseline"),
+    ):
+        from .turbine_spatial import read_per_turbine, build_per_turbine_xlsx
+        spatial = read_per_turbine(settings.db_path, site_id, days)
+        blob = build_per_turbine_xlsx(spatial, unit=unit, mode=mode)
+        fname = f"Windy_{site_id}_{days}d_per_turbine_{mode}_{unit}.xlsx"
+        return Response(
+            content=blob,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
     @app.post("/api/collect")
     def collect(body: dict | None = None):
         body = body or {}
