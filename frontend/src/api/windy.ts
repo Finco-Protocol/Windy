@@ -717,9 +717,10 @@ export const windyApi = {
   assets: (signal?: AbortSignal) => getJson<{ assets: AssetSummary[] }>("/assets", signal),
   assetCreate: (body: AssetCreate) => postJson<WindySite>("/assets", body),
   powerCurves: (signal?: AbortSignal) => getJson<{ curves: PowerCurveSummary[] }>("/power-curves", signal),
-  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false) =>
+  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false,
+    modelingMode: "spot" | "per_turbine" = "spot") =>
     getJson<ForecastResponse>(
-      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}`,
+      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}&modeling_mode=${modelingMode}`,
       signal,
     ),
   windNow: (siteId: string, signal?: AbortSignal) =>
