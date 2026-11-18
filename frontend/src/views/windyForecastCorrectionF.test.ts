@@ -359,3 +359,128 @@ describe("Correction G P1-B — Compare Prosjek respects the Average toggle", ()
     expect(cells!.every((c) => c === "—")).toBe(true), "explicit empty selection stays blank";
   }, 20000);
 });
+
+ 
+describe("Correction H — committed writes, validation and site-switch races", () => {
+  async function selectUnit(unit: string): Promise<void> {
+    const el = [...document.body.querySelectorAll("[role=checkbox]")].find((node) =>
+      node.querySelector(`[aria-label^="${unit}:"]`),
+    ) as HTMLElement | undefined;
+    expect(el).toBeTruthy();
+    el!.click();
+    await nextTick();
+  }
+
+  it("successful POST remains successful if the subsequent operating-status fetch fails", async () => {
+    const h = makeHarness();
+    let committed = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+      const path = raw.replace(/^https?:\\/\\/[^/]+/, "").split("?")[0]!;
+      if (path === "/api/assets/krnovo/status" && committed) {
+        return new Response(JSON.stringify({ detail: "status offline" }), {
+          status: 503, headers: { "Content-Type": "application/json" },
+        });
+      }
+      const res = await h.fetchMock(input, init);
+      if (path === "/api/assets/krnovo/constraints/replace-units" && res.ok) committed = true;
+      return res;
+    }));
+    await mountView(router);
+    await settle(undefined, (t) => t.includes("74.1"));
+    await openChartsAndEditor();
+    await selectUnit("WTG-010");
+    const btn = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Isključi odabrane");
+    btn!.click();
+    await settle(undefined, (t) => t.includes("Status elektrane nije potvrđen"));
+    expect(h.state.replaceCalls).toHaveLength(1);
+    expect(document.body.textContent).toContain("Spremljeno atomarno");
+    expect(document.body.textContent).not.toContain("Spremanje nije potvrđeno");
+    expect([...document.body.querySelectorAll("[role=checkbox][aria-checked=true]")]).toHaveLength(0);
+  }, 20000);
+
+  it("invalid Max MW shows an error without POST or loss of selection", async () => {
+    const h = makeHarness();
+    vi.stubGlobal("fetch", h.fetchMock);
+    await mountView(router);
+    await settle(undefined, (t) => t.includes("74.1"));
+    await openChartsAndEditor();
+    await selectUnit("WTG-010");
+    const label = [...document.body.querySelectorAll("label")].find((l) => l.textContent?.includes("Max MW (dopušteno)"));
+    const input = label?.querySelector("input") as HTMLInputElement | null;
+    expect(input).toBeTruthy();
+    input!.value = "-1";
+    input!.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    const btn = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Spremi limit na odabrane");
+    btn!.click();
+    await nextTick();
+    expect(document.body.textContent).toContain("Nije spremljeno: WTG-010: Max MW");
+    expect(h.state.replaceCalls).toHaveLength(0);
+    expect(document.body.querySelector('[role=checkbox][aria-checked=true]')).not.toBeNull();
+  }, 20000);
+
+  it("invalid percentage displays a validation error and never posts", async () => {
+    const h = makeHarness();
+    vi.stubGlobal("fetch", h.fetchMock);
+    await mountView(router);
+    await settle(undefined, (t) => t.includes("74.1"));
+    await openChartsAndEditor();
+    await selectUnit("WTG-010");
+    const modeBtn = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "% smanjenja");
+    expect(modeBtn).toBeTruthy();
+    modeBtn!.click();
+    await nextTick();
+    const label = [...document.body.querySelectorAll("label")].find((l) => l.textContent?.includes("% smanjenja") && l.querySelector('input[type="number"]'));
+    const input = label?.querySelector("input") as HTMLInputElement | null;
+    expect(input).toBeTruthy();
+    input!.value = "101";
+    input!.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    const btn = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Spremi limit na odabrane");
+    btn!.click();
+    await nextTick();
+    expect(document.body.textContent).toContain("Nije spremljeno: WTG-010: % smanjenja");
+    expect(h.state.replaceCalls).toHaveLength(0);
+  }, 20000);
+
+  it("switching site during two pending Excel requests does not unlock the newer request", async () => {
+    const h = makeHarness();
+    const exportWaiters: ((response: Response) => void)[] = [];
+    const exportUrls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const raw = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+      if (raw.includes("forecast-export.xlsx")) {
+        exportUrls.push(raw);
+        return new Promise<Response>((resolve) => exportWaiters.push(resolve));
+      }
+      return h.fetchMock(input, init);
+    }));
+    await mountView(router);
+    await settle(undefined, (t) => t.includes("74.1"));
+    const exportBtn = () => [...document.body.querySelectorAll("button")].find((b) => b.textContent?.includes("Export Excel")) as HTMLButtonElement | undefined;
+    expect(exportBtn()).toBeTruthy();
+    exportBtn()!.click();
+    await settle(undefined, () => exportWaiters.length === 1);
+    expect(exportBtn()!.disabled).toBe(true);
+
+    await router.push({ path: "/", query: { site: "second-site" } });
+    await nextTick();
+    expect(exportBtn()!.disabled).toBe(false);
+    exportBtn()!.click();
+    await settle(undefined, () => exportWaiters.length === 2);
+    expect(exportUrls[1]).toContain("/api/assets/second-site/forecast-export.xlsx");
+    expect(exportBtn()!.disabled).toBe(true);
+
+    const badXlsx = () => new Response("<html>not an XLSX</html>", {
+      status: 200, headers: { "Content-Type": "text/html" },
+    });
+    exportWaiters[0]!(badXlsx()); // stale, old site must not clear new site's busy flag
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(exportBtn()!.disabled).toBe(true);
+    exportWaiters[1]!(badXlsx());
+    await settle(undefined, (t) => t.includes("Export nije vratio XLSX"));
+    expect(exportBtn()!.disabled).toBe(false);
+  }, 20000);
+});
