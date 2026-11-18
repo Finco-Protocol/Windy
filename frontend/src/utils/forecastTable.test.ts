@@ -88,13 +88,14 @@ describe("buildHourlyRows", () => {
 });
 
 describe("MODEL_LABELS_HR", () => {
-  it("covers all seven registered models", () => {
+  it("covers all eight registered models", () => {
     expect(Object.keys(MODEL_LABELS_HR).sort()).toEqual([
       "ecmwf_ifs",
       "gem_seamless",
       "gfs_seamless",
       "icon_eu",
       "icon_global",
+      "meteofrance_arpege_europe",
       "meteofrance_arpege_world",
       "ukmo_seamless",
     ]);
