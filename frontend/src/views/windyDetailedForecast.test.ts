@@ -100,7 +100,7 @@ describe("Detailed forecast — 26 WTG drilldown", () => {
     expect(txt).toContain("WTG-001");
     expect(txt).toContain("WTG-026");
     expect(txt).toContain("ECMWF IFS");
-    expect(txt).toContain("234");
+    expect(txt).toContain("10"); // one turbine's base MWh, not the farm table duplicated
     expect(document.body.querySelectorAll('[aria-label="Prognoza po turbini"]').length).toBe(1);
     expect(calls.filter(c=>c.path==="/api/turbine-forecast"&&c.method==="GET")).toHaveLength(1);
     expect(calls.filter(c=>c.method==="POST")).toHaveLength(0);
