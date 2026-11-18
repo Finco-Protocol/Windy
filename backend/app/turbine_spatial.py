@@ -238,6 +238,11 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
             item["warning"] = "Odaberite Osvježi per turbine; nema valjanih podataka po koordinatama."
             models.append(item)
             continue
+        if spec.met_only:
+            item["status"] = "MET_ONLY"
+            item["warning"] = "Samo 10 m meteorološki vjetar; bez izračuna proizvodnje po turbini."
+            models.append(item)
+            continue
         unit_winds = json.loads(snap["payload_json"])
         if set(unit_winds) != set(by_location):
             item["status"] = "INVALID_SNAPSHOT"
@@ -259,8 +264,8 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
             intervals = {r["valid_at_utc"]: float(r["interval_hours"]) for r in conn.execute(
                 "SELECT valid_at_utc,interval_hours FROM forecast_points WHERE run_id=?", (run["id"],)
             ).fetchall()}
-        all_times = sorted(set.intersection(*[set(x) for x in per_unit.values()])) if per_unit else []
-        unit_daily = {u: {d: {"mwh": 0., "hours": 0., "wind_sum": 0., "wind_n": 0}
+        all_times = sorted(set.union(*[set(x) for x in per_unit.values()])) if per_unit else []
+        unit_daily = {u: {d: {"mwh": 0., "adjusted_mwh": 0., "hours": 0., "wind_sum": 0., "wind_n": 0}
                           for d in dates} for u in per_unit}
         daily = {d: {"date": d, "base_mwh": 0., "adjusted_mwh": 0.,
                      "hours_counted": 0., "missing_intervals": 0,
@@ -291,6 +296,7 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
                     else:
                         cap = av._most_restrictive_cap(constraints, unit, stamp, float(by_location[unit]["rated_mw"]))
                         adjusted = min(base, cap) if cap is not None else base
+                    ud["adjusted_mwh"] += adjusted * hours
                     powers.append((unit, base, adjusted))
                     base_sum += base
                     adjusted_sum += adjusted
@@ -306,8 +312,10 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
         item["grid_cells"] = snap["unique_grid_cells"]
         item["location_source"] = snap["location_source"]
         item["warning"] = ("Provider je vratio jednu NWP mrežnu ćeliju za sve lokacije; "
-                           "26 zahtjeva ne znači 26 neovisnih prognoza."
-                           if snap["unique_grid_cells"] <= 1 else
+                           "26 koordinata ne znači 26 neovisnih prognoza."
+                           if snap["unique_grid_cells"] == 1 else
+                           "Modelirani vjetar po koordinati; broj odvojenih NWP ćelija nije potvrđen."
+                           if snap["unique_grid_cells"] == 0 else
                            "Modelirani vjetar po koordinati; bez wake/CFD korekcije.")
         item["daily"] = [
             {**d, "base_mwh": round(d["base_mwh"], 3) if d["hours_counted"] else None,
@@ -320,6 +328,7 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
              "longitude": by_location[unit]["longitude"], "elevation_m": by_location[unit].get("elevation_m"),
              "daily": [
                  {"date": d, "base_mwh": round(row["mwh"], 3) if row["hours"] else None,
+                  "adjusted_mwh_pre_export_cap": round(row["adjusted_mwh"], 3) if row["hours"] else None,
                   "wind_mean_mps": round(row["wind_sum"]/row["wind_n"], 3) if row["wind_n"] else None,
                   "hours": round(row["hours"], 3)}
                  for d, row in per_unit_days.items()
@@ -335,3 +344,75 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
                 "Prilagođena farm-suma uključuje zadana per-unit ograničenja i farm export cap. "
                 "Neuspjela lokacija ne pretvara se u 0 MW."
     }
+
+ 
+
+def build_per_turbine_xlsx(spatial: dict, unit: str = "mwh", mode: str = "baseline") -> bytes:
+    """Read-only export of the same verified 26-coordinate model shown on screen.
+
+    This workbook NEVER silently exports the one-spot model under a spatial
+    name. No formulas: guard even metadata strings against formula injection.
+    """
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    if unit not in ("mwh", "gwh") or mode not in ("baseline", "adjusted"):
+        raise ValueError("unit must be mwh/gwh, mode baseline/adjusted")
+    divisor = 1000 if unit == "gwh" else 1
+    valkey = "adjusted_mwh" if mode == "adjusted" else "base_mwh"
+    wsname = f"Farm {unit.upper()}"
+    wb = Workbook()
+    farm = wb.active
+    farm.title = wsname
+    farm.append(["Datum (site lokalno)", "Model", f"Farm {unit.upper()}",
+                 "Sati potpune pokrivenosti", "N turbina", "Djelomično", "Status"])
+    units = wb.create_sheet(f"WTG {unit.upper()}")
+    units.append(["Datum", "Model", "Turbina", f"Base {unit.upper()}",
+                  f"Adjusted pre-export {unit.upper()}", "Vjetar m/s",
+                  "Sati", "Lat", "Lon", "Nadmorska visina m"])
+    coverage = wb.create_sheet("Pokrivenost")
+    coverage.append(["Model", "Issue UTC", "Status", "NWP grid cells", "Izvor lokacija", "Napomena"])
+    for m in spatial["models"]:
+        def cell(s):
+            if not isinstance(s, str):
+                return s
+            return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+
+        coverage.append([cell(m["label"]), cell(m["issue_utc"]), cell(m["status"]),
+                         m["grid_cells"], cell(m.get("location_source") or ""),
+                         cell(m.get("warning") or "")])
+        for d in m["daily"]:
+            val = d[valkey]
+            farm.append([d["date"], m["label"], (val / divisor if val is not None else None),
+                         d["hours_counted"], d["n_turbines"], d["partial"], m["status"]])
+        for t in m["turbines"]:
+            for d in t["daily"]:
+                base = d["base_mwh"]
+                adj = d["adjusted_mwh_pre_export_cap"]
+                units.append([d["date"], m["label"], t["unit_id"],
+                              base / divisor if base is not None else None,
+                              adj / divisor if adj is not None else None,
+                              d["wind_mean_mps"], d["hours"],
+                              t["latitude"], t["longitude"], t["elevation_m"]])
+    meta = wb.create_sheet("Metapodaci")
+    for row in [
+        ("Mod", "per_turbine"), ("N turbina", 26),
+        ("Model", "Independent NWP coordinates; NOT 26 anemometer measurements"),
+        ("Izvor i ID mapping", spatial["location_info"]["location_source"]),
+        ("Privremeno mapiranje", str(spatial["location_info"]["provisional_mapping"])),
+        ("Izvoz", mode), ("Jedinica", unit.upper()),
+        ("Farm export cap", "Applied ONLY to adjusted farm total; WTG adjusted values are PRE export cap"),
+        ("Ograničenja", "Per-unit OFF and MW/% caps applied by UTC hour"),
+        ("Ograničenja modela", "No wake/CFD or unverified topographic uplift"),
+    ]:
+        meta.append(row)
+    for sheet in wb:
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="203850")
+    out = BytesIO()
+    wb.save(out)
+    return out.getvalue()
