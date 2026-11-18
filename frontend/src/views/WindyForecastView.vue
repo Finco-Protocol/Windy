@@ -1191,6 +1191,20 @@ function utcLabel(iso: string | null): string {
             <div v-else-if="Object.keys(adjustedUnavailable).length" class="text-heat-300 mb-2 font-mono text-[10px]">
               ⚠ {{ Object.values(adjustedUnavailable).join(" · ") }}
             </div>
+            <p class="text-paper-400 mb-2 font-mono text-[10px]">
+              „Osvježi” uvijek dohvaća maksimalni horizont po modelu; 7/10/15 mijenja samo prikaz. Arhivirani runovi se ne prepisuju.
+            </p>
+            <div class="mb-2 flex flex-wrap gap-x-4 gap-y-1 font-mono text-[10px]" aria-label="Stvarna pokrivenost prognoznih runova">
+              <span v-for="c in modelColumns.filter((x) => !x.metOnly)" :key="c.id"
+                :class="c.cycle === 'short' || c.cycle === 'incomplete-long' ? 'text-heat-300' : 'text-paper-400'"
+                :title="c.newerIssuePreserved ? 'Noviji kratki run ostaje u Povijesti, ovdje se koristi zadnji puni dugi run.' : ''">
+                <strong>{{ c.label }}</strong>
+                <span v-if="cycleText(c.cycle)"> · {{ cycleText(c.cycle) }}</span>
+                · izdano {{ c.issue ?? "nepoznato" }}
+                · zadnji valjani sat {{ c.lastUsable ?? "nedostaje" }}
+                · lead {{ c.leadHours === null ? "—" : c.leadHours + " h" }}
+              </span>
+            </div>
             <StateBlock v-if="visibleRows.length === 0" kind="empty" :relaxed="true">
               Nema arhiviranih prognoza — pritisnite „Osvježi".
             </StateBlock>
@@ -1203,6 +1217,8 @@ function utcLabel(iso: string | null): string {
                       <span class="inline-flex items-center gap-1.5">
                         <span class="inline-block size-2" :style="{ background: modelColor(c.id) }" />
                         {{ c.label }}<span v-if="c.metOnly" class="text-paper-500" title="samo vjetar (10 m) — izuzet iz MWh i Prosjeka">*</span>
+                        <span v-else-if="c.cycle === 'long'" class="text-sodium-300 text-[9px]" title="Potvrđen dugi 00/12 UTC run">D</span>
+                        <span v-else-if="c.cycle === 'short' || c.cycle === 'incomplete-long'" class="text-heat-300 text-[9px]" title="Kratki ili nepotpuni run, bez lažnog produljivanja">!</span>
                       </span>
                     </th>
                     <th class="text-sodium-300 py-1.5 pr-4 text-right" :title="avgCoverageNote ?? ''">
@@ -1220,7 +1236,10 @@ function utcLabel(iso: string | null): string {
                       <template v-else :title="adjustedUnavailable[c.id] || row.flags[c.id] || 'nema podataka'">—</template>
                     </td>
                     <td class="text-sodium-100 py-1.5 pr-4 text-right" :title="avgByDate.get(row.date) ? `${avgByDate.get(row.date)!.contributors_min}–${avgByDate.get(row.date)!.contributors_max} modela po satu; pokriveno ${avgByDate.get(row.date)!.hours_counted} h` : 'nema ensemble vrijednosti'">
-                      <template v-if="avgPref.enabled && avgByDate.get(row.date)">{{ fmtE(avgByDate.get(row.date)!.mwh) }}</template>
+                      <template v-if="avgPref.enabled && avgByDate.get(row.date)">
+                        {{ fmtE(avgByDate.get(row.date)!.mwh) }}
+                        <span class="text-paper-500 text-[9px]">N={{ avgByDate.get(row.date)!.contributors_min === avgByDate.get(row.date)!.contributors_max ? avgByDate.get(row.date)!.contributors_min : avgByDate.get(row.date)!.contributors_min + "–" + avgByDate.get(row.date)!.contributors_max }}</span>
+                      </template>
                       <template v-else>—</template>
                     </td>
                   </tr>
