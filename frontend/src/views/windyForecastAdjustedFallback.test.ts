@@ -98,6 +98,7 @@ function makeFetch(_mode: "baseline" | "adjusted") {
     const path = u.replace(/^https?:\/\/[^/]+/, "").split("?")[0]! + "?" + (u.includes("?") ? u.split("?")[1]! : "");
     let body: unknown = {};
     if (path.startsWith("/api/site")) body = { site: SITE, power_curve: { id: "ge103-2750-oedb", label: "GE ref", status: "reference", provenance: "OEDB", rated_power_mw: 2.78, cut_in_mps: 3, rated_mps: 12, cut_out_mps: 25 }, models: [], source_provider: "open-meteo", source_note: "" };
+    else if (path.startsWith("/api/turbine-forecast")) body = { site_id: "krnovo", mode: "per_turbine", days: 7, location_info: { location_source: "owner-file-provisional", location_revision: 0, provisional_mapping: true, virtual_inventory: false, inventory_revision: 2, n_turbines: 26 }, models: [], note: "synthetic 26 coordinates" };
     else if (path.startsWith("/api/forecast")) body = forecastPayload(path.includes("with_availability=true") ? "adjusted" : "baseline");
     else if (path.startsWith("/api/assets/krnovo/status")) body = { site_id: "krnovo", installed_mw: 0, available_max_mw: 0, offline_count: 0, curtailed_count: 0, farm_export_cap_mw: null, n_turbines: 0, inventory_revision: 0, constraints_revision: 0, inventory_present: false, n_turbines_inventory: 0 };
     else if (path.startsWith("/api/assets/krnovo/turbines")) body = { site_id: "krnovo", revision: 0, n_turbines: 0, installed_mw: 0, turbines: [] };
