@@ -3,6 +3,7 @@ import { computed, ref, watch, type Ref } from "vue";
 import VChart from "vue-echarts";
 
 import AppFooter from "@/components/AppFooter.vue";
+import PerTurbinePanel from "@/components/PerTurbinePanel.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SegmentedToggle from "@/components/SegmentedToggle.vue";
 import SiteSelector from "@/components/SiteSelector.vue";
@@ -51,6 +52,12 @@ const HORIZON_OPTIONS = [
   { value: 15, label: "15 dana" },
 ] as const;
 const days = ref<7 | 10 | 15>(7);
+// Per turbine is the DEFAULT; the original one-spot forecast remains selectable.
+const modelingMode = ref<"per_turbine" | "spot">("per_turbine");
+const MODELING_OPTIONS = [
+  { value: "per_turbine", label: "Po turbini (26)" },
+  { value: "spot", label: "1 spot" },
+] as const;
 
 // ---- bazni vs prilagođeni prikaz -------------------------------------------
 const VIEW_OPTIONS = [
@@ -83,6 +90,11 @@ const fcResource = useAbortableResource<ForecastResponse>(
   () => [days.value, siteId.value, viewMode.value],
 );
 const { data: fcData, loading: fcLoading, error: fcError } = fcResource;
+const spatialResource = useAbortableResource(
+  (signal) => windyApi.perTurbineForecast(days.value, siteId.value, signal),
+  () => [days.value, siteId.value, modelingMode.value],
+);
+const { data: spatialData, loading: spatialLoading, error: spatialError } = spatialResource;
 
 const modelsWithRun = computed<ForecastModel[]>(() => (fcData.value?.models ?? []).filter((m) => m.run !== null));
 const productionIds = computed(() => productionModelIds(modelsWithRun.value));
@@ -676,7 +688,10 @@ async function exportExcel(): Promise<void> {
   const targetMode = viewMode.value;
   const targetUnit = energyUnit.value;
   try {
-    const url = windyApi.forecastExportUrl(targetSite, targetDays, targetMode, targetUnit, avgModels.value, avgPref.value.enabled); // Correction F P1-10
+    const targetModelingMode = modelingMode.value;
+    const url = targetModelingMode === "per_turbine"
+      ? windyApi.perTurbineExportUrl(targetSite, targetDays, targetMode, targetUnit)
+      : windyApi.forecastExportUrl(targetSite, targetDays, targetMode, targetUnit, avgModels.value, avgPref.value.enabled);
     const res = await fetch(url);
     if (!res.ok) {
       const text = await res.text().catch(() => "");
@@ -718,9 +733,21 @@ async function fetchNow(): Promise<void> {
   collectMessage.value = null;
   try {
     // Display selection does not determine persistence depth: collect full provider horizons.
-    const res = await windyApi.collect(16, siteId.value);
-    collectMessage.value = `Ažurirano ${res.collected_at_utc}`;
-    await Promise.all([fcResource.refresh(), nowResource.refresh(), refreshWeather()]);
+    const targetSite = siteId.value;
+    if (modelingMode.value === "per_turbine") {
+      const res = await windyApi.collectTurbines(targetSite);
+      if (siteId.value !== targetSite) return;
+      const stats = res.per_turbine.models.reduce((acc, x) => {
+        acc[x.status] = (acc[x.status] ?? 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      collectMessage.value = `Per turbine: ${JSON.stringify(stats)}. Nedostupni modeli ostaju bez prognoze; bez 1-spot zamjene.`;
+    } else {
+      const res = await windyApi.collect(16, targetSite);
+      if (siteId.value !== targetSite) return;
+      collectMessage.value = `Ažurirano ${res.collected_at_utc}`;
+    }
+    await Promise.all([fcResource.refresh(), spatialResource.refresh(), nowResource.refresh(), refreshWeather()]);
   } catch (e) {
     collectError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -949,6 +976,7 @@ function utcLabel(iso: string | null): string {
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-3">
+            <SegmentedToggle v-model="modelingMode" :options="[...MODELING_OPTIONS]" inline divided title="Per turbine: NWP na 26 GPS lokacija; 1 spot: originalna referentna točka" />
             <SegmentedToggle v-model="viewMode" :options="[...VIEW_OPTIONS]" inline divided @update:model-value="(v) => setViewMode(v as 'baseline' | 'adjusted')" />
             <SegmentedToggle v-model="days" :options="[...HORIZON_OPTIONS]" inline divided />
             <SegmentedToggle v-model="energyUnit" :options="[...ENERGY_UNIT_OPTIONS]" inline divided title="prikazna jedinica energije (snaga ostaje MW)" />
@@ -964,7 +992,7 @@ function utcLabel(iso: string | null): string {
               class="border-sodium-300/60 text-sodium-200 hover:bg-sodium-300/15 disabled:opacity-50 border px-3 py-1 font-mono text-[11px]"
               :disabled="collecting"
               @click="fetchNow"
-            >{{ collecting ? "Dohvaćam…" : "Osvježi" }}</button>
+            >{{ collecting ? "Dohvaćam…" : modelingMode === "per_turbine" ? "Osvježi 26 turbina" : "Osvježi 1 spot" }}</button>
           </div>
         </div>
 
@@ -974,7 +1002,13 @@ function utcLabel(iso: string | null): string {
 
         <StateBlock v-if="collectError" kind="error">Dohvat nije uspio: {{ collectError }}</StateBlock>
         <StateBlock v-if="exportError" kind="error">Excel export nije uspio: {{ exportError }}</StateBlock>
-        <StateBlock v-if="fcError" kind="error">{{ fcError }}</StateBlock>
+        <StateBlock v-if="fcError && modelingMode === 'spot'" kind="error">{{ fcError }}</StateBlock>
+        <StateBlock v-if="spatialError && modelingMode === 'per_turbine'" kind="error">Per turbine: {{ spatialError }}</StateBlock>
+        <StateBlock v-if="modelingMode === 'per_turbine' && spatialLoading && !spatialData" kind="loading" caption="Učitavam prognoze 26 turbina…" />
+        <PerTurbinePanel
+          v-if="modelingMode === 'per_turbine' && spatialData"
+          :forecast="spatialData" :unit="energyUnit" :view-mode="viewMode"
+        />
         <StateBlock v-else-if="fcLoading && !fcData" kind="loading" caption="Učitavam arhivirane prognoze…" />
 
         <!-- ===== SADA (Addendum A): modelirani uvjeti — NIKAD stvarni vjetar ===== -->
@@ -1179,7 +1213,7 @@ function utcLabel(iso: string | null): string {
           </CollapsibleSection>
         </section>
 
-        <template v-if="fcData">
+        <template v-if="modelingMode === 'spot' && fcData">
           <!-- ===== P0: dnevna tablica — TABLE FIRST ===== -->
           <section aria-label="Očekivana proizvodnja po danima">
             <h2 class="text-paper-50 mb-2 font-mono text-base tracking-wide">
