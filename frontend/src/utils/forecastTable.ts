@@ -23,7 +23,8 @@ export const MODEL_LABELS_HR: Record<string, string> = {
   gfs_seamless: "GFS",
   icon_global: "ICON Global",
   icon_eu: "ICON EU",
-  meteofrance_arpege_world: "ARPEGE",
+  meteofrance_arpege_world: "ARPEGE World",
+  meteofrance_arpege_europe: "ARPEGE Europe",
   gem_seamless: "GEM",
   ukmo_seamless: "UKMO (10 m)",
 };
