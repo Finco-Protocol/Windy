@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -291,6 +291,28 @@ CREATE INDEX IF NOT EXISTS idx_config_rev ON site_config_revisions(site_id, revi
 CREATE INDEX IF NOT EXISTS idx_locations_rev ON turbine_locations(site_id, revision);
 """
 
+MIGRATION_6_SQL = """
+-- v6: independent, immutable per-turbine meteorological snapshots.
+-- Foreign key to existing central run binds issue/provenance but never
+-- changes the legacy one-spot forecast archive or its historical points.
+CREATE TABLE IF NOT EXISTS turbine_forecast_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL REFERENCES forecast_runs(id),
+  site_id TEXT NOT NULL REFERENCES assets(id),
+  model_id TEXT NOT NULL,
+  locations_fingerprint TEXT NOT NULL,
+  location_revision INTEGER NOT NULL,
+  location_source TEXT NOT NULL,
+  inventory_revision INTEGER NOT NULL,
+  collected_at_utc TEXT NOT NULL,
+  unit_count INTEGER NOT NULL,
+  unique_grid_cells INTEGER NOT NULL,
+  payload_json TEXT NOT NULL,
+  UNIQUE (run_id, locations_fingerprint, inventory_revision)
+);
+CREATE INDEX IF NOT EXISTS idx_turbine_snap_run ON turbine_forecast_snapshots(run_id, location_revision);
+"""
+
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
@@ -321,6 +343,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 conn.execute("ALTER TABLE assets ADD COLUMN allow_scaled_reference INTEGER NOT NULL DEFAULT 0")
         if current < 5:
             conn.executescript(MIGRATION_5_SQL)
+        if current < 6:
+            conn.executescript(MIGRATION_6_SQL)
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
