@@ -123,3 +123,48 @@ def test_spatial_export_is_real_xlsx_not_one_spot_and_validates_options(client):
     assert any(row[2] == "WTG-026" for row in rows[1:])
     bad = api.get("/api/assets/krnovo/turbine-forecast-export.xlsx?days=7&unit=invalid")
     assert bad.status_code == 400
+
+
+
+def test_default_26_mode_hourly_charts_use_spatial_not_one_spot(client):
+    api, _settings = prepare(client)
+    r = api.post("/api/collect/turbines", json={"days": 16})
+    assert r.status_code == 200, r.text
+    spot = api.get("/api/forecast?days=7&modeling_mode=spot").json()
+    spatial = api.get("/api/forecast?days=7&modeling_mode=per_turbine&with_availability=true")
+    assert spatial.status_code == 200, spatial.text
+    by_id = {x["model_id"]: x for x in spatial.json()["models"]}
+    ecm = by_id["ecmwf_ifs"]
+    spot_ecm = next(m for m in spot["models"] if m["model_id"] == "ecmwf_ifs")
+    assert ecm["spatial"]["status"] == "OK"
+    assert ecm["spatial"]["grid_cells"] == 26
+    assert ecm["run"]["id"] == spot_ecm["run"]["id"]
+    assert ecm["points"] and spot_ecm["points"]
+    assert ecm["points"][0]["modeled_power_mw"] != spot_ecm["points"][0]["modeled_power_mw"]
+    assert ecm["points"][0]["wind_speed_mps"] != spot_ecm["points"][0]["wind_speed_mps"]
+    assert ecm["adjusted"]["available"]
+    assert ecm["adjusted"]["points"][0]["adjusted_mw"] == ecm["points"][0]["modeled_power_mw"]
+    assert ecm["daily_local"], "existing daily chart must use spatially aggregated hours"
+    assert spatial.json()["intersection"]["n_common_hours"] > 0
+
+
+def test_spatial_forecast_missing_snapshot_discloses_gap_no_spot_fallback(client):
+    api, _settings = prepare(client)
+    api.post("/api/collect", json={"days": 16})
+    m = next(m for m in api.get(
+        "/api/forecast?days=7&modeling_mode=per_turbine&with_availability=true"
+    ).json()["models"] if m["model_id"] == "ecmwf_ifs")
+    assert m["run"] is not None, "issue time survives for explicit gap disclosure"
+    assert m["points"] == [] and m["daily_local"] == []
+    assert m["adjusted"]["available"] is False
+    assert any("1-spot" in w for w in m["warnings"])
+    spot = next(m for m in api.get("/api/forecast?days=7&modeling_mode=spot").json()["models"]
+                if m["model_id"] == "ecmwf_ifs")
+    assert spot["points"], "original spot option stays intact"
+
+
+def test_invalid_spatial_mode_is_400_without_mutation(client):
+    api, settings = prepare(client)
+    assert api.get("/api/forecast?days=7&modeling_mode=invalid").status_code == 400
+    with sqlite3.connect(settings.db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM turbine_forecast_snapshots").fetchone()[0] == 0
