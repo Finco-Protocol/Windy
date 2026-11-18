@@ -840,7 +840,18 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         days: int = Query(10, ge=1, le=16),
         site_id: str = Query("krnovo"),
         with_availability: bool = Query(False),
+        modeling_mode: str = Query("spot"),
     ):
+        if modeling_mode not in ("spot", "per_turbine"):
+            raise ValueError("modeling_mode must be spot or per_turbine")
+        # v1 archive/accuracy/history remain spot for backward compatibility.
+        # The per-turbine forecast uses an independently archived *same-issue*
+        # 26-coordinate snapshot and NEVER falls back to spot MWh/wind.
+        spatial_models = {}
+        if modeling_mode == "per_turbine":
+            from .turbine_spatial import read_per_turbine
+            spatial = read_per_turbine(settings.db_path, site_id, min(days, 15))
+            spatial_models = {m["model_id"]: m for m in spatial["models"]}
         site_row = store.load_site(settings.db_path, site_id)
         curve = store.load_curve(settings.db_path, site_row.get("power_curve_id"))
         tz = ZoneInfo(site_row["timezone"])
@@ -871,10 +882,37 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     entry["warnings"].append("No archived run yet — use 'Fetch now'.")
                     models_out.append(entry)
                     continue
-                pts = conn.execute(
-                    "SELECT * FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc",
-                    (run["id"],),
-                ).fetchall()
+                if modeling_mode == "per_turbine":
+                    sm = spatial_models.get(spec.id) or {}
+                    data = sm.get("hourly") if sm.get("status") in ("OK", "MET_ONLY") else []
+                    pts = [
+                        {
+                            "valid_at_utc": p["valid_at_utc"],
+                            "wind_speed_mps": p["wind_speed_mps"],
+                            "wind_direction_deg": None,
+                            "height_method": spec.height_method,
+                            "modeled_power_mw": p["modeled_power_mw"],
+                            "interval_energy_mwh": p["interval_energy_mwh"],
+                            "interval_hours": p["interval_hours"],
+                            "status": p["status"],
+                        }
+                        for p in data
+                    ]
+                    entry["spatial"] = {
+                        "mode": "per_turbine", "status": sm.get("status", "NO_SPATIAL_SNAPSHOT"),
+                        "grid_cells": sm.get("grid_cells"), "note": sm.get("warning"),
+                    }
+                    if not pts:
+                        entry["warnings"].append(
+                            "Per turbine: nema verificirane potpune prostorne prognoze za ovaj run; "
+                            "početni 1-spot podaci nisu prikazani kao 26 turbina. "
+                            + str(sm.get("warning") or "")
+                        )
+                else:
+                    pts = conn.execute(
+                        "SELECT * FROM forecast_points WHERE run_id=? ORDER BY valid_at_utc",
+                        (run["id"],),
+                    ).fetchall()
                 visible = [p for p in pts if p["valid_at_utc"] <= horizon_end]
                 rows = [dict(p) for p in visible]
                 entry["run"] = {
@@ -1082,8 +1120,37 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                         "points": [],
                     }
                     continue
+                if modeling_mode == "per_turbine" and (
+                    spatial_models.get(entry["model_id"], {}).get("status") != "OK"
+                ):
+                    entry["adjusted"] = {
+                        "available": False,
+                        "reason": "Nema valjanih 26-per-turbine podataka; bez 1-spot fallbacka.",
+                        "daily": [], "points": [],
+                    }
+                    continue
                 try:
-                    sc = availability_mod.scenario_for_run(settings.db_path, site_id, entry["run"]["id"])
+                    if modeling_mode == "per_turbine":
+                        sm = spatial_models[entry["model_id"]]
+                        sc = {
+                            "inventory_revision": spatial["location_info"]["inventory_revision"],
+                            "constraints_revision": availability_mod.current_constraints_revision(
+                                settings.db_path, site_id
+                            ),
+                            "baseline_comparable": True,
+                            "baseline_comparable_reason": None,
+                            "points": [
+                                {
+                                    "valid_at_utc": p["valid_at_utc"],
+                                    "adjusted_mw": p["adjusted_mw"],
+                                    "interval_hours": p["interval_hours"],
+                                    "status": p["status"],
+                                }
+                                for p in sm["hourly"]
+                            ],
+                        }
+                    else:
+                        sc = availability_mod.scenario_for_run(settings.db_path, site_id, entry["run"]["id"])
                     # Correction A 2.2: a curve that is incompatible with the
                     # units' nameplate (without explicit scaled-reference
                     # opt-in) must FAIL CLEARLY — available stays false with
