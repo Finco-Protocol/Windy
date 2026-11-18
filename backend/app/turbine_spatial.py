@@ -150,7 +150,7 @@ def collect_per_turbine(db_path, client, site_id: str, days: int = 16) -> dict:
             continue
         try:
             raw = client.fetch_multi_single_run(
-                locations, spec, run["run_issued_utc"], min(days, spec.request_days),
+                locations, spec, _utc(run["run_issued_utc"]).strftime("%Y-%m-%dT%H:00"), min(days, spec.request_days),
             )
             parsed, grid_count = _parse_multi(spec, raw, locations, float(site["hub_height_m"]))
             # Snapshot is immutable, as is the linked central issue.
