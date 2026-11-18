@@ -120,7 +120,7 @@ describe("Per turbine default + one-spot optional",()=>{
     expect(spot).toBeTruthy();
     spot!.click();
     await until(()=>h.calls.some(c=>c.url.includes("modeling_mode=spot")));
-    expect(document.body.textContent).toContain("Izvor: 1 referentna točka elektrane");
+    await until(()=>document.body.textContent?.includes("Izvor: 1 referentna točka elektrane")??false);
     expect(document.body.querySelector('[aria-label="Prognoza po turbini"]')).toBeNull();
     const per=[...document.body.querySelectorAll("button")].find(b=>b.textContent?.trim()==="Po turbini (26)");
     expect(per).toBeTruthy();
