@@ -39,6 +39,7 @@ from .backfill_batch import (
     start_job,
 )
 from .collect import collect_site, iso_z, parse_utc
+from .horizon_policy import select_forecast_run
 from .config import Settings
 from .openmeteo import OMError, OpenMeteoClient
 from .registry import SOURCE_PROVIDER, WINDY_MODELS
@@ -813,14 +814,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         operational = None
         with dbm.session(settings.db_path) as conn:
             for spec in WINDY_MODELS:
-                run = conn.execute(
-                    """
-                    SELECT * FROM forecast_runs
-                    WHERE site_id=? AND model_id=? AND status='ok'
-                    ORDER BY COALESCE(run_issued_utc, dedupe_key) DESC LIMIT 1
-                    """,
-                    (site_row["id"], spec.id),
-                ).fetchone()
+                run, run_selection = select_forecast_run(conn, site_row["id"], spec)
                 entry: dict = {
                     "model_id": spec.id,
                     "provider": spec.provider,
@@ -831,6 +825,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     "requested_height_m": float(site_row["hub_height_m"]),
                     "height_note": spec.note,
                     "run": None,
+                    "run_selection": run_selection,
                     "points": [],
                     "daily_local": [],
                     "total_mwh_own_window": None,
@@ -854,6 +849,17 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
                     "forecast_days": run["forecast_days"],
                     "source_url": run["source_url"],
                 }
+                if run_selection and spec.id in ("ecmwf_ifs", "icon_global"):
+                    if run_selection["cycle_kind"] != "long":
+                        entry["warnings"].append(
+                            "Nema potvrđenog svježeg dugog 00/12 UTC runa s punim stvarnim horizontom; "
+                            "prikazuje se postojeći arhivirani run bez umjetnog popunjavanja."
+                        )
+                    elif run_selection["newer_issue_preserved"]:
+                        entry["warnings"].append(
+                            "Prikazan je posljednji dostupni puni dugi 00/12 UTC run; "
+                            "noviji kratki run ostaje zasebno sačuvan u Povijesti."
+                        )
                 if run["issue_source"] == "live-forecast-issue-unknown":
                     entry["warnings"].append("Issue time unknown (live-forecast fallback; archive had no run at collection time).")
                 if run["run_issued_utc"] is None:
