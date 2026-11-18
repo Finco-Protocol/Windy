@@ -17,4 +17,8 @@ COPY --from=frontend /app/frontend/dist /app/frontend/dist
 ENV WINDY_DB_PATH=/data/windy.db
 VOLUME ["/data"]
 EXPOSE 8000
+# Container healthcheck: /api/health must return 200 (python stdlib, no curl
+# needed in the slim image). start-period covers first startup + migrations.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
