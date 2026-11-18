@@ -270,6 +270,7 @@ def collect_model(
     spec: ModelSpec,
     days: int,
     now: datetime | None = None,
+    run_hour_filter: tuple[int, ...] | None = None,
 ) -> ModelCollectResult:
     """Collect the newest available archived run for one model; fall back to the
     live forecast API only when the archive has nothing, marking issue time
@@ -280,11 +281,23 @@ def collect_model(
 
     params_hint = f"lat={site['latitude']},lon={site['longitude']},model={spec.id}"
     try:
-        run_iso, raw = client.latest_available_run(site["latitude"], site["longitude"], spec, days, now=now)
+        if run_hour_filter is None:
+            run_iso, raw = client.latest_available_run(site["latitude"], site["longitude"], spec, days, now=now)
+        else:
+            run_iso, raw = client.latest_available_run(
+                site["latitude"], site["longitude"], spec, days, now=now,
+                max_probes=8, run_hour_filter=run_hour_filter,
+            )
         run_iso = normalize_run_iso(run_iso)
         issue_source = "single-runs-archive"
         source_url = f"single-runs-api.open-meteo.com (run={run_iso}, {params_hint})"
     except OMError as exc:
+        if run_hour_filter is not None:
+            # A long-cycle archive miss must not silently become a short live
+            # fallback with a fictitious issue time. Keep the original run.
+            result.status = "UNAVAILABLE"
+            result.error = str(exc)
+            return result
         log.warning("single-runs fetch failed for %s: %s — falling back to live forecast", spec.id, exc)
         result.status = "ok-issue-unknown"
         try:
@@ -343,8 +356,28 @@ def collect_site(
         collect_model(db_path, client, site, curve, spec, min(days, spec.request_days), now=now)
         for spec in WINDY_MODELS
     ]
+    # A newest 06/18Z ECMWF/ICON issue can be shorter than a preceding 00/12Z
+    # issue. Archive both; never overwrite the first issue or join their hours.
+    # If the first request already returned a 00/12Z issue, probing it again
+    # cannot extend an immutable snapshot, so skip the redundant upstream call.
+    long_cycles = []
+    by_id = {r.model_id: r for r in results}
+    for spec in WINDY_MODELS:
+        if spec.id not in ("ecmwf_ifs", "icon_global"):
+            continue
+        latest = by_id[spec.id]
+        issued = parse_utc(latest.run_issued_utc) if latest.run_issued_utc else None
+        if issued and issued.hour in (0, 12):
+            continue
+        long_cycles.append(
+            collect_model(
+                db_path, client, site, curve, spec,
+                min(days, spec.request_days), now=now, run_hour_filter=(0, 12),
+            ).__dict__
+        )
     return {
         "site_id": site_id,
         "collected_at_utc": iso_z(now),
         "models": [r.__dict__ for r in results],
+        "long_cycles": long_cycles,
     }

@@ -63,10 +63,12 @@ class FakeOMClient:
     def push_run(self, model_id: str, run_iso: str, raw: dict) -> None:
         self.runs.setdefault(model_id, []).append((run_iso, raw))
 
-    def latest_available_run(self, lat, lon, spec, days, now=None, max_probes=4):
+    def latest_available_run(self, lat, lon, spec, days, now=None, max_probes=4, run_hour_filter=None):
         stack = self.runs.get(spec.id) or []
+        if run_hour_filter is not None:
+            stack = [(issued, raw) for issued, raw in stack if int(issued[11:13]) in run_hour_filter]
         if not stack:
-            raise ModelRunUnavailable(f"no {spec.id} run found in the archive within the last {max_probes} cycles")
+            raise ModelRunUnavailable(f"no {spec.id} run found for cycles {run_hour_filter} in fake archive")
         return stack[-1]
 
     def fetch_forecast(self, lat, lon, spec, days):

@@ -187,6 +187,7 @@ class OpenMeteoClient:
         days: int,
         now: datetime | None = None,
         max_probes: int = 4,
+        run_hour_filter: tuple[int, ...] | None = None,
     ) -> tuple[str, dict]:
         """Find the newest archived run at/before `now` by probing 6-hourly run
         cycles backwards (models publish 00/06/12/18 UTC runs with publication
@@ -201,6 +202,8 @@ class OpenMeteoClient:
         last_error: Exception | None = None
         for k in range(max_probes):
             run_dt = base - timedelta(hours=6 * k)
+            if run_hour_filter is not None and run_dt.hour not in run_hour_filter:
+                continue  # targeted 00/12 UTC long cycle, not the newer 06/18 short cycle
             run_iso = run_dt.strftime("%Y-%m-%dT%H:00")
             try:
                 return run_iso, self.fetch_single_run(lat, lon, spec, run_iso, days)
@@ -208,7 +211,7 @@ class OpenMeteoClient:
                 last_error = exc
                 continue
         raise ModelRunUnavailable(
-            f"no {spec.id} run found in the archive within the last {max_probes} cycles"
+            f"no {spec.id} {run_hour_filter or 'any'} run found in the archive within the last {max_probes} cycles"
         ) from last_error
 
 

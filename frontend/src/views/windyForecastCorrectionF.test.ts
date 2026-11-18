@@ -484,3 +484,27 @@ describe("Correction H — committed writes, validation and site-switch races", 
     expect(exportBtn()!.disabled).toBe(false);
   }, 20000);
 });
+
+describe("Horizon H — refresh never truncates ECMWF or ICON", () => {
+  it("Osvježi requests the full 16-day collection depth even while viewing seven days", async () => {
+    const h = makeHarness();
+    const collectBodies: { days: number; site_id: string }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const raw = typeof input === "string" || input instanceof URL ? String(input) : input.url;
+      if (raw.split("?")[0] === "/api/collect" && init?.method === "POST") {
+        collectBodies.push(JSON.parse(String(init.body)));
+      }
+      return h.fetchMock(input, init);
+    }));
+    await mountView(router);
+    await settle();
+    const refresh = [...document.body.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === "Osvježi",
+    );
+    expect(refresh).toBeTruthy();
+    refresh!.click();
+    await settle(undefined, () => collectBodies.length === 1);
+    expect(collectBodies).toEqual([{ days: 16, site_id: "krnovo" }]);
+    expect(document.body.textContent).toContain("maksimalni horizont po modelu");
+  }, 20000);
+});
