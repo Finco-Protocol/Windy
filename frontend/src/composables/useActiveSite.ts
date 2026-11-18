@@ -7,6 +7,7 @@ export function buildNavLinks(siteId: string): { path: string; query: Record<str
   const siteQuery = siteId !== "krnovo" ? { site: siteId } : { site: undefined };
   return [
     { path: "/", query: siteQuery, label: "Forecast" },
+    { path: "/detailed-forecast", query: siteQuery, label: "Detailed forecast (26 WTG)" },
     { path: "/history", query: siteQuery, label: "Historical runs" },
     { path: "/actuals", query: siteQuery, label: "Actuals & accuracy" },
     { path: "/availability", query: siteQuery, label: "Availability" },

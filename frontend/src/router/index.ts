@@ -13,6 +13,12 @@ export const router = createRouter({
       component: WindyForecastView,
     },
     {
+      path: "/detailed-forecast",
+      name: "detailed-forecast",
+      // Dedicated 26-WTG drilldown, kept out of the main daily model table.
+      component: () => import("@/views/WindyDetailedForecastView.vue"),
+    },
+    {
       path: "/history",
       name: "history",
       // Screen B — Historical Runs (archived issues + bounded backfill).

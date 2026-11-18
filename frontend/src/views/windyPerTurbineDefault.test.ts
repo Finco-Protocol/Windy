@@ -108,19 +108,25 @@ describe("Per turbine default + one-spot optional",()=>{
   it("starts with the spatial 26-WTG table and leaves legacy 1 spot selectable",async()=>{
     const h=setupFetch();
     await mount();
-    await until(()=>document.body.textContent?.includes("Per turbine — 26 pojedinačnih lokacija")??false);
-    expect(document.body.textContent).toContain("WTG-001");
-    expect(document.body.textContent).toContain("120.1");
+    await until(()=>document.body.textContent?.includes("Očekivana proizvodnja po danima")??false);
+    expect(document.body.textContent).toContain("Izvor: 26 GPS lokacija");
+    expect(document.body.querySelector('[aria-label="Prognoza po turbini"]')).toBeNull();
+    expect(h.calls.filter(c=>c.url.startsWith("/api/turbine-forecast"))).toHaveLength(0);
+    const detailLink = [...document.body.querySelectorAll("a")].find(a=>a.textContent?.includes("Detalji po 26 WTG"));
+    expect(detailLink).toBeTruthy();
+    expect(detailLink!.getAttribute("href")).toContain("/detailed-forecast");
     expect(h.calls.some(c=>c.url.includes("modeling_mode=per_turbine"))).toBe(true);
     const spot=[...document.body.querySelectorAll("button")].find(b=>b.textContent?.trim()==="1 spot");
     expect(spot).toBeTruthy();
     spot!.click();
     await until(()=>h.calls.some(c=>c.url.includes("modeling_mode=spot")));
-    expect(document.body.textContent).not.toContain("Per turbine — 26 pojedinačnih lokacija");
+    await until(()=>document.body.textContent?.includes("Izvor: 1 referentna točka elektrane")??false);
+    expect(document.body.querySelector('[aria-label="Prognoza po turbini"]')).toBeNull();
     const per=[...document.body.querySelectorAll("button")].find(b=>b.textContent?.trim()==="Po turbini (26)");
     expect(per).toBeTruthy();
     per!.click();
-    await until(()=>document.body.textContent?.includes("Per turbine — 26 pojedinačnih lokacija")??false);
+    await until(()=>document.body.textContent?.includes("Izvor: 26 GPS lokacija")??false);
+    expect(document.body.querySelector('[aria-label="Prognoza po turbini"]')).toBeNull();
   },20000);
 
   it("manual refresh collects 26 locations, not implicit spot-only forecast",async()=>{

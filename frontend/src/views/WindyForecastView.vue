@@ -3,7 +3,6 @@ import { computed, ref, watch, type Ref } from "vue";
 import VChart from "vue-echarts";
 
 import AppFooter from "@/components/AppFooter.vue";
-import PerTurbinePanel from "@/components/PerTurbinePanel.vue";
 import CollapsibleSection from "@/components/CollapsibleSection.vue";
 import SegmentedToggle from "@/components/SegmentedToggle.vue";
 import SiteSelector from "@/components/SiteSelector.vue";
@@ -90,11 +89,6 @@ const fcResource = useAbortableResource<ForecastResponse>(
   () => [days.value, siteId.value, viewMode.value, modelingMode.value],
 );
 const { data: fcData, loading: fcLoading, error: fcError } = fcResource;
-const spatialResource = useAbortableResource(
-  (signal) => windyApi.perTurbineForecast(days.value, siteId.value, signal),
-  () => [days.value, siteId.value, modelingMode.value],
-);
-const { data: spatialData, loading: spatialLoading, error: spatialError } = spatialResource;
 
 const modelsWithRun = computed<ForecastModel[]>(() => (fcData.value?.models ?? []).filter((m) => m.run !== null));
 const productionIds = computed(() => productionModelIds(modelsWithRun.value));
@@ -447,7 +441,7 @@ async function saveAssignments(assignments: UnitAssignment[], targetUnits: strin
     }
     if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
     const refreshed = await Promise.allSettled([
-      refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh(), spatialResource.refresh(),
+      refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh(),
     ]);
     if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
     const failedRefreshes = refreshed.filter((x) => x.status === "rejected").length;
@@ -581,7 +575,7 @@ async function revertAll(): Promise<void> {
     if (!isCurrentWrite(targetSite, opId)) return;
     wtgSelected.value = new Set();
     perUnitState.value = {};
-    const refreshed = await Promise.allSettled([refreshConstraints(), refreshStatus(), fcResource.refresh(), spatialResource.refresh()]);
+    const refreshed = await Promise.allSettled([refreshConstraints(), refreshStatus(), fcResource.refresh()]);
     if (!isCurrentWrite(targetSite, opId)) return;
     applyMessage.value = `Sve per-turbine restrikcije uklonjene (revizija ${res.revision}).` +
       (refreshed.some((x) => x.status === "rejected") ? " Osvježavanje nije potpuno uspjelo." : "");
@@ -747,7 +741,7 @@ async function fetchNow(): Promise<void> {
       if (siteId.value !== targetSite) return;
       collectMessage.value = `Ažurirano ${res.collected_at_utc}`;
     }
-    await Promise.all([fcResource.refresh(), spatialResource.refresh(), nowResource.refresh(), refreshWeather()]);
+    await Promise.all([fcResource.refresh(), nowResource.refresh(), refreshWeather()]);
   } catch (e) {
     collectError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -1003,12 +997,6 @@ function utcLabel(iso: string | null): string {
         <StateBlock v-if="collectError" kind="error">Dohvat nije uspio: {{ collectError }}</StateBlock>
         <StateBlock v-if="exportError" kind="error">Excel export nije uspio: {{ exportError }}</StateBlock>
         <StateBlock v-if="fcError" kind="error">{{ fcError }}</StateBlock>
-        <StateBlock v-if="spatialError && modelingMode === 'per_turbine'" kind="error">Per turbine: {{ spatialError }}</StateBlock>
-        <StateBlock v-if="modelingMode === 'per_turbine' && spatialLoading && !spatialData" kind="loading" caption="Učitavam prognoze 26 turbina…" />
-        <PerTurbinePanel
-          v-if="modelingMode === 'per_turbine' && spatialData"
-          :forecast="spatialData" :unit="energyUnit" :view-mode="viewMode"
-        />
         <StateBlock v-if="fcLoading && !fcData" kind="loading" caption="Učitavam arhivirane prognoze…" />
 
         <!-- ===== SADA (Addendum A): modelirani uvjeti — NIKAD stvarni vjetar ===== -->
@@ -1219,6 +1207,12 @@ function utcLabel(iso: string | null): string {
             <h2 class="text-paper-50 mb-2 font-mono text-base tracking-wide">
               Očekivana proizvodnja po danima ({{ energyUnit.toUpperCase() }}) — {{ viewMode === "adjusted" ? (adjustedAllUnavailable ? "prilagođeni prikaz NIJE dostupan (nijedna vrijednost nije prilagođena — bazne vrijednosti NISU prikazani)" : "prilagođeno na raspoloživost") : "bazno (bez ograničenja)" }}
             </h2>
+            <p class="text-paper-400 mb-2 font-mono text-[10px]" aria-label="Izvor modeliranja">
+              Izvor: {{ modelingMode === "per_turbine" ? "26 GPS lokacija — zbroj pojedinačnih WTG, bez 1-spot zamjene" : "1 referentna točka elektrane" }}.
+              <RouterLink v-if="modelingMode === 'per_turbine'"
+                :to="{ path: '/detailed-forecast', query: siteId !== 'krnovo' ? { site: siteId } : {} }"
+                class="text-sodium-200 hover:underline">Detalji po 26 WTG</RouterLink>
+            </p>
             <div v-if="adjustedAllUnavailable" class="text-heat-300 mb-2 font-mono text-[10px]">
               ⚠ Prilagođeni izračun nije moguć za nijedan model ({{ Object.values(adjustedUnavailable)[0] ?? "nema valjanih adjusted vrijednosti" }}). Tablica je PRAZNA namjerno — bazni MWh se ovdje nikad ne prikazuju kao prilagođeni. Prebacite na „Bazno" za bazne vrijednosti.
             </div>

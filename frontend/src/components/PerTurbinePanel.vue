@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import type { SpatialForecast, SpatialModel } from "@/api/windy";
+import type { SpatialForecast, SpatialModel, SpatialTurbine } from "@/api/windy";
+import { formatEnergy as formatStoredEnergy } from "@/utils/energyUnits";
 
 const props = defineProps<{
   forecast: SpatialForecast;
@@ -8,29 +9,24 @@ const props = defineProps<{
   viewMode: "baseline" | "adjusted";
 }>();
 
-const selectedId = ref("ecmwf_ifs");
+const selectedId = ref("");
 const active = computed<SpatialModel | undefined>(() =>
-  props.forecast.models.find((m) => m.model_id === selectedId.value) ??
-  props.forecast.models.find((m) => m.status === "OK"),
+  (selectedId.value ? props.forecast.models.find((m) => m.model_id === selectedId.value) : undefined) ??
+  props.forecast.models.find((m) => m.status === "OK" && !m.met_only) ??
+  props.forecast.models.find((m) => !m.met_only),
 );
 watch(
   () => props.forecast.site_id,
-  () => { selectedId.value = "ecmwf_ifs"; },
-);
-const allDates = computed(() =>
-  props.forecast.models.find((m) => m.daily.length > 0)?.daily.map((r) => r.date) ?? [],
+  () => { selectedId.value = ""; },
 );
 const usable = computed(() => props.forecast.models.filter((m) => m.status === "OK" && !m.met_only));
-const chosenTotal = (m: SpatialModel, date: string): number | null => {
-  const day = m.daily.find((r) => r.date === date);
-  return props.viewMode === "adjusted" ? (day?.adjusted_mwh ?? null) : (day?.base_mwh ?? null);
-};
 const chosenUnit = (value: { base_mwh: number | null; adjusted_mwh_pre_export_cap: number | null }): number | null =>
   props.viewMode === "adjusted" ? value.adjusted_mwh_pre_export_cap : value.base_mwh;
-const formatEnergy = (mwh: number | null | undefined): string => {
-  if (mwh == null || !Number.isFinite(mwh)) return "—";
-  return props.unit === "gwh" ? (mwh / 1000).toFixed(4) : mwh.toFixed(1);
-};
+const formatEnergy = (mwh: number | null | undefined): string => formatStoredEnergy(mwh, props.unit) ?? "—";
+function turbineTotal(turbine: SpatialTurbine): number | null {
+  const available = turbine.daily.map((day) => chosenUnit(day)).filter((v): v is number => v !== null);
+  return available.length ? available.reduce((sum, value) => sum + value, 0) : null;
+}
 </script>
 
 <template>
@@ -54,36 +50,11 @@ const formatEnergy = (mwh: number | null | undefined): string => {
       Podaci iz „1 spot” načina NE koriste se kao zamjena.
     </div>
 
-    <div v-if="allDates.length" class="overflow-x-auto">
-      <h3 class="text-paper-100 mb-2 font-mono text-sm">Usporedba ukupne proizvodnje po modelima ({{ unit.toUpperCase() }})</h3>
-      <table class="min-w-max w-full font-mono text-[11px]">
-        <thead><tr class="border-ink-700 border-b">
-          <th class="p-2 text-left">Model</th>
-          <th v-for="d in allDates" :key="d" class="p-2 text-right">{{ d }}</th>
-          <th class="p-2 text-left">NWP ćelija</th>
-        </tr></thead>
-        <tbody>
-          <tr v-for="model in forecast.models.filter((m) => !m.met_only)" :key="model.model_id" class="border-ink-800 border-b">
-            <td class="text-paper-100 p-2">{{ model.label }}</td>
-            <td v-for="d in allDates" :key="d" class="text-sodium-200 p-2 text-right"
-              :title="model.daily.find((row) => row.date === d)?.partial ? 'Djelomičan dan, ne prikazuje procjenu za sve sate' : ''">
-              {{ formatEnergy(chosenTotal(model, d)) }}
-              <span v-if="model.daily.find((row) => row.date === d)?.partial" class="text-heat-300">⚠</span>
-            </td>
-            <td class="text-paper-400 p-2">{{ model.grid_cells ?? "—" }}</td>
-          </tr>
-        </tbody>
-      </table>
-      <p class="text-paper-400 mt-1 font-mono text-[10px]">
-        Vrijednosti po modelima nisu prosječene niti umjetno popunjene. NWP ćelija ≠ broj turbina.
-        ⚠ označava djelomičnu pokrivenost.
-      </p>
-    </div>
-
     <div class="flex flex-wrap items-center gap-3">
       <label for="windy-per-turbine-model" class="text-paper-300 font-mono text-[11px]">Model za pregled turbina</label>
       <select id="windy-per-turbine-model" v-model="selectedId"
         class="bg-ink-900 border-ink-600 text-paper-50 rounded border px-3 py-1 font-mono text-xs">
+        <option value="" disabled>Automatski: prvi dostupni model</option>
         <option v-for="m in forecast.models.filter((x) => !x.met_only)" :key="m.model_id" :value="m.model_id">
           {{ m.label }} — {{ m.status }}
         </option>
@@ -95,12 +66,17 @@ const formatEnergy = (mwh: number | null | undefined): string => {
       {{ active.warning }}
     </p>
 
+    <div v-if="active && active.turbines.length === 0" role="status" class="text-heat-300 font-mono text-xs">
+      Za {{ active.label }} nisu dostupni pojedinačni WTG podaci ({{ active.status }}).
+      Osvježite 26 turbina ili odaberite drugi model.
+    </div>
     <div v-if="active && active.turbines.length" class="overflow-x-auto">
       <h3 class="text-paper-100 mb-2 font-mono text-sm">Proizvodnja i raspoloživost svake turbine ({{ unit.toUpperCase() }})</h3>
       <table class="min-w-max w-full font-mono text-[11px]">
         <thead><tr class="border-ink-700 border-b">
           <th class="p-2 text-left">WTG</th>
           <th v-for="day in active.daily" :key="day.date" class="p-2 text-right">{{ day.date }}</th>
+          <th class="p-2 text-right">UKUPNO</th>
           <th class="p-2 text-right">Visina terena</th>
         </tr></thead>
         <tbody>
@@ -108,14 +84,15 @@ const formatEnergy = (mwh: number | null | undefined): string => {
             <td class="text-paper-100 p-2" :title="`${t.latitude}, ${t.longitude}`">{{ t.unit_id }}</td>
             <td v-for="d in t.daily" :key="d.date" class="text-sodium-200 p-2 text-right"
               :title="`Vjetar prosjek ${d.wind_mean_mps ?? '—'} m/s; ${d.hours} modeliranih sati`">
-              {{ formatEnergy(chosenUnit(d)) }}
+              {{ formatEnergy(chosenUnit(d)) }}<span v-if="d.hours > 0 && d.hours < 23" class="text-heat-300" title="Djelomična pokrivenost"> ⚠</span>
             </td>
+            <td class="text-paper-100 p-2 text-right">{{ formatEnergy(turbineTotal(t)) }}</td>
             <td class="text-paper-400 p-2 text-right">{{ t.elevation_m == null ? "—" : Math.round(t.elevation_m) + " m" }}</td>
           </tr>
         </tbody>
       </table>
       <p class="text-paper-400 mt-1 font-mono text-[10px]">
-        U Prilagođeno: pojedinačni MWh su nakon ON/OFF i MW/% limita, ali prije zajedničkog export capa.
+        ⚠ označava nepotpunu satnu pokrivenost. U Prilagođeno: pojedinačni MWh su nakon ON/OFF i MW/% limita, ali prije zajedničkog export capa.
         Zbroj po turbinama zato se može razlikovati od ograničenog ukupnog izlaza elektrane.
       </p>
     </div>
