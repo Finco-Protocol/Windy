@@ -1,0 +1,9 @@
+model_id;sluzbeni_horizont;request_days;max_lead_hours;http_status;n_points;non_null_wind;first_valid_utc;last_valid_utc;issue;fetched_at_utc;height_status;zadnji_potpuni_lokalni_dan;live_vs_arhivski
+ecmwf_ifs;15 dana (potvrdeno live 2026-11-18, 360/360 non-null 100m);15;360;200;360;360;2026-11-17T00:00Z;2026-12-01T23:00Z;best-effort;2026-11-18;100m OK;2026-12-01;sadrzi 15d (novi run nakon registry updatea)
+gfs_seamless;16 dana (384h);16;384;200;384;384;2026-11-17T00:00Z;2026-12-02T23:00Z;ok-issue-unknown;2026-11-17T20:12Z;80/100 OK;2026-12-02;sadrzi 16d
+icon_global;8 dana (192h);8;192;200;192;192;—;—;—;—;80/120 OK;—;—
+icon_eu;5 dana (120h);5;120;200;120;120;—;—;—;—;80/120 OK;—;—
+meteofrance_arpege_world;4 dana (~96h);4;96;200;96;96 (80/120m);—;—;—;—;80/120 OK (100m NULL na gem — vidi GEM);—;—
+meteofrance_arpege_europe;4 dana (~96h) — POTVRDJENO live 2026-11-18 (96/96 non-null 80/100m);4;96;200;96;96;—;—;—;—;80/100 OK;—;novi model (zaseban id)
+gem_seamless;10 dana (240h);10;240;200;240;240 (80/120m);2026-11-17T00:00Z;2026-11-26T23:00Z;ok-issue-unknown;2026-11-17T20:12Z;STARI RUN: 100m ALL NULL -> missing-height;NOVI RUN (80/120): potpun;—
+ukmo_seamless;7 dana (168h);7;168;200;168;168 (10m);—;—;—;—;10m-only (met_only);—;—

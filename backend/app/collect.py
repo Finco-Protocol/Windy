@@ -333,7 +333,12 @@ def collect_site(
 
     now = now or datetime.now(timezone.utc)
     site, curve = load_site_and_curve(db_path, site_id)
-    days = days or 10
+    # Correction E Addendum B §2: ONE consistent default everywhere — the
+    # widest registered request horizon. collect_model still clamps per model
+    # (min(days, spec.request_days)), so no model is over-extended and none
+    # is silently shortened by the caller forgetting to pass days. Archive
+    # immutability keeps previously stored shorter issues untouched.
+    days = days or max(spec.request_days for spec in WINDY_MODELS)
     results = [
         collect_model(db_path, client, site, curve, spec, min(days, spec.request_days), now=now)
         for spec in WINDY_MODELS

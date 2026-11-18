@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from . import accuracy as accuracy_mod
 from . import availability as availability_mod
@@ -43,6 +43,7 @@ from .config import Settings
 from .openmeteo import OMError, OpenMeteoClient
 from .registry import SOURCE_PROVIDER, WINDY_MODELS
 from .scheduler import start_scheduler
+from . import wmo
 from .siteconfig import (
     apply_config_revision as siteconfig_apply,
     get_locations,
@@ -191,16 +192,23 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
     def constraints_replace_units(site_id: str, body: dict):
         """Correction A §4: ONE atomic revision per unit-state change — active
         grouped constraints are split (unaffected members preserved), desired
-        states appended. No half-applied delete+add window."""
+        states appended. No half-applied delete+add window. Correction E §1:
+        optional expected_revision — on mismatch 409 with the current revision
+        (client refetches + retries instead of a silent lost update)."""
         store.load_site(settings.db_path, site_id)
         b = body or {}
-        return availability_mod.replace_unit_states(
-            settings.db_path,
-            site_id,
-            b.get("assignments") or [],
-            b.get("start_local") or availability_mod._now(),
-            b.get("end_local"),
-        )
+        expected = b.get("expected_revision")
+        try:
+            return availability_mod.replace_unit_states(
+                settings.db_path,
+                site_id,
+                b.get("assignments") or [],
+                b.get("start_local") or availability_mod._now(),
+                b.get("end_local"),
+                int(expected) if expected is not None else None,
+            )
+        except availability_mod.RevisionConflict as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc), "expected": exc.expected, "current_revision": exc.current})
 
     @app.post("/api/assets/{site_id}/config-revision")
     def config_revision_apply(site_id: str, body: dict):
@@ -335,6 +343,141 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         with _wind_now_lock:
             _wind_now_cache[cache_key] = (now, out)
         return out
+
+    # --- Weather on Site (Correction E Addendum C): read-only informative
+    # layer from the FREE public Open-Meteo /v1/forecast `current` block
+    # (best_match). 10-min cache per site; sanitised errors; never stored as
+    # a forecast run and never presented as an on-site measurement.
+    WEATHER_TTL_S = 600
+    _weather_cache: dict[str, tuple[float, dict]] = {}
+    _weather_lock = threading.Lock()
+
+    @app.get("/api/assets/{site_id}/weather-now")
+    def weather_now(site_id: str):
+        site = store.load_site(settings.db_path, site_id)
+        now = datetime.now(timezone.utc)
+        with _weather_lock:
+            cached = _weather_cache.get(site_id)
+            if cached is not None and (now - cached[0]).total_seconds() < WEATHER_TTL_S:
+                out = dict(cached[1])
+                out["cache"] = {"cached": True, "age_s": round((now - cached[0]).total_seconds(), 1)}
+                return out
+
+        def unavailable(reason: str, extra: dict | None = None) -> dict:
+            base = {
+                "site_id": site_id,
+                "source_provider": SOURCE_PROVIDER,
+                "source_model": "best_match",
+                "weather_code": None,
+                "condition": "Nepoznati uvjeti",
+                "icon": "unknown",
+                "temperature_2m_c": None,
+                "is_day": None,
+                "valid_at_utc": None,
+                "fetched_at_utc": iso_z(now),
+                "stale": True,
+                "status": "unavailable",
+                "reason": reason,
+                "cloud_cover_percent": None,
+                "precipitation_mm": None,
+                "rain_mm": None,
+                "showers_mm": None,
+                "snowfall_cm": None,
+                "note": "modelirana vremenska procjena — NIJE mjerenje na elektrani",
+            }
+            if extra:
+                base.update(extra)
+            return base
+
+        try:
+            cur = client.fetch_current(float(site["latitude"]), float(site["longitude"]))
+        except Exception as exc:
+            out = unavailable(f"weather provider error: {type(exc).__name__}")
+        else:
+            block = cur.get("current") or {}
+            code = block.get("weather_code")
+            temp = block.get("temperature_2m")
+            is_day = block.get("is_day")
+            cond = wmo.wmo_condition(code, None if is_day is None else bool(is_day))
+            valid_local = block.get("time")  # naive UTC timestamp from provider
+            valid_utc = f"{valid_local}:00Z".replace(":00Z", ":00Z") if valid_local else None
+            if valid_utc and len(valid_utc) == 19:
+                valid_utc = valid_utc  # YYYY-MM-DDTHH:MM:00Z form
+            age_min = None
+            stale = True
+            if valid_utc:
+                try:
+                    asof = datetime.strptime(valid_local, "%Y-%m-%dT%H:%M").replace(tzinfo=timezone.utc)
+                    age_min = (now - asof).total_seconds() / 60.0
+                    stale = age_min > 180.0
+                except ValueError:
+                    valid_utc = None
+            out = {
+                "site_id": site_id,
+                "source_provider": SOURCE_PROVIDER,
+                "source_model": "best_match",
+                "weather_code": code,
+                "condition": cond["label"],
+                "icon": cond["icon"],
+                "temperature_2m_c": temp,
+                "is_day": None if is_day is None else bool(is_day),
+                "valid_at_utc": valid_utc,
+                "fetched_at_utc": iso_z(now),
+                "stale": stale,
+                "status": "ok" if (temp is not None and code is not None) else "partial",
+                "reason": None if (temp is not None and code is not None) else "djelomicno dostupno: kod ili temperatura nedostaje",
+                "age_minutes": round(age_min, 1) if age_min is not None else None,
+                "cloud_cover_percent": block.get("cloud_cover"),
+                "precipitation_mm": block.get("precipitation"),
+                "rain_mm": block.get("rain"),
+                "showers_mm": block.get("showers"),
+                "snowfall_cm": block.get("snowfall"),
+                "note": "modelirana vremenska procjena (2 m temperatura) — NIJE mjerenje na elektrani",
+            }
+        with _weather_lock:
+            _weather_cache[site_id] = (now, out)
+        return out
+
+    # --- Correction E Addendum D: read-only Excel export (7/10/15 days) ---
+    @app.get("/api/assets/{site_id}/forecast-export.xlsx")
+    def forecast_export_xlsx(
+        site_id: str,
+        days: int = Query(7),
+        mode: str = Query("baseline"),
+        unit: str = Query("mwh"),
+        avg_models: str | None = Query(None),
+        avg_enabled: bool = Query(True),
+    ):
+        from .xlsx_export import build_export_xlsx, MAX_EXPORT_DAYS
+
+        site = store.load_site(settings.db_path, site_id)
+        days = min(max(days, 1), MAX_EXPORT_DAYS)
+        # Correction G P1-A: OMITTED avg_models (legacy callers) -> documented
+        # default = all production models; an EXPLICITLY EMPTY string ("" =
+        # the UI deselected every model) stays [] -> blank Prosjek/N/UKUPNO in
+        # the workbook. Unknown ids are left as-is (they simply resolve to no
+        # data); UKMO/met-only never gains an energy column.
+        if avg_models is None:
+            models = [m.id for m in WINDY_MODELS if not m.met_only]
+        else:
+            models = [m.strip() for m in avg_models.split(",") if m.strip()]
+        data, _meta = build_export_xlsx(
+            settings.db_path,
+            site,
+            days,
+            mode,
+            unit,
+            models,
+            iso_z(datetime.now(timezone.utc)),
+            avg_enabled=avg_enabled,
+        )
+        fname_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        fname = f"Windy_{site_id}_{fname_date}_{days}d_{mode}_{unit}.xlsx"
+        return Response(
+            content=data,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
 
     @app.get("/api/assets/{site_id}/scenario")
     def scenario_get(site_id: str, run_id: int, inventory_revision: int | None = Query(None), constraints_revision: int | None = Query(None)):

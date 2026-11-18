@@ -416,7 +416,33 @@ def delete_constraints(db_path, site_id: str, ids: list[int]) -> dict:
     return get_constraints(db_path, site_id, rev)
 
 
-def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_local: str, end_local: str | None = None) -> dict:
+class RevisionConflict(AvailabilityError):
+    """Raised when the caller's expected constraints revision no longer
+    matches the current one (lost-update guard, Correction E §1)."""
+
+    def __init__(self, expected: int, current: int):
+        super().__init__(f"revision conflict: expected {expected}, current {current}")
+        self.expected = expected
+        self.current = current
+
+
+def current_constraints_revision_conn(conn, site_id: str) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(revision), 0) AS r FROM operational_constraints WHERE site_id=?", (site_id,)).fetchone()
+    return int(row["r"])
+
+
+def replace_unit_states(
+    db_path,
+    site_id: str,
+    assignments: list[dict],
+    start_local: str,
+    end_local: str | None = None,
+    expected_revision: int | None = None,
+) -> dict:
+    """... expected_revision: optimistic lost-update guard (Correction E §1).
+    When provided and != current constraints revision, raises RevisionConflict
+    (HTTP 409) so the client refetches and retries instead of silently
+    overwriting another mutation."""
     """ONE atomic revision that sets the desired per-unit state (Correction A §4):
 
     - every ACTIVE constraint loses the assigned units' membership; grouped
@@ -473,9 +499,17 @@ def replace_unit_states(db_path, site_id: str, assignments: list[dict], start_lo
         desired[unit] = rec
 
     now = _now()
-    rev = current_constraints_revision(db_path, site_id) + 1
     assigned = set(desired)
-    with dbm.session(db_path) as conn:
+    # Correction F P0-7: BEGIN IMMEDIATE acquires the SQLite write lock NOW,
+    # so the expected-revision read, the next-revision derivation and every
+    # write all happen inside one serialized transaction — two concurrent
+    # requests can never both read the same revision and both commit. A stale
+    # request raises RevisionConflict (409) WITHOUT any write.
+    with dbm.immediate_session(db_path) as conn:
+        current = current_constraints_revision_conn(conn, site_id)
+        if expected_revision is not None and current != int(expected_revision):
+            raise RevisionConflict(int(expected_revision), current)
+        rev = current + 1
         active = conn.execute(
             "SELECT id, kind, unit_ids_json, cap_mw, cap_percent, start_utc, end_utc, created_by "
             "FROM operational_constraints WHERE site_id=? AND revision=? AND superseded_by IS NULL",

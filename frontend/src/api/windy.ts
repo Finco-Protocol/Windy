@@ -151,6 +151,32 @@ export interface WindNowModel {
   run_issued_utc?: string | null;
 }
 
+export type WeatherIcon = "sun" | "moon" | "partly_day" | "partly_night" | "cloud" | "fog" | "drizzle" | "rain" | "sleet" | "snow" | "thunder" | "unknown";
+
+export interface WeatherNowResponse {
+  site_id: string;
+  source_provider: string;
+  source_model: string;
+  weather_code: number | null;
+  condition: string;
+  icon: WeatherIcon;
+  temperature_2m_c: number | null;
+  is_day: boolean | null;
+  valid_at_utc: string | null;
+  fetched_at_utc: string;
+  stale: boolean;
+  status: "ok" | "partial" | "unavailable";
+  reason?: string | null;
+  age_minutes?: number | null;
+  cloud_cover_percent?: number | null;
+  precipitation_mm?: number | null;
+  rain_mm?: number | null;
+  showers_mm?: number | null;
+  snowfall_cm?: number | null;
+  note: string;
+  cache?: { cached: boolean; age_s: number };
+}
+
 export interface WindNowResponse {
   site_id: string;
   modeled: true;
@@ -636,6 +662,12 @@ export const windyApi = {
     ),
   windNow: (siteId: string, signal?: AbortSignal) =>
     getJson<WindNowResponse>(`/assets/${encodeURIComponent(siteId)}/wind-now`, signal),
+  weatherNow: (siteId: string, signal?: AbortSignal) =>
+    getJson<WeatherNowResponse>(`/assets/${encodeURIComponent(siteId)}/weather-now`, signal),
+  // Correction F P0-1: raw fetch does NOT prepend /api — the URL must carry
+  // the full /api prefix or the export downloads a mislabeled SPA page
+  forecastExportUrl: (siteId: string, days: number, mode: string, unit: string, avgModels: string[], avgEnabled: boolean): string =>
+    `/api/assets/${encodeURIComponent(siteId)}/forecast-export.xlsx?days=${days}&mode=${encodeURIComponent(mode)}&unit=${encodeURIComponent(unit)}&avg_models=${encodeURIComponent(avgModels.join(","))}&avg_enabled=${avgEnabled}`,
   collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
   runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
     getJson<{ runs: RunSummary[] }>(
@@ -738,11 +770,18 @@ export const windyApi = {
 };
 
 /** Model display colors, stable across all three screens. */
+// Correction F P1-8: every registered model has a stable, distinguishable
+// accessible color (no all-grey fallback for catalog ids). UKMO (met-only,
+// 10 m) renders dashed on the wind chart.
 export const MODEL_COLORS: Record<string, string> = {
   ecmwf_ifs: "#e8b649",
   gfs_seamless: "#5aa9e6",
   icon_global: "#7bd88f",
   icon_eu: "#c792ea",
+  meteofrance_arpege_world: "#f47f6b",
+  meteofrance_arpege_europe: "#e06a9a",
+  gem_seamless: "#56c8d8",
+  ukmo_seamless: "#b0a168",
 };
 
 export function modelColor(id: string): string {

@@ -353,6 +353,23 @@ def session(db_path: str | Path) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+@contextmanager
+def immediate_session(db_path: str | Path) -> "object":
+    """Connection with an IMMEDIATE write transaction: the write lock is
+    acquired before any read, giving serialized compare-and-write semantics
+    (Correction F P0-7). Commits on success, rolls back on exception."""
+    conn = connect(db_path)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def init_db(db_path: str | Path) -> None:
     """Create schema if missing, apply pending migrations, stamp the version."""
     with session(db_path) as conn:

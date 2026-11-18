@@ -152,6 +152,23 @@ class OpenMeteoClient:
             "timezone": "UTC",
         }
 
+    def fetch_current(self, lat: float, lon: float) -> dict:
+        """Correction E Addendum C: read-only CURRENT weather block
+        (temperature_2m, weather_code, is_day, cloud_cover, precipitation,
+        rain, showers, snowfall) from the free public /v1/forecast endpoint
+        (best_match). One bounded request per call — the endpoint caches."""
+        return self._get_json(
+            "https://api.open-meteo.com/v1/forecast",
+            {
+                "latitude": f"{lat:.6f}",
+                "longitude": f"{lon:.6f}",
+                "current": "temperature_2m,weather_code,is_day,cloud_cover,precipitation,rain,showers,snowfall",
+                "timezone": "UTC",
+                "wind_speed_unit": "ms",
+            },
+            requested_model=None,
+        )
+
     def fetch_forecast(self, lat: float, lon: float, spec: ModelSpec, days: int) -> dict:
         """Live forecast (latest run served by the endpoint; issue time unknown)."""
         return self._get_json(FORECAST_URL, self._base_params(lat, lon, spec, days))
