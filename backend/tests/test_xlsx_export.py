@@ -29,9 +29,9 @@ def _seed(client):
     return api, fake
 
 
-def _fetch_xlsx(api, days=7, mode="baseline", unit="mwh", avg_models=None):
-    q = f"days={days}&mode={mode}&unit={unit}"
-    if avg_models:
+def _fetch_xlsx(api, days=7, mode="baseline", unit="mwh", avg_models=None, avg_enabled=True):
+    q = f"days={days}&mode={mode}&unit={unit}&avg_enabled={'true' if avg_enabled else 'false'}"
+    if avg_models is not None:
         q += f"&avg_models={avg_models}"
     r = api.get(f"/api/assets/krnovo/forecast-export.xlsx?{q}")
     assert r.status_code == 200, r.text
@@ -171,3 +171,62 @@ def test_export_adjusted_hourly_uses_scenario_mw_and_energy(client):
     daily = wb["Dnevna prognoza"]
     gfs_daily = daily.cell(row=2, column=2).value
     assert gfs_daily is not None and gfs_daily < 26 * pu * 24, "daily adjusted reflects OFF unit"
+
+
+def _prosjek_cells(wb, rows=3):
+    """Prosjek + N min + N max column values for the first `rows` daily rows."""
+    ws = wb["Dnevna prognoza"]
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    p_col = headers.index("Prosjek") + 1
+    nmin_col = headers.index("N min") + 1
+    nmax_col = headers.index("N max") + 1
+    ukupno_col = p_col
+    return {
+        "prosjek": [ws.cell(row=r, column=p_col).value for r in range(2, 2 + rows)],
+        "n_min": [ws.cell(row=r, column=nmin_col).value for r in range(2, 2 + rows)],
+        "n_max": [ws.cell(row=r, column=nmax_col).value for r in range(2, 2 + rows)],
+        "ukupno": ws.cell(row=2 + rows, column=p_col).value,
+        "meta": {wb["Metapodaci"].cell(row=r, column=1).value: wb["Metapodaci"].cell(row=r, column=2).value for r in range(1, wb["Metapodaci"].max_row + 1)},
+    }
+
+
+def test_export_avg_models_omitted_defaults_to_all_production(client):
+    api, _fake = _seed(client)
+    wb, _r = _fetch_xlsx(api, days=7, avg_models=None)
+    d = _prosjek_cells(wb)
+    assert d["prosjek"][0] is not None, "omitted avg_models -> default all production models -> numeric Prosjek"
+    meta_ids = set(d["meta"]["average_models"].split(","))
+    assert {"gfs_seamless", "ecmwf_ifs"} <= meta_ids
+    assert "ukmo_seamless" not in meta_ids, "met-only never in Average default"
+
+
+def test_export_avg_models_explicit_empty_blank_prosjek(client):
+    """Correction G P1-A: explicitly empty selection must NOT become all models."""
+    api, _fake = _seed(client)
+    wb, _r = _fetch_xlsx(api, days=7, avg_models="")
+    d = _prosjek_cells(wb)
+    assert all(v is None for v in d["prosjek"]), "blank Prosjek — never silently all-models"
+    assert all(v is None for v in d["n_min"]) and all(v is None for v in d["n_max"])
+    assert d["ukupno"] is None, "UKUPNO Prosjek blank"
+    assert "(prazan odabir" in str(d["meta"]["average_models"]), "metadata reflects empty selection"
+
+
+def test_export_avg_models_single_model_gfs_only(client):
+    api, _fake = _seed(client)
+    wb, _r = _fetch_xlsx(api, days=7, avg_models="gfs_seamless")
+    d = _prosjek_cells(wb)
+    ws = wb["Dnevna prognoza"]
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    gfs = ws.cell(row=2, column=headers.index("NOAA GFS") + 1).value
+    ecm = ws.cell(row=2, column=headers.index("ECMWF IFS HRES") + 1).value
+    assert d["prosjek"][0] is not None
+    assert d["prosjek"][0] == pytest.approx(gfs), "GFS-only Prosjek equals GFS, not the mean"
+    assert d["prosjek"][0] != pytest.approx((gfs + ecm) / 2)
+
+
+def test_export_avg_enabled_false_blanks_prosjek_even_with_models(client):
+    api, _fake = _seed(client)
+    wb, _r = _fetch_xlsx(api, days=7, avg_models="gfs_seamless,ecmwf_ifs", avg_enabled=False)
+    d = _prosjek_cells(wb)
+    assert all(v is None for v in d["prosjek"]), "avg_enabled=false blanks Prosjek"
+    assert d["meta"]["average_enabled"].startswith("NE")

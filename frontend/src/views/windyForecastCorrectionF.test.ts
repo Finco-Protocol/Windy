@@ -306,3 +306,56 @@ describe("Correction F P0-5/P0-6 — bulk authority + failure retention (DOM)", 
     await settle(undefined, (t) => t.includes("72.75") || t.includes("74.1"));
   }, 20000);
 });
+
+describe("Correction G P1-B — Compare Prosjek respects the Average toggle", () => {
+  async function openCompare(): Promise<void> {
+    // Compare section is NOT collapsible; switch to power tab via segmented toggle
+    const tab = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Usporedba proizvodnje");
+    tab!.click();
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 10));
+  }
+
+  it("Prosjek toggle OFF → Compare Prosjek cells are em dash; ON → numeric values return", async () => {
+    const h = makeHarness();
+    vi.stubGlobal("fetch", h.fetchMock);
+    await mountView(router);
+    await settle();
+    await openChartsAndEditor();
+    await openCompare();
+    // default enabled: Prosjek column has numeric cells in production compare
+    const prosjekCells = () => {
+      const tables = [...document.body.querySelectorAll("table")];
+      const t = tables.find((tb) => tb.textContent?.includes("Energija") || tb.textContent?.includes("Prosjek"));
+      const header = [...(t?.querySelectorAll("th") ?? [])].find((th) => th.textContent?.trim() === "Prosjek");
+      if (!header) return null;
+      const col = [...(t!.querySelectorAll("tr")[0]!.querySelectorAll("th"))].findIndex((th) => th.textContent?.trim() === "Prosjek");
+      return [...(t!.querySelectorAll("tbody tr"))].map((tr) => tr.querySelectorAll("td")[col]?.textContent?.trim());
+    };
+    let cells = prosjekCells();
+    expect(cells).not.toBeNull();
+    expect(cells!.every((c) => c !== "—")).toBe(true), "enabled default: numeric values";
+    // toggle Prosjek OFF via the daily-table header button
+    const prosjekToggle = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "Prosjek");
+    prosjekToggle!.click();
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 10));
+    cells = prosjekCells();
+    expect(cells!.every((c) => c === "—")).toBe(true), "disabled → em dash, never a computed value";
+    // re-enable
+    prosjekToggle!.click();
+    await nextTick();
+    await new Promise((r) => setTimeout(r, 10));
+    cells = prosjekCells();
+    expect(cells!.every((c) => c !== "—")).toBe(true);
+    // deselect ALL models → blank, no silent auto-reset to all
+    for (const pid of ["ECMWF", "GFS"]) {
+      const btn = [...document.body.querySelectorAll("button")].filter((b) => b.textContent?.trim() === pid)[0];
+      btn!.click();
+      await nextTick();
+    }
+    await new Promise((r) => setTimeout(r, 10));
+    cells = prosjekCells();
+    expect(cells!.every((c) => c === "—")).toBe(true), "explicit empty selection stays blank";
+  }, 20000);
+});

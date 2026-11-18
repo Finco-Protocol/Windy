@@ -1297,7 +1297,7 @@ function utcLabel(iso: string | null): string {
                         {{ c.label }}{{ c.metOnly ? ' (10 m)' : '' }}
                       </span>
                     </th>
-                    <th v-if="compareTab === 'power'" class="text-sodium-300 py-1.5 pr-3 text-right" title="prosjek odabranih produkcijskih modela (isti UTC sat); broj contributora u tooltipu">Prosjek</th>
+                    <th v-if="compareTab === 'power'" class="text-sodium-300 py-1.5 pr-3 text-right" title="prosjek odabranih produkcijskih modela (isti UTC sat); poštuje Prosjek toggle iz dnevne tablice">Prosjek</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1306,8 +1306,8 @@ function utcLabel(iso: string | null): string {
                     <td v-for="c in compareColumns" :key="c.id" class="py-1 pr-3 text-right" :class="r.values[c.id] !== null && r.values[c.id] !== undefined ? 'text-paper-100' : 'text-paper-500'" :title="r.values[c.id] === null || r.values[c.id] === undefined ? `${c.label}: nema podatka za ovaj sat` : `${c.label} @ ${r.key}:00 UTC`">
                       {{ (r.values[c.id] ?? null) === null ? '—' : fmtCmp(r.values[c.id]) }}
                     </td>
-                    <td v-if="compareTab === 'power'" class="text-sodium-100 py-1 pr-3 text-right" :title="`${compareAvg.find((x) => x.row.key === r.key)?.avg.contributors ?? 0} modela pokriva ovaj sat`">
-                      {{ (compareAvg.find((x) => x.row.key === r.key)?.avg.value ?? null) === null ? '—' : fmtCmp(compareAvg.find((x) => x.row.key === r.key)!.avg.value) }}
+                    <td v-if="compareTab === 'power'" class="py-1 pr-3 text-right" :class="avgPref.enabled ? 'text-sodium-100' : 'text-paper-500'" :title="!avgPref.enabled ? 'Prosjek je isključen (Prosjek toggle u dnevnoj tablici)' : `${compareAvg.find((x) => x.row.key === r.key)?.avg.contributors ?? 0} modela pokriva ovaj sat`">
+                      {{ avgPref.enabled ? ((compareAvg.find((x) => x.row.key === r.key)?.avg.value ?? null) === null ? '—' : fmtCmp(compareAvg.find((x) => x.row.key === r.key)!.avg.value)) : '—' }}
                     </td>
                   </tr>
                 </tbody>

@@ -432,7 +432,7 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
         ("installed_mw", site.get("capacity_mw")),
         ("power_curve", _safe_str(site.get("power_curve_id"))),
         ("curve_status", "REFERENCE/UNVERIFIED (skalirana referentna krivulja, nije as-built)"),
-        ("average_models", ",".join(avg_models)),
+        ("average_models", ",".join(avg_models) if avg_models else "(prazan odabir — Prosjek ostaje prazan)"),
         ("average_enabled", "DA" if avg_enabled else "NE (Prosjek iskljucen u UI-u — Prosjek stupac prazan)"),
         ("average_rule", "hourly-aligned ensemble: prosjek MW po UTC segmentu x sati, dnevno agregirano u site TZ"),
         ("ukmo_note", "UKMO je 10 m povrsinski vjetar — NIJE hub vjetar i NIKAD nema MWh"),

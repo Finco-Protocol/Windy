@@ -452,9 +452,15 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
 
         site = store.load_site(settings.db_path, site_id)
         days = min(max(days, 1), MAX_EXPORT_DAYS)
-        models = [m.strip() for m in (avg_models or "").split(",") if m.strip()]
-        if not models:
+        # Correction G P1-A: OMITTED avg_models (legacy callers) -> documented
+        # default = all production models; an EXPLICITLY EMPTY string ("" =
+        # the UI deselected every model) stays [] -> blank Prosjek/N/UKUPNO in
+        # the workbook. Unknown ids are left as-is (they simply resolve to no
+        # data); UKMO/met-only never gains an energy column.
+        if avg_models is None:
             models = [m.id for m in WINDY_MODELS if not m.met_only]
+        else:
+            models = [m.strip() for m in avg_models.split(",") if m.strip()]
         data, _meta = build_export_xlsx(
             settings.db_path,
             site,
