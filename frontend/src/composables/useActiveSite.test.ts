@@ -15,7 +15,7 @@ describe("buildNavLinks", () => {
         expect(l.query.site).toBe("site-b");
       }
     }
-    expect(links.map((l) => l.path)).toEqual(["/", "/history", "/actuals", "/availability", "/sites"]);
+    expect(links.map((l) => l.path)).toEqual(["/", "/detailed-forecast", "/history", "/actuals", "/availability", "/sites"]);
   });
 
   it("omits the query for the default site (canonical URL)", () => {
