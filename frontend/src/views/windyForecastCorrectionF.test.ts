@@ -465,7 +465,7 @@ describe("Correction H — committed writes, validation and site-switch races", 
     expect(exportBtn()!.disabled).toBe(true);
 
     await router.push({ path: "/", query: { site: "second-site" } });
-    await nextTick();
+    await settle(undefined, () => Boolean(exportBtn())); // siteResource clears its view while the new site loads
     expect(exportBtn()!.disabled).toBe(false);
     exportBtn()!.click();
     await settle(undefined, () => exportWaiters.length === 2);
