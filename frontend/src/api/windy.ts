@@ -76,6 +76,17 @@ export interface ForecastRunInfo {
   source_url: string;
 }
 
+export interface ForecastRunSelection {
+  cycle_kind: "long" | "short" | "incomplete-long" | "standard" | "unknown";
+  selection_reason: string;
+  latest_archived_issue_utc: string | null;
+  selected_issue_utc: string | null;
+  last_usable_wind_utc: string | null;
+  available_lead_hours: number | null;
+  full_horizon_hours: number;
+  newer_issue_preserved: boolean;
+}
+
 export interface ForecastModel {
   model_id: string;
   provider: string;
@@ -85,6 +96,7 @@ export interface ForecastModel {
   requested_height_m: number;
   height_note: string;
   run: ForecastRunInfo | null;
+  run_selection?: ForecastRunSelection | null;
   points: ForecastPoint[];
   met_only: boolean;
   daily_local: { date: string; mwh: number; hours_counted: number; hours_missing: number }[];
