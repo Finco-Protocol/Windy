@@ -7,7 +7,7 @@ import pytest
 
 from app.wmo import wmo_condition
 
-NOW_STR = "2026-11-18T05:30"
+# Fresh fixture clock: a hard-coded 2026-11-18 time becomes stale as CI runs later.\nNOW_STR = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
 
 
 def _payload(code=71, temp=-7.3, is_day=1, time_str=NOW_STR):
