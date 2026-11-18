@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, type Ref } from "vue";
 import VChart from "vue-echarts";
 
 import AppFooter from "@/components/AppFooter.vue";
@@ -136,19 +136,28 @@ watch(
 watch(windVis, (v) => saveChartVisibility("wind", siteId.value, v), { deep: true });
 watch(powerVis, (v) => saveChartVisibility("power", siteId.value, v), { deep: true });
 
-function toggleLegend(vis: ChartVisibility, modelId: string): ChartVisibility {
-  const hidden = new Set(vis.hidden);
+// Correction F P0-2: template auto-unwraps refs, so handlers take the VALUE
+// plus the chart KEY and assign to the correct ref (.value) — the previous
+// return-only version was a no-op click
+function visRef(chart: "wind" | "power"): Ref<ChartVisibility> {
+  return chart === "wind" ? windVis : powerVis;
+}
+function toggleLegend(chart: "wind" | "power", modelId: string): void {
+  const vis = visRef(chart);
+  const hidden = new Set(vis.value.hidden);
   if (hidden.has(modelId)) hidden.delete(modelId);
   else hidden.add(modelId);
-  return { ...vis, hidden: [...hidden], configured: true };
+  vis.value = { ...vis.value, hidden: [...hidden], configured: true };
 }
-function setLegendAll(vis: ChartVisibility, hideAll: boolean): ChartVisibility {
+function setLegendAll(chart: "wind" | "power", hideAll: boolean): void {
+  const vis = visRef(chart);
   const ids = (fcData.value?.models ?? []).map((m) => m.model_id);
-  return { ...vis, hidden: hideAll ? [...ids] : [], configured: true };
+  vis.value = { ...vis.value, hidden: hideAll ? [...ids] : [], configured: true };
 }
-function legendState(vis: ChartVisibility, modelId: string): { active: boolean; hasData: boolean } {
+function legendState(chart: "wind" | "power", modelId: string): { active: boolean; hasData: boolean } {
+  const vis = visRef(chart);
   const m = (fcData.value?.models ?? []).find((x) => x.model_id === modelId);
-  return { active: !vis.hidden.includes(modelId), hasData: !!m?.run };
+  return { active: !vis.value.hidden.includes(modelId), hasData: !!m?.run };
 }
 
 // ---- Correction E Addendum B §1: display energy unit MWh|GWh (per site).
@@ -361,8 +370,11 @@ function freshStart(): string {
 }
 
 // site the write was issued for — a pending response must never refresh a
-// different site's UI (Correction E §1, site-switch guard)
-async function saveAssignments(assignments: UnitAssignment[], targetUnits: string[]): Promise<void> {
+// different site's UI (Correction E §1, site-switch guard).
+// Correction F P0-6: explicit result contract — callers clear selection ONLY
+// on confirmed success; on failure user edits and previous confirmed state
+// stay, retry remains available. Stale-site responses report ok:false.
+async function saveAssignments(assignments: UnitAssignment[], targetUnits: string[]): Promise<{ ok: boolean; revision: number | null }> {
   const targetSite = siteId.value;
   applyBusy.value = true;
   applyError.value = null;
@@ -385,16 +397,18 @@ async function saveAssignments(assignments: UnitAssignment[], targetUnits: strin
       await refreshConstraints();
       res = await attempt(constraintsData.value?.revision ?? null);
     }
-    if (siteId.value !== targetSite) return; // stale response for a previous site — discard
+    if (siteId.value !== targetSite) return { ok: false, revision: res.revision }; // stale site — discard silently
     const st = await windyApi.operatingStatus(targetSite);
-    if (siteId.value !== targetSite) return;
+    if (siteId.value !== targetSite) return { ok: false, revision: res.revision };
     applyMessage.value =
       `Spremljeno atomarno (revizija ${res.revision}, ${targetUnits.length} jedinica: ${targetUnits.slice(0, 6).join(", ")}${targetUnits.length > 6 ? "…" : ""}). ` +
       `Server potvrdio RASP. MAKS. ${st.available_max_mw} MW.`;
     if (st.n_turbines > 0) setViewMode("adjusted");
     await Promise.all([refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh()]);
+    return { ok: true, revision: res.revision };
   } catch (e) {
     if (siteId.value === targetSite) applyError.value = e instanceof Error ? e.message : String(e);
+    return { ok: false, revision: null };
   } finally {
     if (siteId.value === targetSite) applyBusy.value = false;
   }
@@ -417,9 +431,12 @@ async function toggleUnit(unit: string, state: "on" | "off"): Promise<void> {
       getCurrent: unitState,
       getRated: (u) => ratedById.value.get(u) ?? 0,
     });
-    await saveAssignments(assignments, [unit]);
+    const res = await saveAssignments(assignments, [unit]);
+    if (!res.ok && applyError.value) {
+      unitErrors.value = new Map([...unitErrors.value.entries(), [unit, applyError.value]]);
+    }
   } catch (e) {
-    if (siteId.value === siteId.value) unitErrors.value = new Map([...unitErrors.value.entries(), [unit, e instanceof Error ? e.message : String(e)]]);
+    unitErrors.value = new Map([...unitErrors.value.entries(), [unit, e instanceof Error ? e.message : String(e)]]);
   } finally {
     const nb = new Set(busyUnits.value);
     nb.delete(unit);
@@ -427,45 +444,43 @@ async function toggleUnit(unit: string, state: "on" | "off"): Promise<void> {
   }
 }
 
-// Correction E §2: ONE-STEP bulk — select N units, one action, ONE atomic
-// request, no confirmation modal. Bulk choice replaces per-unit overrides.
+// Correction E §2 + F P0-5/P0-6: ONE-STEP bulk — the clicked action IS
+// authoritative: bulk ON/OFF ignores ALL stale per-unit editor overrides and
+// sends explicit state for every selected unit. Selection clears ONLY on
+// confirmed success; failures keep edits + selection for retry.
 async function bulkOnOff(state: "on" | "off"): Promise<void> {
   if (applyBusy.value || wtgSelected.value.size === 0) return;
   const units = [...wtgSelected.value];
-  try {
-    const assignments = buildAssignments({
-      units,
-      getEdit: (u) => perUnitState.value[u] ?? { action: state, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value },
-      getCurrent: unitState,
-      getRated: (u) => ratedById.value.get(u) ?? 0,
-    });
-    await saveAssignments(assignments, units);
+  const assignments = buildAssignments({
+    units,
+    getEdit: () => ({ action: state, mode: bulkMode.value, reductionPct: null, capMw: null }),
+    getCurrent: unitState,
+    getRated: (u) => ratedById.value.get(u) ?? 0,
+  });
+  const res = await saveAssignments(assignments, units);
+  if (res.ok) {
     wtgSelected.value = new Set();
     perUnitState.value = {};
-  } catch (e) {
-    applyError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
 async function bulkSaveLimit(): Promise<void> {
   if (applyBusy.value || wtgSelected.value.size === 0) return;
   const units = [...wtgSelected.value];
-  try {
-    const assignments = buildAssignments({
-      units,
-      getEdit: (u) => perUnitState.value[u] ?? { action: bulkAction.value, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value },
-      getCurrent: unitState,
-      getRated: (u) => ratedById.value.get(u) ?? 0,
-    });
-    if (assignments.length === 0) {
-      applyError.value = "Nema stvarne promjene stanja za odabrane jedinice.";
-      return;
-    }
-    await saveAssignments(assignments, units);
+  const assignments = buildAssignments({
+    units,
+    getEdit: (u) => perUnitState.value[u] ?? { action: bulkAction.value, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value },
+    getCurrent: unitState,
+    getRated: (u) => ratedById.value.get(u) ?? 0,
+  });
+  if (assignments.length === 0) {
+    applyError.value = "Nema stvarne promjene stanja za odabrane jedinice.";
+    return;
+  }
+  const res = await saveAssignments(assignments, units);
+  if (res.ok) {
     wtgSelected.value = new Set();
     perUnitState.value = {};
-  } catch (e) {
-    applyError.value = e instanceof Error ? e.message : String(e);
   }
 }
 
@@ -593,23 +608,34 @@ async function exportExcel(): Promise<void> {
   const targetMode = viewMode.value;
   const targetUnit = energyUnit.value;
   try {
-    const res = await fetch(windyApi.forecastExportUrl(targetSite, targetDays, targetMode, targetUnit, avgModels.value));
+    const url = windyApi.forecastExportUrl(targetSite, targetDays, targetMode, targetUnit, avgModels.value, avgPref.value.enabled); // Correction F P1-10
+    const res = await fetch(url);
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new Error(`export ${res.status}: ${text || res.statusText}`);
     }
+    // Correction F P0-1: reject a mislabeled SPA HTML page — require the real
+    // XLSX MIME and the PK zip signature before treating bytes as a workbook
+    const ctype = res.headers.get("content-type") ?? "";
+    if (!ctype.startsWith("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")) {
+      throw new Error(`Export nije vratio XLSX (content-type: ${ctype || "nepoznat"}) — vjerojatno HTML stranica umjesto datoteke.`);
+    }
     const blob = await res.blob();
+    const head = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+    if (!(head[0] === 0x50 && head[1] === 0x4b)) {
+      throw new Error("Preuzete datoteke nisu valjani XLSX (nedostaje ZIP/PK potpis).");
+    }
     const cd = res.headers.get("content-disposition") ?? "";
     const m = /filename="([^"]+)"/.exec(cd);
     const name = m?.[1] ?? `Windy_${targetSite}_${targetDays}d_${targetMode}_${targetUnit}.xlsx`;
-    const url = URL.createObjectURL(blob);
+    const objUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
+    a.href = objUrl;
     a.download = name;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    URL.revokeObjectURL(objUrl);
   } catch (e) {
     if (siteId.value === targetSite) exportError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -739,13 +765,18 @@ const windOption = computed<BaseOption>(() => ({
   })),
 }));
 
-// Correction E Addendum A §1: power chart follows the page mode TRUTHFULLY —
-// Prilagođeno plots adjusted_mw (only models with adjusted.available), Bazno
-// plots the archived baseline. Never baseline masquerading as adjusted.
-const powerSource = computed<ForecastModel[]>(() =>
-  withRun.value.filter((m) => !m.met_only && !powerVis.value.hidden.includes(m.model_id)),
-);
+// Correction E Addendum A §1 (amended by Correction F P0-3): power chart
+// follows the page mode TRUTHFULLY — in Prilagođeno a model WITHOUT a valid
+// adjusted block is EXCLUDED from the chart entirely (never plotted as
+// baseline under the adjusted heading); Bazno plots archived baseline only.
 const powerChartAdjusted = computed(() => viewMode.value === "adjusted");
+const powerSource = computed<ForecastModel[]>(() =>
+  withRun.value.filter((m) => {
+    if (m.met_only || powerVis.value.hidden.includes(m.model_id)) return false;
+    if (powerChartAdjusted.value && !m.adjusted?.available) return false; // F P0-3: no baseline fallback
+    return true;
+  }),
+);
 const powerOption = computed<BaseOption>(() => ({
   ...baseOption("MW"),
   series: powerSource.value.map((m) => {
@@ -1208,16 +1239,16 @@ function utcLabel(iso: string | null): string {
                 :key="`wl-${m.model_id}`"
                 type="button"
                 class="border px-1.5 py-0.5 font-mono text-[10px] inline-flex items-center gap-1"
-                :class="legendState(windVis, m.model_id).active ? 'border-paper-300/60 text-paper-100' : 'border-ink-600 text-paper-500 line-through'"
-                :aria-pressed="legendState(windVis, m.model_id).active"
+                :class="legendState('wind', m.model_id).active ? 'border-paper-300/60 text-paper-100' : 'border-ink-600 text-paper-500 line-through'"
+                :aria-pressed="legendState('wind', m.model_id).active"
                 :title="m.met_only ? `${m.label}: 10 m površinski vjetar — NIJE usporedivo s vjetrom na 90 m (isključen po defaultu)` : `${m.label}: klik pali/gasi liniju`"
-                @click="toggleLegend(windVis, m.model_id)"
+                @click="toggleLegend(&#39;wind&#39;, m.model_id)"
               >
                 <span class="inline-block size-2" :style="{ background: modelColor(m.model_id) }" />
-                {{ (MODEL_LABELS_HR[m.model_id] ?? m.model_id) + (m.met_only ? ' (10 m)' : '') }}<span v-if="!legendState(windVis, m.model_id).hasData" class="text-paper-500"> · nema podataka</span>
+                {{ (MODEL_LABELS_HR[m.model_id] ?? m.model_id) + (m.met_only ? ' (10 m)' : '') }}<span v-if="!legendState('wind', m.model_id).hasData" class="text-paper-500"> · nema podataka</span>
               </button>
-              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(windVis, false)">Sve</button>
-              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(windVis, true)">Ništa</button>
+              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(&#39;wind&#39;, false)">Sve</button>
+              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(&#39;wind&#39;, true)">Ništa</button>
             </div>
             <VChart style="height: 16rem" :option="powerOption" autoresize />
             <div class="mt-1 flex flex-wrap items-center gap-1.5">
@@ -1227,16 +1258,16 @@ function utcLabel(iso: string | null): string {
                 :key="`pl-${m.model_id}`"
                 type="button"
                 class="border px-1.5 py-0.5 font-mono text-[10px] inline-flex items-center gap-1"
-                :class="legendState(powerVis, m.model_id).active ? 'border-paper-300/60 text-paper-100' : 'border-ink-600 text-paper-500 line-through'"
-                :aria-pressed="legendState(powerVis, m.model_id).active"
+                :class="legendState('power', m.model_id).active ? 'border-paper-300/60 text-paper-100' : 'border-ink-600 text-paper-500 line-through'"
+                :aria-pressed="legendState('power', m.model_id).active"
                 :title="`${m.label}: klik pali/gasi liniju`"
-                @click="toggleLegend(powerVis, m.model_id)"
+                @click="toggleLegend(&#39;power&#39;, m.model_id)"
               >
                 <span class="inline-block size-2" :style="{ background: modelColor(m.model_id) }" />
-                {{ MODEL_LABELS_HR[m.model_id] ?? m.model_id }}<span v-if="!legendState(powerVis, m.model_id).hasData" class="text-paper-500"> · nema podataka</span>
+                {{ MODEL_LABELS_HR[m.model_id] ?? m.model_id }}<span v-if="!legendState('power', m.model_id).hasData" class="text-paper-500"> · nema podataka</span>
               </button>
-              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(powerVis, false)">Sve</button>
-              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(powerVis, true)">Ništa</button>
+              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(&#39;power&#39;, false)">Sve</button>
+              <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 border px-1.5 py-0.5 font-mono text-[9px]" @click="setLegendAll(&#39;power&#39;, true)">Ništa</button>
             </div>
           </CollapsibleSection>
 

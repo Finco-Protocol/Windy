@@ -141,3 +141,33 @@ def test_export_average_column_hourly_aligned(client):
         p = ws.cell(row=r, column=prosjek_col).value
         if g is not None and e is not None:
             assert abs(p - (g + e) / 2) < 0.01, "hourly-aligned average of the selected set"
+
+
+def test_export_adjusted_hourly_uses_scenario_mw_and_energy(client):
+    """Correction F P0-4: with a valid inventory + constraints (WTG-001 OFF),
+    adjusted export hourly sheet must carry SCENARIO MW/energy (never archived
+    baseline), and the daily production column reflects the OFF unit."""
+    api, fake = _seed(client)
+    api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})
+    api.post(
+        "/api/assets/krnovo/constraints",
+        json={"rows": [{"kind": "offline", "unit_ids": ["WTG-001"], "start_local": "2026-11-17T00:00", "end_local": None}]},
+    )
+    wb, _r = _fetch_xlsx(api, days=7, mode="adjusted")
+    ws = wb["Satna proizvodnja"]
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    gfs_mw = headers.index("NOAA GFS MW") + 1
+    gfs_e = headers.index("NOAA GFS energija (MWH)") + 1
+    mw_val = ws.cell(row=2, column=gfs_mw).value
+    e_val = ws.cell(row=2, column=gfs_e).value
+    # wind 12 m/s → per-unit baseline P(12); adjusted with WTG-001 OFF = 25 × P(12),
+    # which differs from the 26-unit baseline — proving scenario (not archived) source
+    from app.power import load_curve
+    pu = load_curve().power_mw_per_turbine(12.0)
+    assert mw_val == pytest.approx(25 * pu, abs=0.01), "scenario MW with WTG-001 OFF"
+    assert mw_val != pytest.approx(26 * pu, abs=0.01), "NOT the archived 26-unit baseline"
+    assert e_val == pytest.approx(25 * pu, abs=0.01), "adjusted_mwh column present (1 h interval)"
+    # daily sheet also adjusted
+    daily = wb["Dnevna prognoza"]
+    gfs_daily = daily.cell(row=2, column=2).value
+    assert gfs_daily is not None and gfs_daily < 26 * pu * 24, "daily adjusted reflects OFF unit"

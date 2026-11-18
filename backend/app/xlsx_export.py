@@ -125,6 +125,8 @@ def _hourly_aligned_daily_avg(mw_points: dict[str, list[dict]], tz: ZoneInfo, av
         return []
     bts = sorted(boundaries)
     daily: dict[str, float] = {}
+    n_min: dict[str, int] = {}
+    n_max: dict[str, int] = {}
     covered: dict[str, list[tuple[datetime, datetime]]] = {}
     for i in range(len(bts) - 1):
         s, e = bts[i], bts[i + 1]
@@ -141,6 +143,10 @@ def _hourly_aligned_daily_avg(mw_points: dict[str, list[dict]], tz: ZoneInfo, av
             if hours > 0:
                 daily[day_key] = daily.get(day_key, 0.0) + avg_mw * hours
                 covered.setdefault(day_key, []).append((cur, seg_end))
+                # Correction F P1-9: N min/max tracks PER-HOUR contributor
+                # counts (staggered coverage: A 00-12h + B 12-24h => 1..2)
+                n_min[day_key] = min(n_min.get(day_key, len(contributors)), len(contributors))
+                n_max[day_key] = max(n_max.get(day_key, len(contributors)), len(contributors))
             cur = seg_end if seg_end > cur else e
     out = []
     for k in sorted(daily):
@@ -150,7 +156,7 @@ def _hourly_aligned_daily_avg(mw_points: dict[str, list[dict]], tz: ZoneInfo, av
                 merged[-1] = (merged[-1][0], max(merged[-1][1], e))
             else:
                 merged.append((s, e))
-        out.append({"date": k, "mwh": round(daily[k], 4), "hours_counted": round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3), "n_max": len(series), "has_data": True})
+        out.append({"date": k, "mwh": round(daily[k], 4), "hours_counted": round(sum((e - s).total_seconds() / 3600.0 for s, e in merged), 3), "n_min": n_min.get(k, 0), "n_max": n_max.get(k, 0), "has_data": True})
     return out
 
 
@@ -160,8 +166,10 @@ def _sanitize_sheet_name(name: str) -> str:
     return name[:31]
 
 
-def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_models: list[str], generated_at_utc: str) -> tuple[bytes, dict]:
-    """Build the workbook bytes. Read-only: SELECTs + scenario_for_run reads."""
+def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_models: list[str], generated_at_utc: str, avg_enabled: bool = True) -> tuple[bytes, dict]:
+    """Build the workbook bytes. Read-only: SELECTs + scenario_for_run reads.
+    avg_enabled=False (Correction F P1-10) leaves Prosjek columns blank and
+    the metadata records that the UI toggle was OFF for this export."""
     from .availability import scenario_for_run
 
     days = min(max(int(days), 1), MAX_EXPORT_DAYS)
@@ -225,6 +233,7 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
     # ---- daily rows per production model (baseline or adjusted) ----
     daily_map: dict[str, dict[str, float | None]] = {}
     mw_points: dict[str, list[dict]] = {}
+    hourly_prod_points: dict[str, list[dict]] = {}
     for spec in WINDY_MODELS:
         info = per_model[spec.id]
         if spec.met_only:
@@ -232,10 +241,25 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
         if mode == "adjusted":
             sc = info.get("adjusted")
             pts = sc["points"] if sc else []
-            rows = _daily_energy(pts, tz, "adjusted_mwh") if pts else []
+            # Correction F P0-4: adjusted mode uses EXCLUSIVELY scenario points
+            # scenario points carry adjusted_mw only — energy = MW x interval_hours
+            hourly_prod_points[spec.id] = [
+                {
+                    "valid_at_utc": p["valid_at_utc"],
+                    "mw": p.get("adjusted_mw"),
+                    "mwh": (p.get("adjusted_mw") * float(p.get("interval_hours") or 1.0)) if p.get("adjusted_mw") is not None else None,
+                    "interval_hours": p.get("interval_hours", 1.0),
+                }
+                for p in pts
+            ]
+            rows = _daily_energy(hourly_prod_points[spec.id], tz, "mwh") if hourly_prod_points.get(spec.id) else []
             mw_points[spec.id] = [{"valid_at_utc": p["valid_at_utc"], "mw_for_avg": p.get("adjusted_mw"), "interval_hours": p.get("interval_hours", 1.0)} for p in pts]
         else:
             rows = _daily_energy(info["points"], tz, "interval_energy_mwh") if info["points"] else []
+            hourly_prod_points[spec.id] = [
+                {"valid_at_utc": p["valid_at_utc"], "mw": p.get("modeled_power_mw"), "mwh": p.get("interval_energy_mwh"), "interval_hours": p.get("interval_hours", 1.0)}
+                for p in info["points"]
+            ]
             mw_points[spec.id] = [{"valid_at_utc": p["valid_at_utc"], "mw_for_avg": p.get("modeled_power_mw"), "interval_hours": p.get("interval_hours", 1.0)} for p in info["points"]]
         info["daily_rows"] = rows
         for r in rows:
@@ -254,7 +278,8 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
     start = idx if idx is not None else max(len(all_dates) - days, 0)
     shown_dates = all_dates[start : start + days]
 
-    avg_rows = {r["date"]: r for r in _hourly_aligned_daily_avg(mw_points, tz, [m for m in avg_models if m in mw_points])}
+    avg_models_eff = [m for m in avg_models if m in mw_points] if avg_enabled else []
+    avg_rows = {r["date"]: r for r in _hourly_aligned_daily_avg(mw_points, tz, avg_models_eff)}
 
     prod_models = [m for m in WINDY_MODELS if not m.met_only]
     wb = Workbook()
@@ -265,9 +290,10 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
     ws.append(["Datum"] + [m.label for m in prod_models] + ["Prosjek", "N min", "N max"])
     for date in shown_dates:
         vals = daily_map.get(date, {})
-        contributing = [vals[m.id] for m in prod_models if vals.get(m.id) is not None]
         ar = avg_rows.get(date)
-        ws.append([date] + [round(vals[m.id] * factor, 6) if vals.get(m.id) is not None else None for m in prod_models] + [round(ar["mwh"] * factor, 6) if ar else None, len(contributing), len(contributing)])
+        # Correction F P1-9: N min/N max = per-HOUR contributor range from the
+        # ensemble (staggered coverage), not the count of models with daily MWh
+        ws.append([date] + [round(vals[m.id] * factor, 6) if vals.get(m.id) is not None else None for m in prod_models] + [round(ar["mwh"] * factor, 6) if ar else None, ar["n_min"] if ar else None, ar["n_max"] if ar else None])
     total_row = ws.max_row + 1
     ws.append(["UKUPNO"])
     for ci, m in enumerate(prod_models, start=2):
@@ -303,7 +329,7 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
                 if dt.astimezone(tz).strftime("%Y-%m-%d") not in grid:
                     continue
                 key = p["valid_at_utc"][:13]
-                by_key.setdefault(key, {})[m.id] = picker(p)
+                by_key.setdefault(key, {})[m.id] = picker(m, p)
                 if key not in local_by_key:
                     local = dt.astimezone(tz)
                     off = local.strftime("%z")
@@ -317,8 +343,47 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
             s.cell(row=1, column=ci).font = HEADER_FONT
             s.column_dimensions[get_column_letter(ci)].width = 18
 
-    _hourly_sheet("Satni vjetar", list(WINDY_MODELS), lambda p: p.get("wind_speed_mps"))
-    _hourly_sheet("Satna proizvodnja", [m for m in WINDY_MODELS if not m.met_only], lambda p: p.get("modeled_power_mw"))
+    _hourly_sheet("Satni vjetar", list(WINDY_MODELS), lambda m, p: p.get("wind_speed_mps"))
+    # Correction F P0-4: production sheet sources adjusted points EXCLUSIVELY
+    # in adjusted mode (never archived baseline under the adjusted label) and
+    # carries BOTH MW and energy columns per model. Energy values are raw MWh
+    # converted to the display unit at the end (factor), blanks for missing.
+    s3 = wb.create_sheet(_sanitize_sheet_name("Satna proizvodnja"))
+    prod_models_e = [m for m in WINDY_MODELS if not m.met_only]
+    unit_hdr = unit.upper()
+    s3.append(["Sat (UTC)", f"Lokalno ({site['timezone']})", "Offset"]
+              + [f"{m.label} MW" for m in prod_models_e]
+              + [f"{m.label} energija ({unit_hdr})" for m in prod_models_e])
+    grid = set(shown_dates)
+    by_key: dict[str, dict[str, object]] = {}
+    local_by_key: dict[str, tuple[str, str]] = {}
+    for m in prod_models_e:
+        for p in hourly_prod_points.get(m.id, []):
+            dt = _parse_utc(p["valid_at_utc"])
+            if dt.astimezone(tz).strftime("%Y-%m-%d") not in grid:
+                continue
+            key = p["valid_at_utc"][:13]
+            slot = by_key.setdefault(key, {})
+            mw, mwh = p.get("mw"), p.get("mwh")
+            slot[f"{m.id}:mw"] = mw
+            slot[f"{m.id}:mwh"] = round(mwh * factor, 6) if mwh is not None else None
+            if key not in local_by_key:
+                local = dt.astimezone(tz)
+                off = local.strftime("%z")
+                local_by_key[key] = (local.strftime("%Y-%m-%d %H:%M"), f"UTC{off[:3]}:{off[3:]}")
+    for key in sorted(by_key):
+        loc, off = local_by_key.get(key, (key, "UTC"))
+        row = [key + ":00:00Z", loc, off]
+        for m in prod_models_e:
+            row.append(by_key[key].get(f"{m.id}:mw"))
+        for m in prod_models_e:
+            row.append(by_key[key].get(f"{m.id}:mwh"))
+        s3.append(row)
+    s3.freeze_panes = "A2"
+    for ci in range(1, len(prod_models_e) * 2 + 4):
+        s3.cell(row=1, column=ci).fill = HEADER_FILL
+        s3.cell(row=1, column=ci).font = HEADER_FONT
+        s3.column_dimensions[get_column_letter(ci)].width = 20
 
     # ---- Sheet 4: Pokrivenost ----
     s4 = wb.create_sheet(_sanitize_sheet_name("Pokrivenost"))
@@ -368,6 +433,7 @@ def build_export_xlsx(db_path, site: dict, days: int, mode: str, unit: str, avg_
         ("power_curve", _safe_str(site.get("power_curve_id"))),
         ("curve_status", "REFERENCE/UNVERIFIED (skalirana referentna krivulja, nije as-built)"),
         ("average_models", ",".join(avg_models)),
+        ("average_enabled", "DA" if avg_enabled else "NE (Prosjek iskljucen u UI-u — Prosjek stupac prazan)"),
         ("average_rule", "hourly-aligned ensemble: prosjek MW po UTC segmentu x sati, dnevno agregirano u site TZ"),
         ("ukmo_note", "UKMO je 10 m povrsinski vjetar — NIJE hub vjetar i NIKAD nema MWh"),
         ("missing_note", "Prazna celija = nema podatka (nikad 0); 0 = stvarna modelirana nula"),

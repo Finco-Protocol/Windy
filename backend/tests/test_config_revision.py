@@ -602,3 +602,45 @@ def test_expected_revision_guard_409_on_stale(client):
         json={"assignments": [{"unit_id": "WTG-001", "state": "off"}], "start_local": "2026-11-18T00:00", "expected_revision": stale + 1},
     )
     assert r2.status_code == 200
+
+
+def test_concurrent_replace_units_serialized(client):
+    """Correction F P0-7: two concurrent replace-units requests BOTH carrying
+    the same expected_revision — exactly one commits, the other gets 409
+    without any write. Constraints and audit trail stay consistent."""
+    import threading
+
+    api, fake, _s = client
+    api.post("/api/assets/krnovo/turbines/generate", json={"count": 26, "rating_mw": 2.75})
+    api.get("/api/assets/krnovo/constraints")
+    base = api.get("/api/assets/krnovo/constraints").json()["revision"]
+    barrier = threading.Barrier(2)
+    results: dict = {}
+
+    def fire(unit: str) -> None:
+        barrier.wait()
+        r = api.post(
+            "/api/assets/krnovo/constraints/replace-units",
+            json={"assignments": [{"unit_id": unit, "state": "off"}], "start_local": "2026-11-18T00:00", "expected_revision": base},
+        )
+        results[unit] = r.status_code
+
+    t1 = threading.Thread(target=fire, args=("WTG-001",))
+    t2 = threading.Thread(target=fire, args=("WTG-002",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    codes = sorted(results.values())
+    assert codes == [200, 409], f"exactly one winner: {results}"
+    # committed state: BOTH units end up OFF? No — the 409 never wrote. Only
+    # the winner's unit is OFF; constraints revision advanced exactly once
+    cons = api.get("/api/assets/krnovo/constraints").json()
+    assert cons["revision"] == base + 1
+    off_units = [u for c in cons["constraints"] if c["kind"] == "offline" for u in (c["unit_ids"] or [])]
+    assert len(off_units) == 1, f"only the winner's unit is OFF: {off_units}"
+    # loser can now retry with the CURRENT revision and succeed
+    loser = [u for u, code in results.items() if code == 409][0]
+    r2 = api.post(
+        "/api/assets/krnovo/constraints/replace-units",
+        json={"assignments": [{"unit_id": loser, "state": "off"}], "start_local": "2026-11-18T00:00", "expected_revision": base + 1},
+    )
+    assert r2.status_code == 200

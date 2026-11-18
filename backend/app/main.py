@@ -446,6 +446,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
         mode: str = Query("baseline"),
         unit: str = Query("mwh"),
         avg_models: str | None = Query(None),
+        avg_enabled: bool = Query(True),
     ):
         from .xlsx_export import build_export_xlsx, MAX_EXPORT_DAYS
 
@@ -462,6 +463,7 @@ def create_app(settings: Settings | None = None, om_client: OpenMeteoClient | No
             unit,
             models,
             iso_z(datetime.now(timezone.utc)),
+            avg_enabled=avg_enabled,
         )
         fname_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         fname = f"Windy_{site_id}_{fname_date}_{days}d_{mode}_{unit}.xlsx"

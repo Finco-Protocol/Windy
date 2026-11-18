@@ -426,6 +426,11 @@ class RevisionConflict(AvailabilityError):
         self.current = current
 
 
+def current_constraints_revision_conn(conn, site_id: str) -> int:
+    row = conn.execute("SELECT COALESCE(MAX(revision), 0) AS r FROM operational_constraints WHERE site_id=?", (site_id,)).fetchone()
+    return int(row["r"])
+
+
 def replace_unit_states(
     db_path,
     site_id: str,
@@ -493,14 +498,18 @@ def replace_unit_states(
                 rec["cap_percent"] = pct
         desired[unit] = rec
 
-    if expected_revision is not None:
-        current = current_constraints_revision(db_path, site_id)
-        if current != int(expected_revision):
-            raise RevisionConflict(int(expected_revision), current)
     now = _now()
-    rev = current_constraints_revision(db_path, site_id) + 1
     assigned = set(desired)
-    with dbm.session(db_path) as conn:
+    # Correction F P0-7: BEGIN IMMEDIATE acquires the SQLite write lock NOW,
+    # so the expected-revision read, the next-revision derivation and every
+    # write all happen inside one serialized transaction — two concurrent
+    # requests can never both read the same revision and both commit. A stale
+    # request raises RevisionConflict (409) WITHOUT any write.
+    with dbm.immediate_session(db_path) as conn:
+        current = current_constraints_revision_conn(conn, site_id)
+        if expected_revision is not None and current != int(expected_revision):
+            raise RevisionConflict(int(expected_revision), current)
+        rev = current + 1
         active = conn.execute(
             "SELECT id, kind, unit_ids_json, cap_mw, cap_percent, start_utc, end_utc, created_by "
             "FROM operational_constraints WHERE site_id=? AND revision=? AND superseded_by IS NULL",
