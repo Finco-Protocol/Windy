@@ -99,7 +99,7 @@ def test_offline_turbine_changes_adjusted_only_not_spatial_baseline(client):
     baseline = next(m for m in before["models"] if m["model_id"] == "ecmwf_ifs")["daily"][0]["base_mwh"]
     start = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = api.post("/api/assets/krnovo/constraints", json={"rows": [
-        {"kind": "offline", "unit_ids": ["WTG-001"], "start_utc": start}
+        {"kind": "offline", "unit_ids": ["WTG-001"], "start_local": start}
     ]})
     assert r.status_code == 200, r.text
     after = api.get("/api/turbine-forecast?days=7").json()
