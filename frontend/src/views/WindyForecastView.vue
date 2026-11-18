@@ -447,7 +447,7 @@ async function saveAssignments(assignments: UnitAssignment[], targetUnits: strin
     }
     if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
     const refreshed = await Promise.allSettled([
-      refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh(),
+      refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh(), spatialResource.refresh(),
     ]);
     if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
     const failedRefreshes = refreshed.filter((x) => x.status === "rejected").length;
@@ -581,7 +581,7 @@ async function revertAll(): Promise<void> {
     if (!isCurrentWrite(targetSite, opId)) return;
     wtgSelected.value = new Set();
     perUnitState.value = {};
-    const refreshed = await Promise.allSettled([refreshConstraints(), refreshStatus(), fcResource.refresh()]);
+    const refreshed = await Promise.allSettled([refreshConstraints(), refreshStatus(), fcResource.refresh(), spatialResource.refresh()]);
     if (!isCurrentWrite(targetSite, opId)) return;
     applyMessage.value = `Sve per-turbine restrikcije uklonjene (revizija ${res.revision}).` +
       (refreshed.some((x) => x.status === "rejected") ? " Osvježavanje nije potpuno uspjelo." : "");
