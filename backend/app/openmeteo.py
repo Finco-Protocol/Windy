@@ -124,8 +124,14 @@ class OpenMeteoClient:
                 # failure shape (see module docstring / upstream notes).
                 self._raise_for_body(200, text, requested_model)
                 raise OMError(f"open-meteo returned unparseable body: {text[:300]}") from exc
-            if data.get("error"):
+            if isinstance(data, dict) and data.get("error"):
                 self._raise_for_body(400, str(data.get("reason", "unknown error")), requested_model)
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        raise OMError("multi-location response contains a non-object item")
+                    if item.get("error"):
+                        self._raise_for_body(400, str(item.get("reason", "unknown error")), requested_model)
             return data
         raise last_error or OMError("open-meteo: retries exhausted")
 
@@ -178,6 +184,30 @@ class OpenMeteoClient:
         params = self._base_params(lat, lon, spec, days)
         params["run"] = run_iso
         return self._get_json(SINGLE_RUNS_URL, params, requested_model=spec.id)
+
+    def fetch_multi_single_run(
+        self,
+        locations: list[dict],
+        spec: ModelSpec,
+        run_iso: str,
+        days: int,
+    ) -> list[dict]:
+        """One issue, multiple coordinates in ONE request (no per-unit N requests).
+
+        Open-Meteo responds with an ordered JSON list when comma-separated
+        locations are requested. Do not assign returned grid coordinates to a
+        different WTG identifier or interpolate missing locations.
+        """
+        if not 1 <= len(locations) <= 26:
+            raise ValueError("spatial batch size must be 1..26")
+        params = self._base_params(locations[0]["latitude"], locations[0]["longitude"], spec, days)
+        params["latitude"] = ",".join(f'{float(p["latitude"]):.6f}' for p in locations)
+        params["longitude"] = ",".join(f'{float(p["longitude"]):.6f}' for p in locations)
+        params["run"] = run_iso
+        response = self._get_json(SINGLE_RUNS_URL, params, requested_model=spec.id)
+        if not isinstance(response, list) or len(response) != len(locations):
+            raise OMError(f"spatial response shape mismatch: expected {len(locations)} locations")
+        return response
 
     def latest_available_run(
         self,
