@@ -86,8 +86,8 @@ watch(
 );
 
 const fcResource = useAbortableResource<ForecastResponse>(
-  (signal) => windyApi.forecast(days.value, siteId.value, signal, viewMode.value === "adjusted"),
-  () => [days.value, siteId.value, viewMode.value],
+  (signal) => windyApi.forecast(days.value, siteId.value, signal, viewMode.value === "adjusted", modelingMode.value),
+  () => [days.value, siteId.value, viewMode.value, modelingMode.value],
 );
 const { data: fcData, loading: fcLoading, error: fcError } = fcResource;
 const spatialResource = useAbortableResource(
@@ -1002,19 +1002,19 @@ function utcLabel(iso: string | null): string {
 
         <StateBlock v-if="collectError" kind="error">Dohvat nije uspio: {{ collectError }}</StateBlock>
         <StateBlock v-if="exportError" kind="error">Excel export nije uspio: {{ exportError }}</StateBlock>
-        <StateBlock v-if="fcError && modelingMode === 'spot'" kind="error">{{ fcError }}</StateBlock>
+        <StateBlock v-if="fcError" kind="error">{{ fcError }}</StateBlock>
         <StateBlock v-if="spatialError && modelingMode === 'per_turbine'" kind="error">Per turbine: {{ spatialError }}</StateBlock>
         <StateBlock v-if="modelingMode === 'per_turbine' && spatialLoading && !spatialData" kind="loading" caption="Učitavam prognoze 26 turbina…" />
         <PerTurbinePanel
           v-if="modelingMode === 'per_turbine' && spatialData"
           :forecast="spatialData" :unit="energyUnit" :view-mode="viewMode"
         />
-        <StateBlock v-else-if="fcLoading && !fcData" kind="loading" caption="Učitavam arhivirane prognoze…" />
+        <StateBlock v-if="fcLoading && !fcData" kind="loading" caption="Učitavam arhivirane prognoze…" />
 
         <!-- ===== SADA (Addendum A): modelirani uvjeti — NIKAD stvarni vjetar ===== -->
         <section aria-label="Sada — modelirani uvjeti" class="border-ink-700 rounded border px-3 py-2">
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 class="text-paper-50 font-mono text-sm tracking-wide">SADA — modelirani uvjeti</h2>
+            <h2 class="text-paper-50 font-mono text-sm tracking-wide">SADA — modelirani uvjeti (referentni 1 spot)</h2>
             <button type="button" class="border-ink-600 text-paper-300 hover:bg-ink-800 disabled:opacity-50 border px-2 py-0.5 font-mono text-[10px]" :disabled="nowRefreshing" @click="refreshNow">
               {{ nowRefreshing ? "…" : "Osvježi SADA" }}
             </button>
@@ -1213,7 +1213,7 @@ function utcLabel(iso: string | null): string {
           </CollapsibleSection>
         </section>
 
-        <template v-if="modelingMode === 'spot' && fcData">
+        <template v-if="fcData">
           <!-- ===== P0: dnevna tablica — TABLE FIRST ===== -->
           <section aria-label="Očekivana proizvodnja po danima">
             <h2 class="text-paper-50 mb-2 font-mono text-base tracking-wide">
