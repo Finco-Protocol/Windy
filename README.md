@@ -29,6 +29,47 @@ Full local stack (builds the frontend and serves it from the backend):
 docker compose up --build  # http://127.0.0.1:8000
 ```
 
+## Forecast modes (v1.8)
+
+**Default — Per turbine (26):** the forecast screen requests a separate,
+read-only archived 26-location NWP projection. On **Osvježi 26 turbina** the
+backend first collects the original one-spot run, then obtains a *single*
+multi-coordinate Open-Meteo Single Runs response per model, for all 26 WTG
+GPS positions. Spatial snapshots are stored separately and immutably by
+issue/run, location fingerprint and inventory revision (additive SQLite v6).
+GET requests never invoke Open-Meteo. Previously archived one-spot runs,
+actuals and historical accuracy stay untouched.
+
+**Alternative — 1 spot:** selects the original central-point calculation and
+all its prior charts, Excel exports, operations, archive and history. Spatial
+mode uses its own 26-WTG curve/rated/availability aggregation for the SAME
+existing charts, Compare and hourly ensemble; an absent spatial snapshot never
+silently falls back to 1-spot wind/MWh. Both modes support 7/10/15-day display,
+MWh/GWh and mode-correct Excel export.
+
+Spatial predictions are model-grid estimates, **not** 26 independent
+anemometer measurements, and **not** a CFD/wake-loss or calibrated complex
+terrain model. The owner-provided 26 coordinates and elevations have
+**provisional WTG-ID mapping** until validated against as-built IDs. The
+per-unit reference curve must be physically compatible with its nameplate,
+or a **separate explicit scaled-reference opt-in** is required; incompatible
+curves result in missing forecasts (never fabricated energy). Missing any WTG
+wind hour makes the whole farm-hour unavailable rather than treating that WTG
+as zero. Farm export caps apply after per-unit ON/OFF and curtailments. The
+per-unit adjusted Excel columns are pre-farm-export-cap.
+
+Collection is an **explicit manual** action; the default scheduler remains
+spot-only to prevent unapproved 26-coordinate recurrent provider use. Open-Meteo
+free endpoints are for **non-commercial use**; check licensing/usage quotas
+before enabling routine commercial collection. Do not publish the unauthenticated
+write endpoints without an authenticating proxy or VPN.
+
+Read-only API: `GET /api/turbine-forecast?site_id=krnovo&days=7` and
+`GET /api/forecast?site_id=krnovo&days=7&modeling_mode=per_turbine`.
+Explicit refresh: `POST /api/collect/turbines` with `{"site_id":"krnovo","days":16}`.
+The existing `/api/forecast` with no modelling-mode parameter remains the
+backward-compatible `spot` default for external API consumers.
+
 ## Tests
 
 ```bash
