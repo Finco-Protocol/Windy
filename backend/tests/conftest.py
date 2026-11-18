@@ -62,6 +62,7 @@ class FakeOMClient:
 
     def fetch_multi_single_run(self, locations, spec, run_iso, days):
         """Synthetic, location-specific grid wind for spatial acceptance tests."""
+        assert len(run_iso) == 16 and run_iso[13:16] == ":00" and not run_iso.endswith("Z"), "API requires canonical run=YYYY-MM-DDTHH:00"
         import copy
         archive = self.runs.get(spec.id) or []
         matched = [raw for iso, raw in archive if iso[:16] == run_iso[:16]]
