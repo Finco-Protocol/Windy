@@ -60,6 +60,25 @@ class FakeOMClient:
             raise self.current_error
         return self.current_payload
 
+    def fetch_multi_single_run(self, locations, spec, run_iso, days):
+        """Synthetic, location-specific grid wind for spatial acceptance tests."""
+        assert len(run_iso) == 16 and run_iso[13:16] == ":00" and not run_iso.endswith("Z"), "API requires canonical run=YYYY-MM-DDTHH:00"
+        import copy
+        archive = self.runs.get(spec.id) or []
+        matched = [raw for iso, raw in archive if iso[:16] == run_iso[:16]]
+        if not matched:
+            raise ModelRunUnavailable(f"missing multi-coordinate issue {spec.id}: {run_iso}")
+        response = []
+        for i, loc in enumerate(locations):
+            raw = copy.deepcopy(matched[-1])
+            for key, values in list(raw.get("hourly", {}).items()):
+                if key.startswith("wind_speed_"):
+                    raw["hourly"][key] = [round(v + i * 0.03, 5) if v is not None else None for v in values]
+            raw["latitude"] = loc["latitude"]
+            raw["longitude"] = loc["longitude"]
+            response.append(raw)
+        return response
+
     def push_run(self, model_id: str, run_iso: str, raw: dict) -> None:
         self.runs.setdefault(model_id, []).append((run_iso, raw))
 

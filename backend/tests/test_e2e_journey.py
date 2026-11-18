@@ -177,11 +177,11 @@ def test_owner_journey_a_to_g(client):
     restore_settings.scheduler_enabled = False
     with TestClient(create_app(settings=restore_settings, om_client=fake)) as api2:
         h = api2.get("/api/health").json()
-        assert h["ok"] is True and h["schema_version"] == "5"
+        assert h["ok"] is True and h["schema_version"] == "6"
         assert api2.get("/api/runs", params={"site_id": "krnovo"}).json()["runs"][0]["id"] == run_id
     # migrations repeatable (second ensure on the restored copy)
     ensure_db(backup_path)
     with dbm.session(backup_path) as conn:
-        assert dbm.get_meta(conn, "schema_version") == "5"
+        assert dbm.get_meta(conn, "schema_version") == "6"
 
 

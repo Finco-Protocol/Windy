@@ -83,6 +83,7 @@ function makeHarness() {
     const path = raw.replace(/^https?:\/\/[^/]+/, "").split("?")[0]!;
     const respond = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     if (path === "/api/site") return respond({ site: SITE, power_curve: { id: "ge103-2750-oedb", label: "GE ref", status: "reference", provenance: "OEDB", rated_power_mw: 2.78, cut_in_mps: 3, rated_mps: 12, cut_out_mps: 25 }, models: [], source_provider: "open-meteo", source_note: "" });
+    if (path.startsWith("/api/turbine-forecast")) return respond({ site_id: "krnovo", mode: "per_turbine", days: 7, location_info: { location_source: "owner-file-provisional", location_revision: 0, provisional_mapping: true, virtual_inventory: false, inventory_revision: 2, n_turbines: 26 }, models: [], note: "synthetic 26 coordinates" });
     if (path.startsWith("/api/forecast")) return respond(forecastPayload(path.includes("with_availability=true") ? "adjusted" : "baseline"));
     if (path === "/api/assets/krnovo/status") {
       state.statusCalls += 1;
@@ -121,6 +122,13 @@ async function mountView(router: Router): Promise<void> {
   app.use(router);
   app.mount(el);
   await router.isReady();
+  // Legacy regressions explicitly select the preserved 1-spot mode.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await nextTick();
+    const spot = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "1 spot");
+    if (spot) { spot.click(); await nextTick(); break; }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function openEditor(): Promise<void> {

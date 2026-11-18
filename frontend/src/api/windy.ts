@@ -5,6 +5,56 @@
 // never an ad-hoc re-fetch), and every accuracy number comes from archived
 // runs joined to imported actuals — never from current forecasts.
 
+export interface SpatialDay {
+  date: string;
+  base_mwh: number | null;
+  adjusted_mwh: number | null;
+  hours_counted: number;
+  missing_intervals: number;
+  n_turbines: number;
+  partial: boolean;
+}
+
+export interface SpatialTurbine {
+  unit_id: string;
+  latitude: number;
+  longitude: number;
+  elevation_m: number | null;
+  daily: {
+    date: string; base_mwh: number | null; adjusted_mwh_pre_export_cap: number | null;
+    wind_mean_mps: number | null; hours: number;
+  }[];
+}
+
+export interface SpatialModel {
+  model_id: string;
+  label: string;
+  issue_utc: string | null;
+  met_only: boolean;
+  status: string;
+  grid_cells: number | null;
+  warning: string | null;
+  location_source?: string;
+  daily: SpatialDay[];
+  turbines: SpatialTurbine[];
+}
+
+export interface SpatialForecast {
+  site_id: string;
+  mode: "per_turbine";
+  days: number;
+  location_info: {
+    location_source: string;
+    location_revision: number;
+    provisional_mapping: boolean;
+    virtual_inventory: boolean;
+    inventory_revision: number;
+    n_turbines: number;
+  };
+  models: SpatialModel[];
+  note: string;
+}
+
 export interface WindySite {
   id: string;
   name: string;
@@ -667,9 +717,10 @@ export const windyApi = {
   assets: (signal?: AbortSignal) => getJson<{ assets: AssetSummary[] }>("/assets", signal),
   assetCreate: (body: AssetCreate) => postJson<WindySite>("/assets", body),
   powerCurves: (signal?: AbortSignal) => getJson<{ curves: PowerCurveSummary[] }>("/power-curves", signal),
-  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false) =>
+  forecast: (days: number, siteId: string, signal?: AbortSignal, withAvailability = false,
+    modelingMode: "spot" | "per_turbine" = "spot") =>
     getJson<ForecastResponse>(
-      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}`,
+      `/forecast?days=${days}&site_id=${encodeURIComponent(siteId)}${withAvailability ? "&with_availability=true" : ""}&modeling_mode=${modelingMode}`,
       signal,
     ),
   windNow: (siteId: string, signal?: AbortSignal) =>
@@ -681,6 +732,14 @@ export const windyApi = {
   forecastExportUrl: (siteId: string, days: number, mode: string, unit: string, avgModels: string[], avgEnabled: boolean): string =>
     `/api/assets/${encodeURIComponent(siteId)}/forecast-export.xlsx?days=${days}&mode=${encodeURIComponent(mode)}&unit=${encodeURIComponent(unit)}&avg_models=${encodeURIComponent(avgModels.join(","))}&avg_enabled=${avgEnabled}`,
   collect: (days = 10, siteId = "krnovo") => postJson<CollectResult>("/collect", { days, site_id: siteId }),
+  perTurbineForecast: (days: number, siteId: string, signal?: AbortSignal) =>
+    getJson<SpatialForecast>(`/turbine-forecast?days=${days}&site_id=${encodeURIComponent(siteId)}`, signal),
+  collectTurbines: (siteId: string) =>
+    postJson<{ spot: CollectResult; per_turbine: { models: { model_id: string; status: string; reason?: string }[] } }>(
+      "/collect/turbines", { days: 16, site_id: siteId },
+    ),
+  perTurbineExportUrl: (siteId: string, days: number, mode: string, unit: string) =>
+    `/api/assets/${encodeURIComponent(siteId)}/turbine-forecast-export.xlsx?days=${days}&mode=${encodeURIComponent(mode)}&unit=${encodeURIComponent(unit)}`,
   runs: (modelId: string | null, siteId: string, signal?: AbortSignal) =>
     getJson<{ runs: RunSummary[] }>(
       `/runs?limit=300&site_id=${encodeURIComponent(siteId)}${modelId ? `&model_id=${encodeURIComponent(modelId)}` : ""}`,
