@@ -114,7 +114,23 @@ const adjustedUnavailable = computed<Record<string, string>>(() => {
 // instead of showing a plausible-looking (baseline) MWh table
 const adjustedAllUnavailable = computed(() => viewMode.value === "adjusted" && modelsWithRun.value.length > 0 && modelsWithRun.value.every((m) => !m.adjusted?.available));
 const visibleRows = computed<DailyRow[]>(() => visibleDailyRows(dailyRows.value, days.value, tz.value));
-const modelColumns = computed(() => modelsWithRun.value.map((m) => ({ id: m.model_id, label: MODEL_LABELS_HR[m.model_id] ?? m.model_id, metOnly: m.met_only })));
+const modelColumns = computed(() => modelsWithRun.value.map((m) => ({
+  id: m.model_id,
+  label: MODEL_LABELS_HR[m.model_id] ?? m.model_id,
+  metOnly: m.met_only,
+  cycle: m.run_selection?.cycle_kind,
+  issue: m.run?.run_issued_utc ?? null,
+  lastUsable: m.run_selection?.last_usable_wind_utc ?? null,
+  leadHours: m.run_selection?.available_lead_hours ?? null,
+  newerIssuePreserved: m.run_selection?.newer_issue_preserved ?? false,
+})));
+function cycleText(kind?: string): string {
+  if (kind === "long") return "DUGI";
+  if (kind === "short") return "KRATKI";
+  if (kind === "incomplete-long") return "NEPOTPUN DUGI";
+  if (kind === "unknown") return "NEPOZNAT RUN";
+  return "";
+}
 
 // ---- Correction E Addendum A §1: chart legends — per-site, per-chart,
 // client-side ONLY (no API calls on toggle). Wind and power selections are
@@ -701,7 +717,8 @@ async function fetchNow(): Promise<void> {
   collectError.value = null;
   collectMessage.value = null;
   try {
-    const res = await windyApi.collect(days.value, siteId.value);
+    // Display selection does not determine persistence depth: collect full provider horizons.
+    const res = await windyApi.collect(16, siteId.value);
     collectMessage.value = `Ažurirano ${res.collected_at_utc}`;
     await Promise.all([fcResource.refresh(), nowResource.refresh(), refreshWeather()]);
   } catch (e) {
