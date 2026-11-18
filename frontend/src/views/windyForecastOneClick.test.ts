@@ -121,6 +121,13 @@ async function mountView(router: Router): Promise<void> {
   app.use(router);
   app.mount(el);
   await router.isReady();
+  // Legacy regressions explicitly select the preserved 1-spot mode.
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await nextTick();
+    const spot = [...document.body.querySelectorAll("button")].find((b) => b.textContent?.trim() === "1 spot");
+    if (spot) { spot.click(); await nextTick(); break; }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 async function openEditor(): Promise<void> {
