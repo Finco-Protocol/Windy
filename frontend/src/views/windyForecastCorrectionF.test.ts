@@ -78,6 +78,7 @@ function makeHarness() {
     const path = raw.replace(/^https?:\/\/[^/]+/, "").split("?")[0]!;
     const respond = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
     if (path === "/api/site") return respond({ site: SITE, power_curve: { id: "ge103-2750-oedb", label: "GE ref", status: "reference", provenance: "OEDB", rated_power_mw: 2.78, cut_in_mps: 3, rated_mps: 12, cut_out_mps: 25 }, models: [], source_provider: "open-meteo", source_note: "" });
+    if (path.startsWith("/api/turbine-forecast")) return respond({ site_id: "krnovo", mode: "per_turbine", days: 7, location_info: { location_source: "owner-file-provisional", location_revision: 0, provisional_mapping: true, virtual_inventory: false, inventory_revision: 2, n_turbines: 26 }, models: [], note: "synthetic 26 coordinates" });
     if (path.startsWith("/api/forecast")) return respond(forecastPayload(path.includes("with_availability=true") ? "adjusted" : "baseline"));
     if (path === "/api/assets/krnovo/status") return respond({ site_id: "krnovo", installed_mw: 74.1, available_max_mw: availableMax(), offline_count: state.offUnits.size, curtailed_count: 0, farm_export_cap_mw: null, n_turbines: 26, inventory_revision: 2, constraints_revision: state.revision });
     if (path === "/api/assets/krnovo/turbines") return respond({ site_id: "krnovo", revision: 2, n_turbines: 26, installed_mw: 74.1, turbines: UNITS.map((u) => ({ unit_id: u, name: u, rated_mw: RATED, curve_id: null, created_at_utc: "" })) });
@@ -506,7 +507,7 @@ describe("Horizon H — refresh never truncates ECMWF or ICON", () => {
     await mountView(router);
     await settle();
     const refresh = [...document.body.querySelectorAll("button")].find(
-      (b) => b.textContent?.trim() === "Osvježi",
+      (b) => b.textContent?.trim() === "Osvježi 1 spot",
     );
     expect(refresh).toBeTruthy();
     refresh!.click();
