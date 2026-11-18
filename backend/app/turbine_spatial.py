@@ -232,18 +232,31 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
         item: dict = {"model_id": spec.id, "label": spec.label, "met_only": spec.met_only,
                       "status": "NO_RUN" if run is None else "NO_SPATIAL_SNAPSHOT",
                       "issue_utc": run["run_issued_utc"] if run is not None else None,
-                      "grid_cells": None, "daily": [], "turbines": [],
+                      "grid_cells": None, "daily": [], "turbines": [], "hourly": [],
                       "warning": None}
         if snap is None:
             item["warning"] = "Odaberite Osvježi per turbine; nema valjanih podataka po koordinatama."
             models.append(item)
             continue
+        unit_winds = json.loads(snap["payload_json"])
         if spec.met_only:
+            met_times: dict[str, list[float]] = {}
+            for unit_data in unit_winds.values():
+                for stamp, wind, _status in unit_data["series"]:
+                    if wind is not None:
+                        met_times.setdefault(stamp, []).append(float(wind))
+            item["hourly"] = [
+                {"valid_at_utc": stamp, "wind_speed_mps": round(sum(winds)/26, 5) if len(winds)==26 else None,
+                 "modeled_power_mw": None, "adjusted_mw": None,
+                 "interval_energy_mwh": None, "interval_hours": 1., "status": "met-only"}
+                for stamp, winds in sorted(met_times.items())
+                if _utc(stamp).astimezone(tz).date().isoformat() in dates
+            ]
             item["status"] = "MET_ONLY"
-            item["warning"] = "Samo 10 m meteorološki vjetar; bez izračuna proizvodnje po turbini."
+            item["grid_cells"] = snap["unique_grid_cells"]
+            item["warning"] = "26 koordinata, samo 10 m meteorološki vjetar; bez modeliranja MWh."
             models.append(item)
             continue
-        unit_winds = json.loads(snap["payload_json"])
         if set(unit_winds) != set(by_location):
             item["status"] = "INVALID_SNAPSHOT"
             item["warning"] = "Lokacije i WTG oznake se ne podudaraju; bez zamjene 1-spot vrijednostima."
@@ -267,6 +280,8 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
         all_times = sorted(set.union(*[set(x) for x in per_unit.values()])) if per_unit else []
         unit_daily = {u: {d: {"mwh": 0., "adjusted_mwh": 0., "hours": 0., "wind_sum": 0., "wind_n": 0}
                           for d in dates} for u in per_unit}
+        hourly: list[dict] = []
+        curve_failures = 0
         daily = {d: {"date": d, "base_mwh": 0., "adjusted_mwh": 0.,
                      "hours_counted": 0., "missing_intervals": 0,
                      "n_turbines": 26} for d in dates}
@@ -278,14 +293,19 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
             if not 0 < hours <= 6:
                 continue
             base_sum, adjusted_sum, valid_count = 0., 0., 0
+            wind_sum, wind_count = 0., 0
             powers = []
             for unit, series in per_unit.items():
                 wind = series.get(stamp)
                 base, status = _power(wind, by_location[unit], curve_by_id, site)
                 if wind is not None:
+                    wind_sum += float(wind)
+                    wind_count += 1
                     ud = unit_daily[unit][d]
                     ud["wind_sum"] += wind
                     ud["wind_n"] += 1
+                if base is None and status in ("incompatible-curve", "missing-curve"):
+                    curve_failures += 1
                 if base is not None:
                     valid_count += 1
                     ud = unit_daily[unit][d]
@@ -302,13 +322,26 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
                     adjusted_sum += adjusted
             if valid_count != 26:
                 daily[d]["missing_intervals"] += 1
+                hourly.append({"valid_at_utc": stamp,
+                               "wind_speed_mps": round(wind_sum / 26, 5) if wind_count == 26 else None,
+                               "modeled_power_mw": None, "adjusted_mw": None,
+                               "interval_energy_mwh": None, "interval_hours": hours,
+                               "status": "missing-unit-or-curve"})
                 continue
             limit = av._farm_export_cap(constraints, stamp)
             adjusted_sum = min(adjusted_sum, limit) if limit is not None else adjusted_sum
             daily[d]["base_mwh"] += base_sum * hours
             daily[d]["adjusted_mwh"] += adjusted_sum * hours
             daily[d]["hours_counted"] += hours
-        item["status"] = "OK"
+            hourly.append({"valid_at_utc": stamp,
+                           "wind_speed_mps": round(wind_sum / 26, 5) if wind_count == 26 else None,
+                           "modeled_power_mw": round(base_sum, 6), "adjusted_mw": round(adjusted_sum, 6),
+                           "interval_energy_mwh": round(base_sum * hours, 6),
+                           "interval_hours": hours, "status": "ok"})
+        item["status"] = "OK" if any(r["hours_counted"] > 0 for r in daily.values()) else (
+            "NO_VALID_POWER" if curve_failures else "NO_COMPLETE_WTG_HOURS"
+        )
+        item["hourly"] = hourly
         item["grid_cells"] = snap["unique_grid_cells"]
         item["location_source"] = snap["location_source"]
         item["warning"] = ("Provider je vratio jednu NWP mrežnu ćeliju za sve lokacije; "
@@ -317,6 +350,9 @@ def read_per_turbine(db_path, site_id: str, days: int = 7) -> dict:
                            "Modelirani vjetar po koordinati; broj odvojenih NWP ćelija nije potvrđen."
                            if snap["unique_grid_cells"] == 0 else
                            "Modelirani vjetar po koordinati; bez wake/CFD korekcije.")
+        if curve_failures:
+            item["warning"] += (" Neki ili svi WTG imaju nekompatibilnu referentnu krivulju; "
+                                "provjerite nazivnu snagu i eksplicitni scaled-reference opt-in.")
         item["daily"] = [
             {**d, "base_mwh": round(d["base_mwh"], 3) if d["hours_counted"] else None,
              "adjusted_mwh": round(d["adjusted_mwh"], 3) if d["hours_counted"] else None,
