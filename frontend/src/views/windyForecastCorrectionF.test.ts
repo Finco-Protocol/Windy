@@ -458,7 +458,7 @@ describe("Correction H — committed writes, validation and site-switch races", 
     }));
     await mountView(router);
     await settle(undefined, (t) => t.includes("74.1"));
-    const exportBtn = () => [...document.body.querySelectorAll("button")].find((b) => b.textContent?.includes("Export Excel")) as HTMLButtonElement | undefined;
+    const exportBtn = () => [...document.body.querySelectorAll("button")].find((b) => b.getAttribute("title")?.startsWith("Export Excel:")) as HTMLButtonElement | undefined;
     expect(exportBtn()).toBeTruthy();
     exportBtn()!.click();
     await settle(undefined, () => exportWaiters.length === 1);
