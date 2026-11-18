@@ -376,7 +376,7 @@ describe("Correction H — committed writes, validation and site-switch races", 
     let committed = false;
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const raw = typeof input === "string" || input instanceof URL ? String(input) : input.url;
-      const path = raw.replace(/^https?:\\/\\/[^/]+/, "").split("?")[0]!;
+      const path = raw.split("?")[0]!;
       if (path === "/api/assets/krnovo/status" && committed) {
         return new Response(JSON.stringify({ detail: "status offline" }), {
           status: 503, headers: { "Content-Type": "application/json" },
