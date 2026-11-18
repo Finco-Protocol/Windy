@@ -350,6 +350,11 @@ function allowedMw(unit: string, edit: UnitEdit): number | null {
 }
 
 const applyBusy = ref(false); // bulk save in flight
+let siteGeneration = 0;
+let saveOperationId = 0; // invalidate pending writes when switching site
+function isCurrentWrite(site: string, opId: number): boolean {
+  return siteId.value === site && saveOperationId === opId;
+}
 const applyError = ref<string | null>(null);
 const applyMessage = ref<string | null>(null);
 const busyUnits = ref<Set<string>>(new Set()); // per-unit one-click save in flight
@@ -376,10 +381,11 @@ function freshStart(): string {
 // stay, retry remains available. Stale-site responses report ok:false.
 async function saveAssignments(assignments: UnitAssignment[], targetUnits: string[]): Promise<{ ok: boolean; revision: number | null }> {
   const targetSite = siteId.value;
+  const opId = ++saveOperationId;
   applyBusy.value = true;
   applyError.value = null;
   applyMessage.value = null;
-  const attempt = async (expected: number | null): Promise<ReturnType<typeof windyApi.constraintsReplaceUnits>> =>
+  const attempt = (expected: number | null) =>
     windyApi.constraintsReplaceUnits(targetSite, {
       assignments,
       start_local: freshStart(),
@@ -387,30 +393,50 @@ async function saveAssignments(assignments: UnitAssignment[], targetUnits: strin
       ...(expected !== null ? { expected_revision: expected } : {}),
     });
   try {
+    // Only the POST and its revision retry decide whether a write succeeded.
+    // A failed follow-up status fetch must NEVER turn a committed write into
+    // "not saved" or leave a bulk selection available for duplicate replay.
     let res: Awaited<ReturnType<typeof windyApi.constraintsReplaceUnits>>;
     try {
       res = await attempt(constraintsData.value?.revision ?? null);
     } catch (e) {
-      // 409 = someone else created a revision meanwhile: refetch and retry ONCE
       const msg = e instanceof Error ? e.message : String(e);
       if (!msg.includes("409")) throw e;
       await refreshConstraints();
-      res = await attempt(constraintsData.value?.revision ?? null);
+      if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: null };
+      res = await attempt(constraintsData.value?.revision ?? null); // retry only once
     }
-    if (siteId.value !== targetSite) return { ok: false, revision: res.revision }; // stale site — discard silently
-    const st = await windyApi.operatingStatus(targetSite);
-    if (siteId.value !== targetSite) return { ok: false, revision: res.revision };
+    if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
+
+    let statusNote = "Status elektrane nije potvrđen (pokušajte osvježiti prikaz).";
+    try {
+      const st = await windyApi.operatingStatus(targetSite);
+      if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
+      statusNote = `Server potvrdio RASP. MAKS. ${st.available_max_mw} MW.`;
+      if (st.n_turbines > 0) setViewMode("adjusted");
+    } catch {
+      // The write is already committed: status failure is warning, not a save error.
+    }
+    if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
+    const refreshed = await Promise.allSettled([
+      refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh(),
+    ]);
+    if (!isCurrentWrite(targetSite, opId)) return { ok: false, revision: res.revision };
+    const failedRefreshes = refreshed.filter((x) => x.status === "rejected").length;
+    const refreshNote = failedRefreshes
+      ? ` ${failedRefreshes} osvježavanja nije uspjelo; podaci mogu biti zastarjeli.`
+      : "";
     applyMessage.value =
       `Spremljeno atomarno (revizija ${res.revision}, ${targetUnits.length} jedinica: ${targetUnits.slice(0, 6).join(", ")}${targetUnits.length > 6 ? "…" : ""}). ` +
-      `Server potvrdio RASP. MAKS. ${st.available_max_mw} MW.`;
-    if (st.n_turbines > 0) setViewMode("adjusted");
-    await Promise.all([refreshConstraints(), refreshStatus(), refreshInventory(), fcResource.refresh()]);
+      statusNote + refreshNote;
     return { ok: true, revision: res.revision };
   } catch (e) {
-    if (siteId.value === targetSite) applyError.value = e instanceof Error ? e.message : String(e);
+    if (isCurrentWrite(targetSite, opId)) {
+      applyError.value = `Spremanje nije potvrđeno: ${e instanceof Error ? e.message : String(e)}. Provjerite aktualno stanje prije ponavljanja.`;
+    }
     return { ok: false, revision: null };
   } finally {
-    if (siteId.value === targetSite) applyBusy.value = false;
+    if (isCurrentWrite(targetSite, opId)) applyBusy.value = false;
   }
 }
 
@@ -420,6 +446,7 @@ async function saveAssignments(assignments: UnitAssignment[], targetUnits: strin
 // (backend keeps them). Per-unit busy lock prevents racing re-clicks.
 async function toggleUnit(unit: string, state: "on" | "off"): Promise<void> {
   if (busyUnits.value.has(unit) || applyBusy.value) return;
+  const generation = siteGeneration;
   const nextBusy = new Set(busyUnits.value);
   nextBusy.add(unit);
   busyUnits.value = nextBusy;
@@ -432,15 +459,17 @@ async function toggleUnit(unit: string, state: "on" | "off"): Promise<void> {
       getRated: (u) => ratedById.value.get(u) ?? 0,
     });
     const res = await saveAssignments(assignments, [unit]);
-    if (!res.ok && applyError.value) {
+    if (generation === siteGeneration && !res.ok && applyError.value) {
       unitErrors.value = new Map([...unitErrors.value.entries(), [unit, applyError.value]]);
     }
   } catch (e) {
-    unitErrors.value = new Map([...unitErrors.value.entries(), [unit, e instanceof Error ? e.message : String(e)]]);
+    if (generation === siteGeneration) unitErrors.value = new Map([...unitErrors.value.entries(), [unit, e instanceof Error ? e.message : String(e)]]);
   } finally {
-    const nb = new Set(busyUnits.value);
-    nb.delete(unit);
-    busyUnits.value = nb;
+    if (generation === siteGeneration) {
+      const nb = new Set(busyUnits.value);
+      nb.delete(unit);
+      busyUnits.value = nb;
+    }
   }
 }
 
@@ -448,15 +477,33 @@ async function toggleUnit(unit: string, state: "on" | "off"): Promise<void> {
 // authoritative: bulk ON/OFF ignores ALL stale per-unit editor overrides and
 // sends explicit state for every selected unit. Selection clears ONLY on
 // confirmed success; failures keep edits + selection for retry.
+// Validate the complete payload BEFORE posting: bad Max MW/% inputs are
+// displayed as actionable errors and never escape from Vue click handlers.
+function safeBulkAssignments(units: string[], getEdit: (unit: string) => UnitEdit): UnitAssignment[] | null {
+  applyError.value = null;
+  try {
+    const assignments = buildAssignments({
+      units,
+      getEdit,
+      getCurrent: unitState,
+      getRated: (u) => ratedById.value.get(u) ?? 0,
+    });
+    if (assignments.length === 0) {
+      applyError.value = "Nema stvarne promjene stanja za odabrane jedinice.";
+      return null;
+    }
+    return assignments;
+  } catch (e) {
+    applyError.value = `Nije spremljeno: ${e instanceof Error ? e.message : String(e)}`;
+    return null;
+  }
+}
+
 async function bulkOnOff(state: "on" | "off"): Promise<void> {
   if (applyBusy.value || wtgSelected.value.size === 0) return;
   const units = [...wtgSelected.value];
-  const assignments = buildAssignments({
-    units,
-    getEdit: () => ({ action: state, mode: bulkMode.value, reductionPct: null, capMw: null }),
-    getCurrent: unitState,
-    getRated: (u) => ratedById.value.get(u) ?? 0,
-  });
+  const assignments = safeBulkAssignments(units, () => ({ action: state, mode: bulkMode.value, reductionPct: null, capMw: null }));
+  if (!assignments) return;
   const res = await saveAssignments(assignments, units);
   if (res.ok) {
     wtgSelected.value = new Set();
@@ -467,16 +514,14 @@ async function bulkOnOff(state: "on" | "off"): Promise<void> {
 async function bulkSaveLimit(): Promise<void> {
   if (applyBusy.value || wtgSelected.value.size === 0) return;
   const units = [...wtgSelected.value];
-  const assignments = buildAssignments({
+  const assignments = safeBulkAssignments(
     units,
-    getEdit: (u) => perUnitState.value[u] ?? { action: bulkAction.value, mode: bulkMode.value, reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value },
-    getCurrent: unitState,
-    getRated: (u) => ratedById.value.get(u) ?? 0,
-  });
-  if (assignments.length === 0) {
-    applyError.value = "Nema stvarne promjene stanja za odabrane jedinice.";
-    return;
-  }
+    (u) => perUnitState.value[u] ?? {
+      action: bulkAction.value, mode: bulkMode.value,
+      reductionPct: bulkReductionPct.value, capMw: bulkCapMw.value,
+    },
+  );
+  if (!assignments) return;
   const res = await saveAssignments(assignments, units);
   if (res.ok) {
     wtgSelected.value = new Set();
@@ -487,6 +532,7 @@ async function bulkSaveLimit(): Promise<void> {
 // kept for power users: remove ALL active per-unit restrictions (destructive —
 // keeps its explicit browser confirm, unlike the one-click actions above)
 async function revertAll(): Promise<void> {
+  if (applyBusy.value) return;
   applyError.value = null;
   applyMessage.value = null;
   const units = activeUnitConstraints.value.flatMap((c) => c.unit_ids ?? []);
@@ -496,6 +542,7 @@ async function revertAll(): Promise<void> {
   }
   if (!window.confirm(`Ukloniti SVAKA aktivna ograničenja po turbinama (${new Set(units).size} jedinica)?`)) return;
   const targetSite = siteId.value;
+  const opId = ++saveOperationId;
   applyBusy.value = true;
   try {
     const res = await windyApi.constraintsReplaceUnits(targetSite, {
@@ -503,14 +550,17 @@ async function revertAll(): Promise<void> {
       start_local: freshStart(),
       end_local: null,
     });
-    applyMessage.value = `Sve per-turbine restrikcije uklonjene (revizija ${res.revision}).`;
+    if (!isCurrentWrite(targetSite, opId)) return;
     wtgSelected.value = new Set();
     perUnitState.value = {};
-    await Promise.all([refreshConstraints(), refreshStatus(), fcResource.refresh()]);
+    const refreshed = await Promise.allSettled([refreshConstraints(), refreshStatus(), fcResource.refresh()]);
+    if (!isCurrentWrite(targetSite, opId)) return;
+    applyMessage.value = `Sve per-turbine restrikcije uklonjene (revizija ${res.revision}).` +
+      (refreshed.some((x) => x.status === "rejected") ? " Osvježavanje nije potpuno uspjelo." : "");
   } catch (e) {
-    applyError.value = e instanceof Error ? e.message : String(e);
+    if (isCurrentWrite(targetSite, opId)) applyError.value = e instanceof Error ? e.message : String(e);
   } finally {
-    applyBusy.value = false;
+    if (isCurrentWrite(targetSite, opId)) applyBusy.value = false;
   }
 }
 
@@ -598,11 +648,13 @@ const collectError = ref<string | null>(null);
 
 // ---- Correction E Addendum D: Excel export (7/10/15) — read-only snapshot
 const exportBusy = ref(false);
+let exportOperationId = 0;
 const exportError = ref<string | null>(null);
 async function exportExcel(): Promise<void> {
   if (exportBusy.value) return; // no double-click duplication
   exportBusy.value = true;
   exportError.value = null;
+  const opId = ++exportOperationId;
   const targetSite = siteId.value;
   const targetDays = days.value;
   const targetMode = viewMode.value;
@@ -628,6 +680,7 @@ async function exportExcel(): Promise<void> {
     const cd = res.headers.get("content-disposition") ?? "";
     const m = /filename="([^"]+)"/.exec(cd);
     const name = m?.[1] ?? `Windy_${targetSite}_${targetDays}d_${targetMode}_${targetUnit}.xlsx`;
+    if (siteId.value !== targetSite || exportOperationId !== opId) return; // site changed while downloading
     const objUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = objUrl;
@@ -637,9 +690,9 @@ async function exportExcel(): Promise<void> {
     a.remove();
     URL.revokeObjectURL(objUrl);
   } catch (e) {
-    if (siteId.value === targetSite) exportError.value = e instanceof Error ? e.message : String(e);
+    if (siteId.value === targetSite && exportOperationId === opId) exportError.value = e instanceof Error ? e.message : String(e);
   } finally {
-    if (siteId.value === targetSite) exportBusy.value = false;
+    if (exportOperationId === opId) exportBusy.value = false;
   }
 }
 
@@ -660,6 +713,12 @@ async function fetchNow(): Promise<void> {
 
 watch(siteId, (newSite, oldSite) => {
   if (newSite === oldSite) return;
+  ++siteGeneration;
+  ++saveOperationId;
+  ++exportOperationId;
+  applyBusy.value = false;
+  exportBusy.value = false;
+  exportError.value = null;
   wtgSelected.value = new Set();
   perUnitState.value = {};
   busyUnits.value = new Set();
